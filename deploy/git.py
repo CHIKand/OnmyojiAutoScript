@@ -48,6 +48,11 @@ class GitManager(DeployConfig):
 
         logger.hr('Fetch Repository Branch', 1)
         self.execute(f'"{self.git}" fetch {source} {branch}')
+        from deploy.fork_guard import WARNING_TEMPLATE, local_only_commits
+        unpushed = local_only_commits(self.git)
+        if unpushed:
+            logger.warning(WARNING_TEMPLATE.format(count=len(unpushed), branch=branch))
+            return
 
         logger.hr('Pull Repository Branch', 1)
         # Remove git lock
