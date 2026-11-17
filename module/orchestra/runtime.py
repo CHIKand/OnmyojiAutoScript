@@ -14,8 +14,12 @@
 before_run 先把原值记进进度并存盘，再把行参数存进配置文件，两次落盘之间被杀，恢复时凭进度把原值写回即可；
 启动一行失败就撤回行参数并暂停编排，免得 decide 一直选中它、让它的任务一次次按原生设置跑；
 after_run 没走完，进度里仍是 row_running 且带着 saved_params，下一次 pick 补还原。
+任务自己的 scheduler.next_run 也算被覆盖的原值：before_run 把它设为现在（凭它判完成），原值一并记进 saved_params。
+行完成时任务已把它推到之后，留着任务写的值，其余还原；没完成、启动失败、崩溃或停止遗留时连它一起还原，
+否则它停在过去，上游会把它当成到点的待办（在插队名单里的还会被编排放行），按用户的原生设置再跑一轮。
 编排进行中（state 是 running 或 paused 且阶段不是 idle、done）上游没有任务可跑，不能让实例因此退出：
 改交一个 5 分钟后到点的占位 Function，上游睡到那时再选，配置一变（比如点了继续）就提前醒来。编排停了或跑完了，照上游重抛。
+编排进行中每次选任务记一行 INFO（选中哪一行、休息到几点、放行了谁），没有编排的实例一行都不记。
 """
 import random
 import threading
@@ -32,19 +36,26 @@ from module.exception import RequestHumanTakeover
 from module.logger import logger
 from module.orchestra.engine import (Decision, TaskRef, decide, next_row_index, on_row_end, on_row_start, recover,
                                      row_limits, sync_controls)
-from module.orchestra.mapping import TASK_SPECS, TaskSpec, apply_row, restore_params
+from module.orchestra.mapping import TASK_SPECS, TaskSpec, apply_row, restore_params, serialize_value
 from module.orchestra.model import Orchestra, validate_rows
-from module.orchestra.progress import Progress, load_progress, progress_path, save_progress
+from module.orchestra.progress import (Progress, adopt_legacy_progress, legacy_progress_path, load_progress,
+                                       progress_path, save_progress)
 
 _HEARTBEAT_THREAD = 'OrchestraHeartbeat'
 _JOIN_TIMEOUT = 5.0   # 等心跳线程退出的秒数上限：它在 Event 上等，被唤醒后至多还剩一次存盘（重试最多约 0.5 秒）
 _EMPTY_WAIT = timedelta(minutes=5)   # 编排进行中却没有任务可跑时，占位等待的时长
+_WAIT_MARGIN = timedelta(seconds=1)  # 休息等待的占位比等待目标晚这么久到点，见 _pick
 
 
 def _function(command: str, when: datetime) -> Function:
     """交给调度循环的 Function。上游只看 command 和 next_run，其余字段取常规值。"""
     return Function(convert_to_underscore(command),
                     {'scheduler': {'enable': True, 'next_run': when, 'priority': 5}})
+
+
+def _next_run_path(spec: TaskSpec) -> str:
+    """任务调度时间的字段路径，以 ConfigModel 为根，与 saved_params 的键同一写法。"""
+    return f'{spec.model_key}.scheduler.next_run'
 
 
 @dataclass
@@ -79,10 +90,12 @@ class OrchestraRuntime:
 
         passthrough 原样返回上游的结果；上游没有任务可跑（抛 RequestHumanTakeover）时，编排没在进行就照样重抛，
         在进行（暂停也算）就改交一个 5 分钟后到点的占位 Function，不让实例退出。native 返回待办里同名的 Function；
-        row 与 wait 另造一个：row 的 next_run 是现在，wait 的 next_run 是休息截止（或更早到点的插队任务），
+        row 与 wait 另造一个：row 的 next_run 是现在，wait 的 next_run 是休息截止（或更早到点的插队任务）再加 1 秒，
         上游发现它没到点就睡到那一刻再重选，占位的任务不会被运行。
+        上一个任务的对象（script.running_task_obj）在这里放下：心跳只在行运行时读它，空闲等待期间不必再引用着。
         """
         try:
+            self._script.running_task_obj = None
             return self._pick()
         except RequestHumanTakeover:
             raise   # 上游没有任务可跑，交还给调用方处理，同没有编排时一样
@@ -118,10 +131,13 @@ class OrchestraRuntime:
             self._log_skipped(settings, p, decision.row_index)
         if p.phase == 'done' and settings.state != 'idle':
             self._set_idle(config)
-        if settings.state in ('running', 'paused') or p.phase not in ('idle', 'done'):
+        active = settings.state in ('running', 'paused') or p.phase not in ('idle', 'done')
+        if active:
             p = replace(p, status_note=self._anti_ban_note(config, now))   # 提示只在编排进行中才更新，否则原样不动
         self._commit(p)
         self._decision = decision
+        if active:
+            self._log_decision(decision, p)
 
         if decision.kind == 'passthrough':
             if error is None:
@@ -135,7 +151,9 @@ class OrchestraRuntime:
             return self._pending_function(config, decision.command)
         if decision.kind == 'row':
             return _function(decision.command, now)
-        return _function(decision.command or self._placeholder(settings, p), decision.at)
+        # 晚 1 秒到点：上游拿到占位时若已到点（等待目标与上游取的 now 只差几毫秒），会把占位的任务名当成
+        # 到点的任务直接运行，before_run 认不出是行，那个任务就按原生设置跑了一轮
+        return _function(decision.command or self._placeholder(settings, p), decision.at + _WAIT_MARGIN)
 
     def _wait_function(self, settings: Orchestra, p: Progress, now: datetime) -> Function | None:
         """上游没有任务可跑、编排又在进行时用：交一个 5 分钟后到点的占位 Function，上游睡到那时再选。
@@ -166,12 +184,15 @@ class OrchestraRuntime:
             return wait
 
     def _load(self, config) -> bool:
-        """首次调用时读进度文件。文件缺失或损坏时 load_progress 给默认进度，不算失败；
-        读文件本身出错（如被占用）返回 False，这一次按上游选，下一次再读。"""
+        """首次调用时读进度文件。新位置还没有、旧位置（log/.orchestra_<实例名>.json）有时，先把旧文件搬过来，
+        进行中的序列与没还原的原值都接得上。文件缺失或损坏时 load_progress 给默认进度，不算失败；
+        搬或读本身出错（如被占用）返回 False，这一次按上游选，下一次再来。"""
         if self._p is not None:
             return True
         path = progress_path(config.config_name)
         try:
+            if adopt_legacy_progress(config.config_name):
+                logger.info(f'编排进度文件已从 {legacy_progress_path(config.config_name)} 搬到 {path}')
             p = load_progress(path)
         except OSError as exc:
             logger.warning(f'编排进度文件读取失败（{path}）：{exc!r}，本次按上游原逻辑选任务，下次再试')
@@ -212,7 +233,7 @@ class OrchestraRuntime:
         try:
             restore_params(config.model, saved)
         except Exception as exc:
-            logger.error(f'编排：行参数有字段没能还原，其余已还原：{exc}')
+            logger.error(f'编排：行参数有字段没能还原，其余已还原：{exc}', exc_info=exc)
         config.save()
 
     @staticmethod
@@ -220,6 +241,21 @@ class OrchestraRuntime:
         """序列跑完：把 state 写回 idle 并存配置。否则下一次 sync_controls 会把还停在 running 的 state 当成新的开始。"""
         config.model.orchestra.state = 'idle'
         config.save()
+
+    @staticmethod
+    def _log_decision(decision: Decision, p: Progress) -> None:
+        """编排进行中每次选任务记一行：选中哪一行、休息到几点、放行了谁，或者为什么交还上游。"""
+        if decision.kind == 'row':
+            message = f'选中第 {decision.row_index + 1} 行 {decision.command}'
+        elif decision.kind == 'wait':
+            message = f'休息中，等到 {decision.at:%H:%M:%S}'
+            if decision.command is not None:
+                message += f'，届时放行 {decision.command}'
+        elif decision.kind == 'native':
+            message = f'放行 {decision.command}，按它自己的设置运行'
+        else:
+            message = '已暂停，按上游原逻辑选任务' if p.paused else '本次不插手，按上游原逻辑选任务'
+        logger.info(f'编排：{message}')
 
     @staticmethod
     def _log_skipped(settings: Orchestra, p: Progress, index: int) -> None:
@@ -282,27 +318,34 @@ class OrchestraRuntime:
         if self._p is None or not 0 <= index < len(settings.rows) or settings.rows[index].task != command:
             return   # pick 之后表被改了，那一行已不是当时选中的
         row, p = settings.rows[index], self._p
-        saved = None
+        written: dict = {}   # 已在内存里改过的字段的原值，启动失败时只撤回这些
         try:
             spec = TASK_SPECS[command]
-            # 剩余量只属于被中断的那一行；decide 跳过无效行选了别的行，它不沿用
-            count, minutes = (row_limits(row, p, settings.resume_policy) if index == p.row_index
+            # 剩余量只属于被中断的那一行，行号和任务都对得上才沿用：decide 跳过无效行选了别的行，
+            # 或表在运行中被改过、同一个行号换了任务，都按该行自己的上限
+            resuming = index == p.row_index and p.row_task == command
+            count, minutes = (row_limits(row, p, settings.resume_policy) if resuming
                               else (row.max_count, row.max_minutes))
-            saved = apply_row(config.model, row, count, minutes)
+            next_run_path = _next_run_path(spec)
+            original_next_run = ConfigModel.deep_get(config.model, next_run_path)
+            if not isinstance(original_next_run, datetime):
+                raise ValueError(f'无法读取 {next_run_path}')
+            written = apply_row(config.model, row, count, minutes)
+            saved = {**written, next_run_path: serialize_value(original_next_run)}   # 下面要把 next_run 改成现在
             now = self._clock()
             # 先把原值记进进度并存盘，再把行参数存进配置文件：两次落盘之间被杀，恢复时凭进度把原值写回即可（幂等）
-            started = on_row_start(p, index, now, saved)
+            started = on_row_start(p, index, now, saved, command)
             self._commit(started)
             if self._dirty:   # 进度没存成：原值只在内存里，不能把行参数写进配置文件，当作启动失败
                 raise OSError('进度文件没能存盘，不写行参数')
             # next_run 先设为现在（同 Config.task_call，截到秒）：任务正常结束会把它推到之后，
             # 推不动就说明没走到结束，after_run 凭它判定完成
-            next_run_path = f'{spec.model_key}.scheduler.next_run'
             if not ConfigModel.deep_set(config.model, next_run_path, now.replace(microsecond=0)):
                 raise ValueError(f'无法写入 {next_run_path}')
+            written = saved
             config.save()   # 任务内部 task_delay 会 reload，没存盘的行参数会丢
         except Exception as exc:
-            self._abort_start(config, p, saved, index, command, exc)
+            self._abort_start(config, p, written, index, command, exc)
             return
         script.running_task_obj = None   # 心跳不能读到上一个任务的计数
         row_run = _Row(spec, base=started.done_count or 0)
@@ -310,29 +353,30 @@ class OrchestraRuntime:
         self._start_heartbeat(row_run)
         logger.info(f'编排：第 {index + 1} 行 {command} 开始（次数上限 {count}，分钟上限 {minutes}）')
 
-    def _abort_start(self, config, p: Progress, saved: dict | None, index: int, command: str,
+    def _abort_start(self, config, p: Progress, written: dict, index: int, command: str,
                      exc: Exception) -> None:
         """启动一行失败（写参数、存进度、存配置，哪一步都算）：撤回行参数、记错误、暂停编排。
 
         不暂停的话，decide 会一直选中这一行，它的任务就一次次按自己的设置原生运行。当前这个任务仍照常跑一次。
-        配置文件在最后一步 config.save() 之前没有写过行参数，所以撤回只改内存，暂停时的 config.save() 把撤回后的值一并存下；
-        撤回成功且存成了，进度才退回开始之前。否则保持原样：进度里若已有 row_running 与原值，下一次 pick 当作中断补还原。
-        撤回与暂停各自出错都只记日志，互不挡着。
+        written 是已在内存里改过的字段的原值：行参数，以及已改成现在的 next_run。没改过的不碰，免得撤回一个写不进去的字段时
+        白白报错。配置文件在最后一步 config.save() 之前没有写过行参数，所以撤回只改内存，暂停时的 config.save()
+        把撤回后的值一并存下。撤回成功且存成了，进度才退回开始之前。否则保持原样：进度里若已有 row_running 与原值，
+        下一次 pick 当作中断补还原。撤回与暂停各自出错都只记日志（带调用栈），互不挡着。
         """
-        logger.error(f'编排：第 {index + 1} 行 {command} 启动失败：{exc!r}，撤回行参数并暂停编排')
+        logger.error(f'编排：第 {index + 1} 行 {command} 启动失败：{exc!r}，撤回行参数并暂停编排', exc_info=exc)
         reverted = True
         try:
-            if saved:
-                restore_params(config.model, saved)
+            if written:
+                restore_params(config.model, written)
         except Exception as err:
             reverted = False
-            logger.error(f'编排：撤回第 {index + 1} 行的行参数时出错：{err!r}')
+            logger.error(f'编排：撤回第 {index + 1} 行的行参数时出错：{err!r}', exc_info=err)
         try:
             self._pause(config)
             if reverted:
                 self._commit(p)
         except Exception as err:
-            logger.error(f'编排：暂停编排时出错：{err!r}')
+            logger.error(f'编排：暂停编排时出错：{err!r}', exc_info=err)
 
     @staticmethod
     def _pause(config) -> None:
@@ -361,13 +405,17 @@ class OrchestraRuntime:
         settings = config.model.orchestra
         with self._lock:
             p = self._p
-        next_run = ConfigModel.deep_get(config.model, f'{row.spec.model_key}.scheduler.next_run')
+        next_run_path = _next_run_path(row.spec)
+        next_run = ConfigModel.deep_get(config.model, next_run_path)
         # 规格 §8.4：run 返回成功，且任务把 next_run 推到了开始之后，才算这一行完成
         completed = (success and isinstance(next_run, datetime) and p.row_started_at is not None
                      and next_run > p.row_started_at)
         counter = self._counter(row.spec)
         done_count = None if counter is None else row.base + counter   # 读不到就传 None，engine 保留此前的累计
-        self._restore(config, p.saved_params)
+        # 完成了：任务自己推后的 next_run 留着，其余原值还原；没完成：连 next_run 一起还原，免得它停在过去
+        originals = p.saved_params if not completed else {
+            path: raw for path, raw in p.saved_params.items() if path != next_run_path}
+        self._restore(config, originals)
         ended = on_row_end(p, settings, self._clock(), completed, done_count, self._rng)
         if ended.phase == 'done' and settings.state != 'idle':
             self._set_idle(config)

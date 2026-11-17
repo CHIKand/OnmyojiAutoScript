@@ -21,13 +21,16 @@ from module.exception import RequestHumanTakeover
 from module.orchestra import runtime as runtime_module
 from module.orchestra.mapping import TASK_SPECS
 from module.orchestra.model import OrchestraRow
-from module.orchestra.progress import Progress, load_progress, progress_path, save_progress
+from module.orchestra.progress import Progress, legacy_progress_path, load_progress, progress_path, save_progress
 from module.orchestra.runtime import (OrchestraRuntime, orchestra_after_run, orchestra_before_run, orchestra_pick,
                                       runtime_of)
 from tasks.Orochi.config import Layer
 
 T0 = datetime(2026, 11, 17, 10, 0)
 LIMIT_COUNT = 'orochi.orochi_config.limit_count'
+LAYER = 'orochi.orochi_config.layer'
+NEXT_RUN = 'orochi.scheduler.next_run'
+DEFAULT_NEXT_RUN = ConfigModel().orochi.scheduler.next_run   # 上游默认值 2023-01-01，一直在过去
 HEARTBEAT = 'OrchestraHeartbeat'
 # 真实的 Config.save / update_scheduler 用了 pydantic 已弃用的 .dict()，用到真实 Config 的用例不刷这条上游警告
 REAL_CONFIG = pytest.mark.filterwarnings(
@@ -120,8 +123,19 @@ def warnings(caplog) -> list[logging.LogRecord]:
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    created: list[OrchestraRuntime] = []
+    real_init = OrchestraRuntime.__init__
+
+    def tracking_init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        created.append(self)
+    monkeypatch.setattr(OrchestraRuntime, '__init__', tracking_init)
     yield
-    assert heartbeat_threads() == []   # 每个用例结束时，心跳线程都已经停了并回收
+    left_running = heartbeat_threads()
+    for runtime in created:   # 断言失败时 after_run 没走到：停掉它的心跳，免得线程拖进后面的用例
+        runtime._abandon_row()
+    assert heartbeat_threads() == []
+    assert left_running == []   # 每个用例自己也该把心跳线程停掉并回收
 
 
 # ---------- 简报规定的 8 个用例 ----------
@@ -151,12 +165,13 @@ def test_row_cycle_applies_and_restores_params():
     assert (cfg.limit_count, cfg.layer) == (12, Layer.TWELVE)
     p = saved()
     assert p.phase == 'row_running' and p.row_started_at == T0
-    assert p.saved_params == {LIMIT_COUNT: 30, 'orochi.orochi_config.layer': '悲鸣'}
+    assert p.saved_params == {LIMIT_COUNT: 30, LAYER: '悲鸣', NEXT_RUN: DEFAULT_NEXT_RUN.isoformat()}
 
     config.model.orochi.scheduler.next_run = T0 + timedelta(days=1)   # 任务正常结束，会把 next_run 推到明天
     clock.advance(minutes=3)
     runtime.after_run('Orochi', True)
     assert (cfg.limit_count, cfg.layer) == (30, Layer.ELEVEN)
+    assert config.model.orochi.scheduler.next_run == T0 + timedelta(days=1)   # 完成了：任务自己推后的 next_run 留着
     p = saved()
     assert p.phase == 'resting' and p.row_index == 1 and p.saved_params == {}
     assert p.rest_until == T0 + timedelta(minutes=8)   # 结束于 3 分钟时，默认休息 5 分钟
@@ -399,8 +414,8 @@ def test_wait_placeholder_is_the_current_row_task():
     rows = [OrchestraRow(task='Orochi'), OrchestraRow(task='GoryouRealm')]
     resting = Progress(phase='resting', row_index=1, sequence_started_at=T0, rest_until=T0 + timedelta(minutes=5))
     runtime, _, config, _ = make(rows=rows, progress=resting)
-    picked = runtime.pick()   # 休息中、没有插队任务：占位 Function 的时间就是休息截止
-    assert (picked.command, picked.next_run) == ('GoryouRealm', T0 + timedelta(minutes=5))
+    picked = runtime.pick()   # 休息中、没有插队任务：占位 Function 的时间是休息截止再加 1 秒
+    assert (picked.command, picked.next_run) == ('GoryouRealm', T0 + timedelta(minutes=5, seconds=1))
     runtime.before_run('GoryouRealm')   # 万一上游在休息截止的一瞬间把它当成到点的任务交了上来，也不当作编排的行
     assert saved().phase == 'resting' and config.saves == 0
     runtime.after_run('GoryouRealm', True)
@@ -419,7 +434,7 @@ def test_wait_targets_the_earlier_cut_in_task():
     runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi')], progress=resting)
     config.waiting_task = [fn('meta_demon', T0 + timedelta(minutes=2))]
     picked = runtime.pick()
-    assert (picked.command, picked.next_run) == ('MetaDemon', T0 + timedelta(minutes=2))
+    assert (picked.command, picked.next_run) == ('MetaDemon', T0 + timedelta(minutes=2, seconds=1))
     assert saved().phase == 'resting'
 
 
@@ -561,7 +576,7 @@ def test_config_save_failure_keeps_saved_params_for_the_next_pick(monkeypatch):
 
 def test_resume_same_interrupted_row_uses_remaining_limits_and_accumulates_count():
     row = OrchestraRow(task='Orochi', max_count=30, max_minutes=20)
-    interrupted = Progress(phase='interrupted', row_index=0, sequence_started_at=T0, done_count=10,
+    interrupted = Progress(phase='interrupted', row_index=0, row_task='Orochi', sequence_started_at=T0, done_count=10,
                            row_elapsed_before=600.0)
     runtime, script, config, clock = make(rows=[row], progress=interrupted)
     cfg = config.model.orochi.orochi_config
@@ -686,7 +701,8 @@ def test_a_failing_revert_does_not_stop_the_pause_and_keeps_the_originals_record
     cfg = config.model.orochi.orochi_config
     assert (cfg.limit_count, cfg.layer) == (12, Layer.TWELVE)   # 行参数没撤回成，随暂停存进了配置
     p = saved()
-    assert p.phase == 'row_running' and p.saved_params == {LIMIT_COUNT: 30, 'orochi.orochi_config.layer': '悲鸣'}   # 原值不能丢
+    assert p.phase == 'row_running' and p.saved_params == {LIMIT_COUNT: 30, LAYER: '悲鸣',
+                                                            NEXT_RUN: DEFAULT_NEXT_RUN.isoformat()}   # 原值不能丢
 
     config.pending_task = [fn('restart', T0)]
     runtime.pick()   # 下一次选任务：当作中断，用进度里的原值补还原
@@ -726,8 +742,8 @@ def test_progress_is_written_before_the_row_params_reach_the_config_file():
     config.save = lambda: seen.append(saved())   # 配置文件被写的那一刻，进度文件里应该已经记着原值了
     runtime.before_run('Orochi')
     assert len(seen) == 1
-    assert seen[0].phase == 'row_running' and seen[0].saved_params == {LIMIT_COUNT: 30,
-                                                                        'orochi.orochi_config.layer': '悲鸣'}
+    assert seen[0].phase == 'row_running' and seen[0].saved_params == {LIMIT_COUNT: 30, LAYER: '悲鸣',
+                                                                        NEXT_RUN: DEFAULT_NEXT_RUN.isoformat()}
     runtime.after_run('Orochi', False)
 
 
@@ -746,7 +762,8 @@ def test_a_kill_between_the_two_writes_leaves_originals_that_recovery_restores()
     with pytest.raises(Killed):
         runtime.before_run('Orochi')
     p = saved()
-    assert p.phase == 'row_running' and p.saved_params == {LIMIT_COUNT: 30, 'orochi.orochi_config.layer': '悲鸣'}
+    assert p.phase == 'row_running' and p.saved_params == {LIMIT_COUNT: 30, LAYER: '悲鸣',
+                                                            NEXT_RUN: DEFAULT_NEXT_RUN.isoformat()}
     assert heartbeat_threads() == []   # 心跳在两次落盘之后才起
 
     # 重启：配置文件里还是原值，进度里是 row_running 与原值
@@ -772,7 +789,8 @@ def test_double_failure_keeps_the_originals_in_the_progress():
     assert (cfg.limit_count, cfg.layer) == (30, Layer.ELEVEN)   # 内存里的行参数撤回了
     assert config.model.orchestra.state == 'paused'   # 内存里已暂停，存不存得下来另说
     p = saved()
-    assert p.phase == 'row_running' and p.saved_params == {LIMIT_COUNT: 30, 'orochi.orochi_config.layer': '悲鸣'}
+    assert p.phase == 'row_running' and p.saved_params == {LIMIT_COUNT: 30, LAYER: '悲鸣',
+                                                            NEXT_RUN: DEFAULT_NEXT_RUN.isoformat()}
     runtime.after_run('Orochi', True)   # 行没起，什么都不做
     assert saved().phase == 'row_running'
 
@@ -787,8 +805,8 @@ def test_double_failure_keeps_the_originals_in_the_progress():
 def test_before_run_sets_next_run_to_now_and_clears_the_previous_task_object():
     runtime, script, config, _ = make(rows=[OrchestraRow(task='Orochi')])
     config.model.orochi.scheduler.next_run = T0 + timedelta(days=1)
-    script.running_task_obj = SimpleNamespace(current_count=99)   # 上一个任务的对象
     runtime.pick()
+    script.running_task_obj = SimpleNamespace(current_count=99)   # 上一个任务的对象（pick 已清过一次，这里再放回去）
     runtime.before_run('Orochi')
     assert config.model.orochi.scheduler.next_run == T0   # 否则任务把 next_run 推回原值，就分不出完成与否
     assert script.running_task_obj is None
@@ -842,7 +860,7 @@ def test_after_run_error_leaves_progress_recoverable(monkeypatch):
         runtime.after_run('Orochi', True)   # 不抛异常，线程也停了
     assert heartbeat_threads() == []
     p = saved()
-    assert p.phase == 'row_running' and p.saved_params == {LIMIT_COUNT: 30}   # 进度没推进，原值还记着
+    assert p.phase == 'row_running' and p.saved_params == {LIMIT_COUNT: 30, NEXT_RUN: DEFAULT_NEXT_RUN.isoformat()}   # 进度没推进，原值还记着
     runtime.after_run('Orochi', True)   # 那一行已经收过尾（虽然出错了）：再调用什么都不做，不会补推进度
     assert saved().phase == 'row_running'
     config.model.orochi.orochi_config.limit_count = 12   # 假设这次的还原没能落到配置里
@@ -880,7 +898,7 @@ def test_heartbeat_survives_failing_saves(monkeypatch):
 
 
 def test_heartbeat_adds_the_previous_count_of_a_resumed_row():
-    interrupted = Progress(phase='interrupted', row_index=0, sequence_started_at=T0, done_count=10,
+    interrupted = Progress(phase='interrupted', row_index=0, row_task='Orochi', sequence_started_at=T0, done_count=10,
                            row_elapsed_before=60.0)
     runtime, script, _, _ = make(rows=[OrchestraRow(task='Orochi', max_count=30)], progress=interrupted, interval=0.02)
     runtime.pick()
@@ -1166,6 +1184,7 @@ def test_interrupted_row_through_the_real_config_file():
     runtime.after_run('Orochi', True)   # run 返回了，但任务没走到 task_delay：文件里的 next_run 还是 before_run 写的那个
     restored = ConfigModel('t').orochi
     assert (restored.orochi_config.limit_count, restored.orochi_config.layer) == (30, Layer.ELEVEN)
+    assert restored.scheduler.next_run == DEFAULT_NEXT_RUN   # 没完成：next_run 也回到行开始之前
     assert saved().phase == 'interrupted'
 
 
@@ -1190,3 +1209,283 @@ def test_module_level_hooks_delegate_to_the_runtime():
     orchestra_before_run(script, 'Orochi')
     orchestra_after_run(script, 'Orochi', True)
     assert calls == ['pick', ('before', 'Orochi'), ('after', 'Orochi', True)]
+
+
+# ---------- 最终评审修正 ----------
+
+# I1：行没完成时，任务自己的 next_run 也还原；否则它停在"现在"，被上游当成到点任务按原生设置再跑一轮
+
+def test_interrupted_row_puts_the_native_next_run_back():
+    runtime, _, config, clock = make(rows=[OrchestraRow(task='Orochi', max_count=12)])
+    tomorrow = T0 + timedelta(days=1)
+    config.model.orochi.scheduler.next_run = tomorrow   # 用户原本排在明天
+    runtime.pick()
+    runtime.before_run('Orochi')
+    assert config.model.orochi.scheduler.next_run == T0   # 行开始：设为现在，用来判完成
+    assert saved().saved_params[NEXT_RUN] == tomorrow.isoformat()
+    clock.advance(minutes=3)
+    runtime.after_run('Orochi', True)   # 任务没走到 task_delay：没完成
+    assert saved().phase == 'interrupted'
+    assert config.model.orochi.scheduler.next_run == tomorrow   # 回到明天，不会成为到点的待办
+
+
+def test_completed_row_keeps_the_next_run_the_task_wrote():
+    rows = [OrchestraRow(task='Orochi', max_count=12), OrchestraRow(task='Orochi')]
+    runtime, _, config, clock = make(rows=rows)
+    config.model.orochi.scheduler.next_run = T0 + timedelta(days=3)
+    runtime.pick()
+    runtime.before_run('Orochi')
+    config.model.orochi.scheduler.next_run = T0 + timedelta(hours=2)   # 任务正常结束时自己推的时间
+    clock.advance(minutes=3)
+    runtime.after_run('Orochi', True)
+    assert saved().phase == 'resting'
+    assert config.model.orochi.scheduler.next_run == T0 + timedelta(hours=2)   # 不还原成三天后
+    assert config.model.orochi.orochi_config.limit_count == 30   # 其余原值照常还原
+
+
+def test_crash_recovery_puts_the_native_next_run_back_too():
+    tomorrow = T0 + timedelta(days=1)
+    crashed = Progress(phase='row_running', row_index=0, row_task='Orochi', sequence_started_at=T0, row_started_at=T0,
+                       saved_params={LIMIT_COUNT: 30, NEXT_RUN: tomorrow.isoformat()})
+    runtime, _, config, _ = make(state='idle', progress=crashed)   # 停止之后才重启
+    config.model.orochi.orochi_config.limit_count = 12
+    config.model.orochi.scheduler.next_run = T0   # 崩溃时留在配置里的"现在"
+    config.pending_task = [fn('restart', T0)]
+    runtime.pick()
+    assert (config.model.orochi.orochi_config.limit_count, config.model.orochi.scheduler.next_run) == (30, tomorrow)
+    assert saved().saved_params == {}
+
+
+def test_a_failed_start_puts_the_native_next_run_back():
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi', max_count=12)])
+    tomorrow = T0 + timedelta(days=1)
+    config.model.orochi.scheduler.next_run = tomorrow
+    runtime.pick()
+    real_save, calls = config.save, []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError('disk full')   # 写行参数的那次存配置失败：next_run 这时在内存里已是现在
+        real_save()
+    config.save = flaky
+    runtime.before_run('Orochi')
+    assert config.model.orchestra.state == 'paused'
+    assert (config.model.orochi.orochi_config.limit_count, config.model.orochi.scheduler.next_run) == (30, tomorrow)
+
+
+def test_an_unreadable_native_next_run_stops_the_row_before_anything_is_written(monkeypatch):
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi', max_count=12)])
+    runtime.pick()
+    real_get = ConfigModel.deep_get
+
+    def hide_next_run(obj, keys, default=None):
+        return default if str(keys).endswith('scheduler.next_run') else real_get(obj, keys, default)
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_module.ConfigModel, 'deep_get', staticmethod(hide_next_run))
+        runtime.before_run('Orochi')
+    assert config.model.orchestra.state == 'paused' and config.model.orochi.orochi_config.limit_count == 30
+    assert saved().phase == 'ready' and saved().saved_params == {}
+
+
+@REAL_CONFIG
+@pytest.mark.filterwarnings('ignore:Pydantic serializer warnings:UserWarning')   # 上游默认值里写成字符串的整数字段
+def test_an_interrupted_climb_row_is_not_rerun_natively_as_a_cut_in():
+    # 爬塔既在表里又在插队名单里，用户自己把它排在明天。行没完成时 next_run 若停在"现在"，
+    # 下一次选任务它就成了到点的插队任务，按用户自己的原生设置跑最多 30 分钟
+    model = ConfigModel()
+    model.restart.scheduler.enable = False
+    tomorrow = (datetime.now() + timedelta(days=1)).replace(microsecond=0)
+    model.activity_shikigami.scheduler.enable, model.activity_shikigami.scheduler.next_run = True, tomorrow
+    model.orchestra.rows = [OrchestraRow(task='ActivityShikigami', sub1='ap', max_count=50)]
+    model.orchestra.state = 'running'
+    ConfigModel.write_json('t', model.model_dump())
+    script = SimpleNamespace(config=Config('t'), config_name='t', anti_ban_guard=AntiBanGuard(), running_task_obj=None)
+    runtime = OrchestraRuntime(script, rng=random.Random(0))
+    assert runtime.pick().command == 'ActivityShikigami'
+    runtime.before_run('ActivityShikigami')
+    runtime.after_run('ActivityShikigami', True)   # 没走到 task_delay：没完成
+    assert ConfigModel('t').activity_shikigami.scheduler.next_run == tomorrow
+    script.config = Config('t')   # 上游每轮之后重建 config
+    assert runtime.pick().command == 'ActivityShikigami'
+    assert runtime._decision.kind == 'row'   # 续跑表里的这一行，不是按原生设置插队
+
+
+# I2：上游的御魂溢出自愈 SoulsTidy 在编排进行中照样放行
+
+def test_souls_tidy_is_let_through_during_the_sequence():
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi')], cut_in_tasks=[])
+    tidy = fn('souls_tidy', T0 - timedelta(minutes=1))
+    config.pending_task = [fn('orochi', T0 - timedelta(hours=1)), tidy]
+    assert runtime.pick() is tidy
+
+
+# I4：进度文件搬到 log/orchestra/，旧位置的文件在第一次读进度时搬过来
+
+def test_a_legacy_progress_file_is_adopted_with_its_originals():
+    crashed = Progress(phase='row_running', row_index=0, row_task='Orochi', sequence_started_at=T0, row_started_at=T0,
+                       heartbeat_at=T0 + timedelta(minutes=5), done_count=8, saved_params={LIMIT_COUNT: 30})
+    save_progress(legacy_progress_path('t'), crashed)   # 旧版本写在 log/ 根目录下的、进行中的进度
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi', max_count=30)])
+    config.model.orochi.orochi_config.limit_count = 99
+    assert runtime.pick().command == 'Orochi'
+    assert not legacy_progress_path('t').exists()
+    assert config.model.orochi.orochi_config.limit_count == 30   # 原值随文件搬了过来，照样还原
+    p = saved()
+    assert (p.phase, p.row_elapsed_before, p.done_count, p.saved_params) == ('interrupted', 300.0, 8, {})
+
+
+def test_a_legacy_file_that_cannot_be_moved_yet_is_retried_on_the_next_pick(monkeypatch, caplog):
+    resting = Progress(phase='resting', row_index=0, sequence_started_at=T0, rest_until=T0 + timedelta(minutes=5))
+    save_progress(legacy_progress_path('t'), resting)
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi')])
+    real, calls = runtime_module.adopt_legacy_progress, []
+
+    def flaky(name):
+        calls.append(name)
+        if len(calls) == 1:
+            raise PermissionError('locked')
+        return real(name)
+    monkeypatch.setattr(runtime_module, 'adopt_legacy_progress', flaky)
+    due = fn('restart', T0)
+    config.pending_task = [due]
+    with caplog.at_level(logging.WARNING):
+        assert runtime.pick() is due   # 这一次按上游的选，编排不插手
+    assert [r for r in warnings(caplog) if '读取失败' in r.getMessage()]
+    assert legacy_progress_path('t').exists() and not progress_path('t').exists()
+    config.pending_task = []
+    picked = runtime.pick()   # 下一次搬成了，接着旧文件里的休息
+    assert (picked.command, picked.next_run) == ('Orochi', T0 + timedelta(minutes=5, seconds=1))
+    assert not legacy_progress_path('t').exists() and saved().phase == 'resting'
+
+
+# N1：表在运行中被改过、同一个行号换了任务：不沿用被打断那一行的剩余量
+
+def test_a_row_edited_into_another_task_gets_its_own_limits():
+    interrupted = Progress(phase='interrupted', row_index=0, row_task='Orochi', sequence_started_at=T0, done_count=10,
+                           row_elapsed_before=600.0)
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='GoryouRealm', max_count=25, max_minutes=20)],
+                                 progress=interrupted)
+    assert runtime.pick().command == 'GoryouRealm'
+    runtime.before_run('GoryouRealm')
+    cfg = config.model.goryou_realm.goryou_config
+    assert (cfg.limit_count, cfg.limit_time) == (25, dtime(0, 20))   # 不是 15 次、10 分钟
+    p = saved()
+    assert (p.row_index, p.row_task, p.row_elapsed_before, p.done_count) == (0, 'GoryouRealm', 0.0, None)
+    runtime.after_run('GoryouRealm', False)
+
+
+def test_the_progress_file_names_the_task_of_the_running_row():
+    runtime, _, _, _ = make(rows=[OrchestraRow(task='NoSuchTask'), OrchestraRow(task='GoryouRealm')])
+    runtime.pick()
+    runtime.before_run('GoryouRealm')
+    assert (saved().row_index, saved().row_task) == (1, 'GoryouRealm')
+    runtime.after_run('GoryouRealm', False)
+    assert (saved().phase, saved().row_task) == ('interrupted', 'GoryouRealm')
+
+
+# N3：选任务时放下上一个任务的对象
+
+@pytest.mark.parametrize('state', ['idle', 'running'])
+def test_pick_lets_go_of_the_previous_task_object(state):
+    runtime, script, config, _ = make(rows=[OrchestraRow(task='Orochi')], state=state)
+    config.pending_task = [fn('restart', T0)]
+    script.running_task_obj = SimpleNamespace(current_count=99)   # 上一个任务的对象，空闲等待期间不必还留着
+    runtime.pick()
+    assert script.running_task_obj is None
+
+
+# N6：编排进行中每次选任务记一行 INFO
+
+def orchestra_info(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if r.name == 'oas' and r.levelno == logging.INFO and r.getMessage().startswith('编排：')]
+
+
+def test_each_pick_logs_its_decision_while_orchestrating(caplog):
+    rows = [OrchestraRow(task='Orochi'), OrchestraRow(task='GoryouRealm')]
+    resting = Progress(phase='resting', row_index=1, sequence_started_at=T0, rest_until=T0 + timedelta(minutes=5))
+    runtime, _, config, clock = make(rows=rows, progress=resting)
+    with caplog.at_level(logging.INFO):
+        runtime.pick()                                  # 休息中
+        config.pending_task = [fn('meta_demon', T0)]
+        runtime.pick()                                  # 插队
+        config.pending_task = []
+        clock.advance(minutes=6)
+        runtime.pick()                                  # 休息完，下一行
+        config.model.orchestra.state = 'paused'
+        config.pending_task = [fn('restart', T0)]
+        runtime.pick()                                  # 暂停
+    lines = orchestra_info(caplog)
+    assert len(lines) == 4   # 每次选任务一行
+    assert '休息' in lines[0] and '10:05:00' in lines[0]
+    assert 'MetaDemon' in lines[1]
+    assert '第 2 行' in lines[2] and 'GoryouRealm' in lines[2]
+    assert '暂停' in lines[3]
+
+
+def test_an_idle_instance_logs_nothing_about_the_orchestration(caplog):
+    runtime, _, config, _ = make(state='idle')
+    config.pending_task = [fn('orochi', T0)]
+    with caplog.at_level(logging.INFO):
+        runtime.pick()
+    assert not [r for r in caplog.records if '编排' in r.getMessage()]
+
+
+# N7：休息等待的占位多等 1 秒
+
+def test_the_rest_placeholder_is_due_a_second_after_the_rest_ends():
+    # 上游拿到占位时若已到点（休息截止与上游取 now 只差几毫秒），会把占位的任务名当成到点任务直接跑，
+    # before_run 认不出是行，任务就按原生设置跑了一轮。多等 1 秒，上游睡过这一刻再来选
+    rest_until = T0 + timedelta(minutes=5)
+    resting = Progress(phase='resting', row_index=0, sequence_started_at=T0, rest_until=rest_until)
+    runtime, _, _, clock = make(rows=[OrchestraRow(task='Orochi')], progress=resting)
+    clock.now = rest_until - timedelta(milliseconds=1)
+    assert runtime.pick().next_run == rest_until + timedelta(seconds=1)
+
+
+# N8：错误日志带上异常的调用栈
+
+def test_a_start_failure_is_logged_with_its_traceback(monkeypatch, caplog):
+    runtime, _, _, _ = make(rows=[OrchestraRow(task='Orochi', max_count=12)])
+    runtime.pick()
+
+    def refuse(*args, **kwargs):
+        raise ValueError('字段路径无法解析')
+    monkeypatch.setattr(runtime_module, 'apply_row', refuse)
+    with caplog.at_level(logging.ERROR):
+        runtime.before_run('Orochi')
+    records = [r for r in caplog.records if r.levelno >= logging.ERROR and '启动失败' in r.getMessage()]
+    assert len(records) == 1 and records[0].exc_info is not None and records[0].exc_info[0] is ValueError
+
+
+def test_a_failing_revert_is_logged_with_its_traceback(monkeypatch, caplog):
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi', max_count=12)])
+    runtime.pick()
+    real_save, calls = config.save, []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError('disk full')
+        real_save()
+    config.save = flaky
+
+    def boom(*args, **kwargs):
+        raise RuntimeError('撤回出错')
+    with monkeypatch.context() as patch, caplog.at_level(logging.ERROR):
+        patch.setattr(runtime_module, 'restore_params', boom)
+        runtime.before_run('Orochi')
+    records = [r for r in caplog.records if r.levelno >= logging.ERROR and r.getMessage().startswith('编排：撤回第')]
+    assert len(records) == 1 and records[0].exc_info is not None
+
+
+def test_a_restore_error_is_logged_with_its_traceback(caplog):
+    stale = Progress(phase='interrupted', row_index=0, sequence_started_at=T0,
+                     saved_params={'orochi.no_such_group.limit_count': 30})
+    runtime, _, config, _ = make(state='idle', progress=stale)
+    config.pending_task = [fn('restart', T0)]
+    with caplog.at_level(logging.ERROR):
+        runtime.pick()
+    records = [r for r in caplog.records if r.levelno >= logging.ERROR and '没能还原' in r.getMessage()]
+    assert len(records) == 1 and records[0].exc_info is not None
