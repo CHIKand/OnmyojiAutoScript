@@ -6,6 +6,7 @@
 重启相关的用例把 instance_control._manager 换成假的。
 """
 import asyncio
+import logging
 import os
 import shutil
 import subprocess
@@ -21,6 +22,7 @@ from fastapi import FastAPI, HTTPException
 
 from module.config import config_model
 from module.config.config_model import ConfigModel
+from module.orchestra.engine import sync_controls
 from module.orchestra.progress import Progress, progress_path, save_progress
 from module.server import instance_control, orchestra_router
 from module.server.custom_routes import register_custom
@@ -78,9 +80,25 @@ class FakeProcess:
         self.calls.append('start')
 
 
+class SlowProcess(FakeProcess):
+    """stop 分两步、中间两次让出事件循环：两次重启若交错进行，记账里会出现两个 stop:begin 挨在一起。"""
+
+    async def stop(self) -> None:
+        self.calls.append('stop:begin')
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.calls.append('stop:end')
+
+
 def use_fake_manager(monkeypatch, **processes: FakeProcess) -> None:
     manager = SimpleNamespace(script_process=dict(processes))
     monkeypatch.setattr(instance_control, '_manager', lambda: manager)
+
+
+def resting(**kwargs) -> None:
+    """实例的进度文件：正在休息。"""
+    save_progress(progress_path('t'), Progress(phase='resting', row_index=1,
+                                               rest_until=datetime.now() + timedelta(minutes=5), **kwargs))
 
 
 # ---------- GET ----------
@@ -200,20 +218,116 @@ def test_put_keeps_what_the_instance_changed_during_validation(instance_dir, mon
 # ---------- POST command ----------
 
 def test_state_commands_walk_through_the_states(instance_dir):
+    # 开始另外记一条 start 命令（序号加 1），暂停、继续、停止只改 state
     for action, state in [('start', 'running'), ('pause', 'paused'), ('resume', 'running'), ('stop', 'idle')]:
         assert asyncio.run(post_command('t', {'action': action})) == {'ok': True}
         saved = stored()
         assert saved.state == state, action
-        assert (saved.command, saved.command_seq) == ('', 0), action
+        assert (saved.command, saved.command_seq) == ('start', 1), action
 
 
 def test_skip_rest_increments_seq(instance_dir):
+    resting()   # 只有休息中才接受跳过休息
     for _ in range(2):
         assert asyncio.run(post_command('t', {'action': 'skip_rest'})) == {'ok': True}
     saved = stored()
     assert saved.command_seq == 2
     assert saved.command == 'skip_rest'
     assert saved.state == 'idle'
+
+
+def test_every_start_is_a_new_command(instance_dir):
+    for seq in (1, 2, 3):
+        assert asyncio.run(post_command('t', {'action': 'start'})) == {'ok': True}
+        saved = stored()
+        assert (saved.state, saved.command, saved.command_seq) == ('running', 'start', seq)
+
+
+def test_stop_then_start_before_the_instance_reads_still_restarts_the_sequence(instance_dir):
+    """实例在两次点击之间没读到配置：光看 state 还是 running，序列会接着跑；start 命令让它从头开始（规格 §8.3 停止即清零）。"""
+    assert asyncio.run(put_orchestra('t', {'rows': [{'task': 'Orochi'}] * 3}))['ok']
+    assert asyncio.run(post_command('t', {'action': 'start'})) == {'ok': True}
+    mid_sequence = Progress(phase='resting', row_index=2, sequence_started_at=datetime(2026, 11, 17, 8, 0),
+                            rest_until=datetime(2026, 11, 17, 9, 0), last_command_seq=stored().command_seq)
+    for action in ('stop', 'start'):   # 实例已处理过第一次开始，正在第 3 行之前休息
+        assert asyncio.run(post_command('t', {'action': action})) == {'ok': True}
+    now = datetime(2026, 11, 17, 8, 30)
+    p = sync_controls(stored(), mid_sequence, now)
+    assert (p.phase, p.row_index, p.sequence_started_at) == ('ready', 0, now)
+
+
+@pytest.mark.parametrize('phase', [None, 'idle', 'ready', 'row_running', 'interrupted', 'done'])
+def test_skip_rest_is_refused_unless_resting(instance_dir, phase):
+    if phase is not None:   # None：还没有进度文件
+        save_progress(progress_path('t'), Progress(phase=phase))
+    before = config_bytes()
+    assert asyncio.run(post_command('t', {'action': 'skip_rest'})) == {'ok': False}
+    assert config_bytes() == before   # 一行在跑时点的跳过，不能留到下一次休息才生效
+
+
+def test_skip_rest_while_paused_in_a_rest_is_accepted(instance_dir):
+    save_progress(progress_path('t'), Progress(phase='resting', paused=True, rest_remaining=120.0))
+    assert asyncio.run(post_command('t', {'action': 'skip_rest'})) == {'ok': True}   # 继续之后生效
+
+
+def test_skip_rest_is_refused_while_a_start_is_pending(instance_dir):
+    resting()   # 上一个序列的休息
+    assert asyncio.run(post_command('t', {'action': 'start'})) == {'ok': True}   # 实例还没读到这次开始
+    before = config_bytes()
+    assert asyncio.run(post_command('t', {'action': 'skip_rest'})) == {'ok': False}   # 否则会把 start 命令顶掉
+    assert config_bytes() == before
+    resting(last_command_seq=1)   # 实例处理了开始，又进入了新序列的休息
+    assert asyncio.run(post_command('t', {'action': 'skip_rest'})) == {'ok': True}
+    assert (stored().command, stored().command_seq) == ('skip_rest', 2)
+
+
+def test_skip_rest_is_refused_when_the_progress_cannot_be_read(instance_dir, monkeypatch):
+    resting()
+
+    def locked(path):
+        raise PermissionError('占用中')
+    monkeypatch.setattr(orchestra_router, 'load_progress', locked)
+    before = config_bytes()
+    assert asyncio.run(post_command('t', {'action': 'skip_rest'})) == {'ok': False}
+    assert config_bytes() == before
+
+
+def test_a_command_waits_for_a_put_that_is_writing(instance_dir, monkeypatch):
+    """PUT 重读配置之后、存盘之前来了开始：两个接口之间不串行的话，PUT 存盘会把开始冲掉。"""
+    real_read = config_model.read_file
+    reread, release = threading.Event(), threading.Event()
+    put_reads = []
+
+    def read(path):
+        data = real_read(path)
+        if threading.current_thread().name == 'put':
+            put_reads.append(path)
+            if len(put_reads) == 2:   # 第一次读是校验用的，第二次是写之前的重读
+                reread.set()
+                release.wait(5)
+        return data
+    monkeypatch.setattr(config_model, 'read_file', read)
+    results = {}
+    put = threading.Thread(name='put', target=lambda: results.update(
+        put=orchestra_router._write_settings('t', {'rows': [{'task': 'Orochi'}]})))
+    command = threading.Thread(name='command', target=lambda: results.update(
+        command=orchestra_router._apply_command('t', 'start')))
+    put.start()
+    try:
+        assert reread.wait(5)
+        command.start()
+        command.join(0.3)
+        waited = command.is_alive()   # PUT 还在读改写：开始要等它存完
+    finally:
+        release.set()
+        put.join(5)
+        if command.is_alive() or command.ident is not None:
+            command.join(5)
+    assert waited
+    assert results == {'put': {'ok': True, 'errors': []}, 'command': {'ok': True}}
+    saved = stored()
+    assert [r.task for r in saved.rows] == ['Orochi']
+    assert (saved.state, saved.command, saved.command_seq) == ('running', 'start', 1)
 
 
 @pytest.mark.parametrize('body', [{'action': 'explode'}, {'action': 'START'}, {'action': None}, {'action': ['start']}, {}])
@@ -279,6 +393,40 @@ def test_restart_running_instances_skips_inactive(monkeypatch):
     assert [processes[name].calls for name in 'acd'] == [['stop', 'start']] * 3
 
 
+def test_overlapping_restarts_of_one_instance_take_turns(monkeypatch):
+    process = SlowProcess()
+    use_fake_manager(monkeypatch, t=process)
+
+    async def twice():
+        return await asyncio.gather(restart_instance('t'), restart_instance('t'))
+    assert asyncio.run(twice()) == [True, True]
+    assert process.calls == ['stop:begin', 'stop:end', 'start'] * 2   # 第二次等第一次 start 完才 stop
+
+
+def test_restart_locks_follow_the_running_event_loop(monkeypatch):
+    process = SlowProcess()
+    use_fake_manager(monkeypatch, t=process)
+
+    async def twice():
+        return await asyncio.gather(restart_instance('t'), restart_instance('t'))
+    for _ in range(2):   # 每次 asyncio.run 是新的事件循环；一把跨循环共用的锁在第二次争用时会报"绑在别的事件循环上"
+        assert asyncio.run(twice()) == [True, True]
+    assert process.calls == ['stop:begin', 'stop:end', 'start'] * 4
+
+
+def test_restart_running_instances_survives_a_failing_instance(monkeypatch, caplog):
+    class Broken(FakeProcess):
+        async def stop(self) -> None:
+            raise RuntimeError('进程停不下来')
+
+    processes = {'a': FakeProcess(), 'b': Broken(), 'c': FakeProcess()}
+    use_fake_manager(monkeypatch, **processes)
+    with caplog.at_level(logging.ERROR):
+        assert asyncio.run(restart_running_instances()) == ['a', 'c']   # 只列出重启成了的
+    assert [processes[name].calls for name in 'ac'] == [['stop', 'start']] * 2
+    assert any('[b]' in r.getMessage() and r.exc_info for r in caplog.records if r.levelno >= logging.ERROR)
+
+
 def test_restart_endpoint(instance_dir, monkeypatch):
     process = FakeProcess()
     use_fake_manager(monkeypatch, t=process)
@@ -321,9 +469,12 @@ def test_blocking_io_runs_off_the_event_loop(instance_dir, monkeypatch):
     spy(orchestra_router, 'instance_names')
     spy(instance_control, 'instance_names')
 
+    resting()
+
     async def scenario() -> int:
         await get_orchestra('t')
         await put_orchestra('t', {'rows': []})
+        await post_command('t', {'action': 'skip_rest'})   # 先读进度文件看是不是在休息
         await post_command('t', {'action': 'start'})
         await post_restart('t')   # 进程表里没有 t：只走名字核对
         return threading.get_ident()

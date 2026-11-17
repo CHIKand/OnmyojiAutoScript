@@ -4,11 +4,13 @@
 而 ConfigModel 读不到文件时会给默认值、一保存就新建配置文件，名字不核对就会碰到不该碰的路径。
 
 配置只经 ConfigModel 读写，上游在 config/<名字>.json.lock 上加跨进程文件锁，实例进程与本接口不会同时写同一个文件。
+本进程里各接口的读改写（PUT 写之前的重读到存盘、命令的读到存盘）再用 _CONFIG_LOCK 串行，互相不会冲掉对方刚写的值。
 同步的文件读写（配置、进度、目录列表）都放到工作线程里做，不卡事件循环。
 本接口只改配置文件，不通知实例：实例等待下一个任务时每 5 秒查一次配置文件的修改时间（上游 Script.wait_until），
 发现变化就重新选任务。
 """
 import asyncio
+import threading
 from dataclasses import asdict
 from datetime import datetime
 
@@ -19,7 +21,7 @@ from module.config.config_model import ConfigModel
 from module.logger import logger
 from module.orchestra.mapping import catalog
 from module.orchestra.model import Orchestra, validate_settings
-from module.orchestra.progress import load_progress, progress_path, progress_to_dict
+from module.orchestra.progress import Progress, load_progress, progress_path, progress_to_dict
 from module.server.instance_control import instance_names
 
 orchestra_app = APIRouter(prefix='/custom/orchestra')
@@ -27,8 +29,9 @@ orchestra_app = APIRouter(prefix='/custom/orchestra')
 _NOT_FOUND = '实例不存在'
 _EDITABLE = ('rows', 'after_finish', 'total_minutes_cap', 'default_rest_minutes', 'rest_jitter', 'resume_policy',
              'cut_in_tasks')   # PUT 能改的项；state、command、command_seq 只由命令接口和引擎写
-_STATE_OF_ACTION = {'start': 'running', 'resume': 'running', 'pause': 'paused', 'stop': 'idle'}
-_ACTIONS = (*_STATE_OF_ACTION, 'skip_rest')   # 用元组，action 是什么类型的值都能安全地比较
+_STATE_OF_ACTION = {'resume': 'running', 'pause': 'paused', 'stop': 'idle'}   # 只改 state 的命令
+_ACTIONS = ('start', *_STATE_OF_ACTION, 'skip_rest')   # 用元组，action 是什么类型的值都能安全地比较
+_CONFIG_LOCK = threading.Lock()   # 本进程里接口之间的配置读改写串行，见文件开头
 
 
 def _validation_errors(exc: ValidationError) -> list[dict]:
@@ -72,29 +75,54 @@ def _write_settings(name: str, body: dict) -> dict:
     if errors:
         return {'ok': False, 'errors': [asdict(error) for error in errors]}
 
-    # 校验与写入之间实例可能改过 state、command_seq（引擎跑完一遍会把 state 置回 idle），
-    # 所以写之前重读一次，只覆盖用户可改的项，运行控制字段保持读到的样子。
-    # 配置的读与写各自加锁，读到写之间（构造 ConfigModel 约几十毫秒）仍有空隙，上游别的写配置的接口也是这样。
-    cfg = ConfigModel(name)
-    live = cfg.orchestra
-    for key in _EDITABLE:
-        setattr(live, key, getattr(candidate, key))
-    cfg.save()
+    # 校验与写入之间实例可能改过 state、command_seq（引擎跑完一遍会把 state 置回 idle），命令接口也可能刚写过，
+    # 所以写之前重读一次，只覆盖用户可改的项，运行控制字段保持读到的样子。重读到存盘持 _CONFIG_LOCK，
+    # 本进程的接口之间不会互相冲掉；实例进程的写入不经过这把锁，读到写之间（构造 ConfigModel 约几十毫秒）
+    # 仍有空隙，上游别的写配置的接口也是这样。
+    with _CONFIG_LOCK:
+        cfg = ConfigModel(name)
+        live = cfg.orchestra
+        for key in _EDITABLE:
+            setattr(live, key, getattr(candidate, key))
+        cfg.save()
     logger.info(f'[{name}] 编排设置已保存，共 {len(live.rows)} 行')
     return {'ok': True, 'errors': []}
+
+
+def _start_pending(live: Orchestra, progress: Progress) -> bool:
+    """配置里有一条实例还没处理的开始命令。"""
+    return live.command == 'start' and live.command_seq > progress.last_command_seq
 
 
 def _apply_command(name: str, action: object) -> dict:
     if name not in instance_names() or action not in _ACTIONS:
         return {'ok': False}
-    cfg = ConfigModel(name)
-    live = cfg.orchestra
-    if action == 'skip_rest':
-        live.command = 'skip_rest'
-        live.command_seq += 1
-    else:
-        live.state = _STATE_OF_ACTION[action]
-    cfg.save()
+    progress = None
+    if action == 'skip_rest':   # 规格 §8.3 跳过休息仅在休息中可用：一行在跑时也记下的话，它会在这一行之后的休息里生效
+        try:
+            progress = load_progress(progress_path(name))
+        except OSError:
+            return {'ok': False}   # 进度文件暂时读不了，不知道是不是在休息
+        if progress.phase != 'resting':
+            return {'ok': False}
+    with _CONFIG_LOCK:
+        cfg = ConfigModel(name)
+        live = cfg.orchestra
+        if action == 'skip_rest':
+            if _start_pending(live, progress):
+                # 实例还没读到上一次的开始：新序列从第 1 行起，没有休息可跳，而且命令只有一格，会把 start 顶掉
+                return {'ok': False}
+            live.command = 'skip_rest'
+            live.command_seq += 1
+        elif action == 'start':
+            # 开始除了 state，还记一条 start 命令：停止之后马上开始，实例读到时 state 仍是 running，
+            # 只凭 state 认不出要从头来，引擎凭这条新命令重置进度
+            live.state = 'running'
+            live.command = 'start'
+            live.command_seq += 1
+        else:
+            live.state = _STATE_OF_ACTION[action]
+        cfg.save()
     logger.info(f'[{name}] 编排命令：{action}')
     return {'ok': True}
 
@@ -113,5 +141,6 @@ async def put_orchestra(script_name: str, body: dict) -> dict:
 
 @orchestra_app.post('/{script_name}/command')
 async def post_command(script_name: str, body: dict) -> dict:
-    """控制命令。action 取 start、pause、resume、stop 改 state，取 skip_rest 则令 command_seq 加 1。"""
+    """控制命令。pause、resume、stop 只改 state；start 把 state 改为 running，另记一条 start 命令（command_seq 加 1）；
+    skip_rest 只在实例的进度处于休息中、且没有还没处理的开始命令时接受，记一条 skip_rest 命令。不接受返回 ok 为 False。"""
     return await asyncio.to_thread(_apply_command, script_name, body.get('action'))

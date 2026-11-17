@@ -2,6 +2,7 @@
 
 重启先 await 进程的 stop()，再 await start()。上游做不到这一点：GET /{name}/start 调了 async 的 start() 却没 await，
 ScriptProcess.start() 发现进程还活着时调 self.stop() 同样没 await，旧进程不一定停得掉。
+同一个实例的重启按先后排队：两次重启交错的话，两次 stop 叠在一起，后一次 start 可能让前一次起的进程没人管。
 M3a 合并上游代码后用 restart_running_instances 让在跑的实例换上新代码，单个实例用 POST /custom/instance/{name}/restart。
 
 不在模块顶层导入 module.server.main_manager：它一导入就扫描 config/、给每个实例建进程对象并启动推送线程。
@@ -32,23 +33,41 @@ def instance_names() -> set[str]:
     return {path.stem for path in (Path.cwd() / 'config').glob('*.json') if path.stem != 'template'}
 
 
+_restart_locks: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
+
+
+def _restart_lock(name: str) -> asyncio.Lock:
+    """name 的重启锁，在当前运行的事件循环上第一次用到时才建。asyncio.Lock 一有争用就绑定到当时的循环，
+    换了循环（比如测试里每个 asyncio.run 都是新的循环）就换一把新的。只在事件循环线程里调用，不用另加锁。"""
+    loop = asyncio.get_running_loop()
+    entry = _restart_locks.get(name)
+    if entry is None or entry[0] is not loop:
+        entry = _restart_locks[name] = (loop, asyncio.Lock())
+    return entry[1]
+
+
 async def restart_instance(name: str) -> bool:
-    """重启一个实例：先 stop() 再 start()，都 await。进程表里没有这个实例返回 False。"""
-    process = _manager().script_process.get(name)
-    if process is None:
-        return False
-    await process.stop()
-    await process.start()
+    """重启一个实例：先 stop() 再 start()，都 await；同一个实例的两次重启按先后排队。进程表里没有这个实例返回 False。"""
+    async with _restart_lock(name):
+        process = _manager().script_process.get(name)
+        if process is None:
+            return False
+        await process.stop()
+        await process.start()
     logger.info(f'[{name}] 实例已重启')
     return True
 
 
 async def restart_running_instances() -> list[str]:
-    """重启所有没停的实例（状态不是 INACTIVE），返回它们的名字。停着的不动，不替用户启动。"""
+    """重启所有没停的实例（状态不是 INACTIVE），返回重启成了的名字。停着的不动，不替用户启动。
+    一个实例出错只记日志（带调用栈），不挡着其余的，也不列进返回值。"""
     restarted: list[str] = []
     for name, process in list(_manager().script_process.items()):   # 重启中途进程表可能被别的请求改动，先取快照
-        if process.state != ScriptState.INACTIVE and await restart_instance(name):
-            restarted.append(name)
+        try:
+            if process.state != ScriptState.INACTIVE and await restart_instance(name):
+                restarted.append(name)
+        except Exception:
+            logger.exception(f'[{name}] 实例重启失败')
     return restarted
 
 
