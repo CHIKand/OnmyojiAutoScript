@@ -3,14 +3,17 @@
 全部在 tmp_path 下的本地裸仓库里跑：不联网，不读写本仓库的远端、config/ 和 log/。
 每个临时仓库都设了本地身份并关掉 autocrlf 和提交签名，结果不依赖本机的全局 git 配置。
 """
+import os
 import shutil
 import subprocess
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
-from module.server.fork_git import (GitRunner, commit_paths, count_behind, ensure_remote, is_asset_path,
-                                    merge_upstream, push, upstream_commits)
+from module.server import fork_git
+from module.server.fork_git import (NETWORK_TIMEOUT, GitRunner, commit_paths, count_behind, ensure_remote,
+                                    is_asset_path, merge_upstream, push, upstream_commits)
 
 BASE = {
     'script.py': 'base\n',
@@ -118,6 +121,44 @@ class Regen:
     def __call__(self, task):
         self.calls.append(task)
         write(self.repo, {f'tasks/{task}/assets.py': f'# regenerated {task}\n'})
+
+
+class StalledGit:
+    """假的卡死的 git 进程：wait 一调用就按超时处理，不真等。"""
+    pid = 0           # 测试里 _kill_tree 被换成了记录器，不会真去杀进程
+
+    def __init__(self, command, **kwargs):
+        self.args, self.kwargs, self.wait_timeouts, self.killed = command, kwargs, [], False
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        raise subprocess.TimeoutExpired(self.args, timeout)
+
+    def poll(self):
+        return None   # 还活着
+
+    def kill(self):
+        self.killed = True
+
+
+@pytest.fixture
+def stall(monkeypatch):
+    """stall('fetch', 'push')：这些联网命令换成卡死的假进程，其余命令照常真跑。杀进程树的清理换成记录。"""
+    def install(*commands):
+        processes, killed = [], []
+        real_popen = subprocess.Popen
+
+        def popen(command, **kwargs):
+            if command[1] in commands:
+                processes.append(StalledGit(command, **kwargs))
+                return processes[-1]
+            return real_popen(command, **kwargs)
+
+        monkeypatch.setattr(subprocess, 'Popen', popen)
+        monkeypatch.setattr(fork_git, '_kill_tree', killed.append)
+        return SimpleNamespace(processes=processes, killed=killed)
+
+    return install
 
 
 @pytest.fixture(scope='module')
@@ -478,21 +519,109 @@ def test_runner_check_semantics(trio):
     assert raised.value.stderr
 
 
-def test_runner_never_waits_for_input(trio, monkeypatch):
-    seen = []
-    real_run = subprocess.run
+@pytest.fixture
+def run_calls(monkeypatch):
+    """subprocess.run 每次调用的关键字参数，调用照常真跑。"""
+    calls, real_run = [], subprocess.run
 
     def spy(*args, **kwargs):
-        seen.append(kwargs)
+        calls.append(kwargs)
         return real_run(*args, **kwargs)
 
     monkeypatch.setattr(subprocess, 'run', spy)
+    return calls
+
+
+def test_runner_never_waits_for_input(trio, run_calls, stall):
+    net = stall('fetch')                                  # 联网命令走另一条路径，两条都要检查
     trio.runner.run('status')
-    env = seen[-1]['env']
-    assert env['GIT_TERMINAL_PROMPT'] == '0'
-    assert env['GIT_EDITOR'] == 'true'
-    assert seen[-1]['stdin'] == subprocess.DEVNULL
+    with pytest.raises(subprocess.TimeoutExpired):
+        trio.runner.run('fetch', 'upstream')
+    for kwargs in (run_calls[-1], net.processes[0].kwargs):
+        assert kwargs['env']['GIT_TERMINAL_PROMPT'] == '0'
+        assert kwargs['env']['GIT_EDITOR'] == 'true'
+        assert kwargs['env']['GCM_INTERACTIVE'] == 'Never'    # Git Credential Manager 取不到凭据时直接失败，不弹窗
+        assert kwargs['stdin'] == subprocess.DEVNULL
     assert trio.runner.run('var', 'GIT_EDITOR').stdout.strip() == 'true'
+
+
+def test_only_network_commands_have_a_timeout(trio, run_calls):
+    trio.runner.run('status')
+    trio.runner.run('rev-parse', 'HEAD')
+    assert run_calls and all('timeout' not in kwargs for kwargs in run_calls)      # 本地命令不设超时
+    assert NETWORK_TIMEOUT == 300 and fork_git.NETWORK_COMMANDS == {'fetch', 'push', 'ls-remote'}
+
+
+@pytest.mark.parametrize('command', ['fetch', 'push', 'ls-remote'])
+def test_network_command_times_out_and_the_process_is_killed(trio, stall, command):
+    net = stall(command)
+    with pytest.raises(subprocess.TimeoutExpired):
+        trio.runner.run(command, 'origin', check=False)      # check 为假时超时也照样抛出
+    [process] = net.processes
+    assert process.wait_timeouts == [NETWORK_TIMEOUT]
+    assert net.killed == [process]
+    # 输出必须落到文件而不是管道：帮手进程会抓着管道不放，杀掉 git 之后读管道的一端也不会返回，超时就失效了
+    assert subprocess.PIPE not in (process.kwargs['stdout'], process.kwargs['stderr'])
+
+
+def test_kill_tree_takes_down_the_whole_tree_then_the_process(monkeypatch):
+    calls = []
+    monkeypatch.setattr(subprocess, 'run', lambda command, **kwargs: calls.append(command))
+    process = StalledGit(['git', 'fetch'])
+    process.wait = lambda timeout=None: 0
+    fork_git._kill_tree(process)
+    # Windows 上先 taskkill /T 杀整棵树，因为 git-remote-https 这类帮手不会随 git 一起退出
+    assert calls == ([['taskkill', '/F', '/T', '/PID', '0']] if os.name == 'nt' else [])
+    assert process.killed
+
+    # git 在超时的瞬间已经自己退出了：它的 PID 可能已被别的进程占用，不能再按 PID 去杀
+    calls.clear()
+    process.poll = lambda: 0
+    fork_git._kill_tree(process)
+    assert calls == []
+
+
+def test_network_command_result_and_errors_match_the_local_path(trio, tmp_path):
+    # 联网命令的输出走临时文件，这一条路径的解码也要是 UTF-8（否则中文路径的报错会乱码），check 的语义也要和本地命令一致
+    sh(trio.work, 'remote', 'set-url', 'origin', str(tmp_path / '缺失仓库.git'))
+    pushed = trio.runner.run('push', 'origin', 'HEAD:custom', check=False)
+    assert pushed.returncode != 0
+    assert '缺失仓库.git' in pushed.stderr
+    with pytest.raises(subprocess.CalledProcessError) as raised:
+        trio.runner.run('push', 'origin', 'HEAD:custom')
+    assert raised.value.returncode == pushed.returncode
+    assert '缺失仓库.git' in raised.value.stderr
+
+
+def test_fetch_timeout_reports_and_keeps_head(trio, stall):
+    before = trio.head
+    net = stall('fetch')
+    result = trio.merge()
+    assert (result.status, result.commits) == ('fetch_failed', 0)
+    assert result.message == 'git fetch timed out after 300s'
+    assert len(net.killed) == 1
+    assert trio.head == before
+    assert not merging(trio.work)
+    assert is_clean(trio.work)
+
+
+def test_push_timeout_keeps_local_merge(trio, stall):
+    trio.upstream_commit({'new.txt': 'hello\n'})
+    before, fork_before = trio.head, trio.fork_tip
+    net = stall('push')
+    result = trio.merge()
+    assert (result.status, result.commits) == ('push_failed', 1)
+    assert result.message == 'git push timed out after 300s'
+    assert len(net.killed) == 1
+    assert trio.head != before
+    assert before in sh(trio.work, 'rev-list', '--parents', '-n', '1', 'HEAD').split()
+    assert not merging(trio.work)
+    assert trio.fork_tip == fork_before                  # 超时的推送没有到达 fork
+
+
+def test_push_returns_the_timeout_text(trio, stall):
+    stall('push')
+    assert push(trio.runner, 'custom') == (False, 'git push timed out after 300s')
 
 
 def test_count_behind_and_upstream_commits(trio):

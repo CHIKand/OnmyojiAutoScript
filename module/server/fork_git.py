@@ -7,16 +7,48 @@ M3b 的素材页复用 commit_paths 和 push。只用标准库。
 合并先做成"待提交"状态（merge --no-commit --no-ff）：在工作区里按顺序处理素材冲突、重新生成 assets.py、
 跑调用方传入的自检，全部通过才提交并推送。代码冲突、自检不过、处理途中的任何异常，都会 merge --abort，
 分支和工作区回到合并之前，不留合并到一半的仓库。每次 git 调用都不等待输入（GIT_TERMINAL_PROMPT=0、
-GIT_EDITOR=true、stdin 接空设备），也从不加 --force。
+GIT_EDITOR=true、GCM_INTERACTIVE=Never、stdin 接空设备），也从不加 --force。
+联网的命令（fetch、push、ls-remote）另有 NETWORK_TIMEOUT 秒的超时，超时就杀掉 git 并按该步骤失败处理，
+免得网络卡死时整个更新流程（以及等着它的服务接口和后台线程）一直挂着。
 """
 import os
 import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 UPSTREAM_REMOTE = 'upstream'
 ASSET_SUFFIXES = {'.png', '.jpg', '.jpeg', '.bmp', '.json'}
+NETWORK_TIMEOUT = 300       # 秒，联网命令的超时
+NETWORK_COMMANDS = frozenset({'fetch', 'push', 'ls-remote'})
+_REAP_TIMEOUT = 10          # 秒，杀掉进程后等它收尾的上限
+
+
+def _git_env() -> dict[str, str]:
+    """GIT_TERMINAL_PROMPT 和 GCM_INTERACTIVE 分别关掉终端里和 Git Credential Manager 弹窗里的输入，
+    取不到凭据时 git 直接失败，不会停下来等人。"""
+    return {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_EDITOR': 'true', 'GCM_INTERACTIVE': 'Never'}
+
+
+def _kill_tree(process: subprocess.Popen) -> None:
+    """杀掉 git 和它起的帮手进程（git-remote-https 等）。Windows 上只杀 git 本身的话，帮手会留在网络等待里，
+    所以带 /T 杀整棵树；其他系统只杀 git 本身。"""
+    if os.name == 'nt' and process.poll() is None:      # 已经退出的进程，PID 可能已被别的进程占用，不能按 PID 去杀
+        try:
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], capture_output=True,
+                           stdin=subprocess.DEVNULL, timeout=_REAP_TIMEOUT)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    process.kill()
+    try:
+        process.wait(timeout=_REAP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _timed_out(command: str) -> str:
+    return f'git {command} timed out after {NETWORK_TIMEOUT}s'
 
 
 @dataclass
@@ -26,10 +58,36 @@ class GitRunner:
     repo: Path
 
     def run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-        """在仓库目录里执行 git，输出按 UTF-8 解码。check 为真时非零退出码抛 CalledProcessError，stderr 在异常上。"""
-        return subprocess.run([self.git, *args], cwd=self.repo, capture_output=True, encoding='utf-8',
-                              errors='replace', stdin=subprocess.DEVNULL, check=check,
-                              env={**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_EDITOR': 'true'})
+        """在仓库目录里执行 git，输出按 UTF-8 解码。check 为真时非零退出码抛 CalledProcessError，stderr 在异常上。
+
+        第一个参数是 NETWORK_COMMANDS 里的联网命令时带 NETWORK_TIMEOUT 的超时：超时后 git 连同帮手进程被杀掉，
+        抛 subprocess.TimeoutExpired（check 为假也一样，调用方要自己处理）。其余命令没有超时。
+        """
+        command = [self.git, *args]
+        if args[:1] and args[0] in NETWORK_COMMANDS:
+            return self._run_with_timeout(command, check)
+        return subprocess.run(command, cwd=self.repo, capture_output=True, encoding='utf-8', errors='replace',
+                              stdin=subprocess.DEVNULL, check=check, env=_git_env())
+
+    def _run_with_timeout(self, command: list[str], check: bool) -> subprocess.CompletedProcess:
+        """输出写临时文件而不是管道：git-remote-https 这类帮手进程会继承管道，卡住时即使杀了 git，
+        读管道的一端也要等到帮手退出才返回（在本机实测 subprocess.run(timeout=3) 对卡死的 git fetch 阻塞了 25 秒以上），
+        超时就形同虚设。写文件没有这个依赖，wait 到点就返回。"""
+        with tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as out, \
+                tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as err:
+            process = subprocess.Popen(command, cwd=self.repo, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                       env=_git_env())
+            try:
+                process.wait(timeout=NETWORK_TIMEOUT)
+            except BaseException:       # 超时，或者被 Ctrl+C 打断
+                _kill_tree(process)
+                raise
+            out.seek(0)
+            err.seek(0)
+            result = subprocess.CompletedProcess(command, process.returncode, out.read(), err.read())
+        if check and result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
+        return result
 
 
 @dataclass
@@ -90,9 +148,12 @@ def commit_paths(r: GitRunner, paths: list[str], message: str) -> str | None:
 
 
 def push(r: GitRunner, branch: str) -> tuple[bool, str]:
-    """git push origin HEAD:<branch>，不加 --force。返回 (是否成功, 失败时的 stderr)。
+    """git push origin HEAD:<branch>，不加 --force。返回 (是否成功, 失败时的 stderr；超时则是超时说明)。
     用 HEAD:<分支> 是因为运行目录的本地分支名可能和 fork 上的不一样。"""
-    pushed = r.run('push', 'origin', f'HEAD:{branch}', check=False)
+    try:
+        pushed = r.run('push', 'origin', f'HEAD:{branch}', check=False)
+    except subprocess.TimeoutExpired:
+        return False, _timed_out('push')
     ok = pushed.returncode == 0
     return ok, '' if ok else pushed.stderr.strip()
 
@@ -106,6 +167,8 @@ def merge_upstream(r: GitRunner, upstream: str, upstream_branch: str, push_branc
     组件是 Component/<组件>，各取各的 assets.py。有代码冲突就整体中止。
     verify 在提交之前收到仓库路径，返回 (是否通过, 原因)，None 表示不做自检。自检不通过，或者 verify、regenerate
     抛异常，或者处理合并结果时 git 命令失败，都 merge --abort 并返回 smoke_failed，message 里是原因。
+    fetch 或 push 超过 NETWORK_TIMEOUT 秒没完成：fetch 返回 fetch_failed（仓库没动过），
+    push 返回 push_failed（本地合并保留），message 都是 "git <命令> timed out after <秒数>s"。
 
     不可重入：开头会放弃仓库里已有的合并，同一个仓库同时有两次调用时，后一次会把前一次进行中的合并放弃掉，
     调用方要自己保证同一时刻只有一次。
@@ -115,7 +178,10 @@ def merge_upstream(r: GitRunner, upstream: str, upstream_branch: str, push_branc
     if dirty:                                             # 运行目录里总有未跟踪的文件，只看已跟踪文件的改动
         return MergeResult('dirty', 0, [], [], dirty)
     ensure_remote(r, UPSTREAM_REMOTE, upstream)
-    fetched = r.run('fetch', UPSTREAM_REMOTE, upstream_branch, check=False)
+    try:
+        fetched = r.run('fetch', UPSTREAM_REMOTE, upstream_branch, check=False)
+    except subprocess.TimeoutExpired:
+        return MergeResult('fetch_failed', 0, [], [], _timed_out('fetch'))
     if fetched.returncode != 0:
         return MergeResult('fetch_failed', 0, [], [], fetched.stderr.strip())
     ref = f'{UPSTREAM_REMOTE}/{upstream_branch}'
