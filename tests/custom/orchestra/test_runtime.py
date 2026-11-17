@@ -99,7 +99,9 @@ def heartbeat_threads() -> list[threading.Thread]:
     return [t for t in threading.enumerate() if t.name == HEARTBEAT]
 
 
-def wait_for(condition, timeout: float = 1.0) -> bool:
+def wait_for(condition, timeout: float = 3.0) -> bool:
+    """轮询到条件成立或超时。3 秒只是失败时的上限，通过的用例几十毫秒就返回；
+    Windows 上进度文件偶尔被占用，存盘要重试（最多约 0.5 秒），所以留足余量。"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -270,6 +272,45 @@ def test_status_note_does_not_call_wake_time():
     script.anti_ban_guard.wake_time = forbidden
     runtime.pick()
     assert saved().status_note == '防封禁休眠中，08:00 继续'
+
+
+# ---------- 没有编排在进行时：不更新提示，不写进度文件 ----------
+
+def sleeping_antiban(config, clock) -> None:
+    """防封禁开着，假时钟落在 02:00–08:00 的休眠窗口里。"""
+    anti_ban = config.model.script.anti_ban
+    anti_ban.enable, anti_ban.sleep_start, anti_ban.sleep_end = True, dtime(2, 0), dtime(8, 0)
+    clock.now = datetime(2026, 11, 17, 3, 0)
+
+
+def test_idle_instance_with_antiban_in_the_window_writes_no_progress_file():
+    runtime, _, config, clock = make(state='idle')
+    sleeping_antiban(config, clock)
+    due = fn('orochi', T0 - timedelta(hours=1))
+    config.pending_task = [due]
+    assert runtime.pick() is due
+    assert not progress_path('t').exists()   # 没有编排：提示不更新，进度与加载时的一样，就不存盘
+    assert config.saves == 0
+
+
+def test_status_note_is_updated_while_paused():
+    runtime, _, config, clock = make(rows=[OrchestraRow(task='Orochi')], state='paused')
+    sleeping_antiban(config, clock)
+    config.pending_task = [fn('restart', T0)]
+    runtime.pick()
+    p = saved()
+    assert p.paused and p.status_note == '防封禁休眠中，08:00 继续'   # 暂停也算编排在进行
+
+
+def test_status_note_is_left_alone_when_nothing_is_orchestrated():
+    finished = Progress(phase='done', sequence_started_at=T0, status_note='防封禁休眠中，08:00 继续')   # 上一轮留下的
+    runtime, _, config, clock = make(rows=[OrchestraRow(task='Orochi')], state='idle', progress=finished)
+    config.model.script.anti_ban.enable = True
+    clock.now = datetime(2026, 11, 17, 12, 0)   # 不在窗口里：要是还在更新，提示会被清成空
+    config.pending_task = [fn('restart', T0)]
+    runtime.pick()
+    assert saved() == finished   # 提示原样不动，文件也没有被改写
+    assert config.saves == 0
 
 
 # ---------- 选任务 ----------
@@ -490,34 +531,160 @@ def test_before_run_ignores_other_commands_and_vanished_rows():
     assert config.model.orochi.orochi_config.limit_count == 30 and saved().phase == 'ready' and config.saves == 0
 
 
-def test_apply_error_does_not_start_the_row(monkeypatch, caplog):
+def test_apply_error_pauses_the_orchestration_and_the_next_pick_is_native(monkeypatch, caplog):
     runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi', max_count=12)])
-    runtime.pick()
+    assert runtime.pick().command == 'Orochi'
 
     def refuse(*args, **kwargs):
         raise ValueError('字段路径无法解析')
     monkeypatch.setattr(runtime_module, 'apply_row', refuse)
     with caplog.at_level(logging.ERROR):
-        runtime.before_run('Orochi')
-    assert any('写不进去' in r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)   # 记错误，不是内部异常
-    assert config.saves == 0 and saved().phase == 'ready'   # 没写参数、没存配置、没起行
+        runtime.before_run('Orochi')   # 当前这个任务可以照常原生跑一次；before_run 本身不抛异常
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any('第 1 行' in m and 'Orochi' in m and '字段路径无法解析' in m for m in errors)   # 记错误：第几行、什么异常
+    assert config.model.orchestra.state == 'paused' and config.saves == 1   # 暂停，并把暂停存进了配置
+    assert config.model.orochi.orochi_config.limit_count == 30   # 参数一个没写
+    assert saved().phase == 'ready' and saved().saved_params == {}   # 没起行
     runtime.after_run('Orochi', True)   # 行没起，after_run 什么都不做
-    assert saved().phase == 'ready' and config.saves == 0
+    assert saved().phase == 'ready'
+
+    due = fn('orochi', T0 - timedelta(minutes=1))
+    config.pending_task = [due]
+    assert runtime.pick() is due   # 已暂停：交还上游的选法，不再选这一行，它的任务不会一次次原生地跑下去
+    assert saved().paused is True
 
 
-def test_config_save_failure_in_before_run_rolls_the_params_back():
+@pytest.mark.parametrize('step', ['on_row_start', 'deep_set', 'config_save'])
+def test_start_failure_reverts_pauses_and_hands_back_to_native(step, monkeypatch, caplog):
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi', sub1='神罚', max_count=12)])
+    assert runtime.pick().command == 'Orochi'
+    if step == 'on_row_start':
+        def boom(*args, **kwargs):
+            raise RuntimeError('引擎出错')
+        monkeypatch.setattr(runtime_module, 'on_row_start', boom)
+    elif step == 'deep_set':
+        real_deep_set = ConfigModel.deep_set
+
+        def refuse_next_run(obj, keys, value):   # 只拒绝写 next_run：apply_row、restore_params 也走 deep_set，不能一起拒
+            return False if str(keys).endswith('scheduler.next_run') else real_deep_set(obj, keys, value)
+        monkeypatch.setattr(runtime_module.ConfigModel, 'deep_set', staticmethod(refuse_next_run))
+    else:
+        real_save, calls = config.save, []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError('disk full')   # 写行参数的那次存配置失败，之后暂停时的那次成功
+            real_save()
+        config.save = flaky
+
+    with caplog.at_level(logging.ERROR):
+        runtime.before_run('Orochi')
+    cfg = config.model.orochi.orochi_config
+    assert (cfg.limit_count, cfg.layer) == (30, Layer.ELEVEN)   # 已写的行参数撤回
+    assert config.model.orchestra.state == 'paused' and config.saves == 1   # 暂停并存了配置（失败的那次不计）
+    assert saved().phase == 'ready' and saved().saved_params == {}   # 进度退回开始之前
+    assert heartbeat_threads() == []
+    assert any('第 1 行' in r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    runtime.after_run('Orochi', True)
+    due = fn('orochi', T0 - timedelta(minutes=1))
+    config.pending_task = [due]
+    assert runtime.pick() is due   # 暂停了：下一次选任务交还上游
+
+
+def test_a_failing_revert_does_not_stop_the_pause_and_keeps_the_originals_recorded(monkeypatch):
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi', sub1='神罚', max_count=12)])
+    runtime.pick()
+    real_save, calls = config.save, []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError('disk full')   # 写行参数的那次存配置失败，之后暂停时的那次成功
+        real_save()
+    config.save = flaky
+
+    def boom(*args, **kwargs):
+        raise RuntimeError('撤回出错')
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_module, 'restore_params', boom)   # 撤回本身也出错
+        runtime.before_run('Orochi')   # 不抛异常
+    assert config.model.orchestra.state == 'paused' and config.saves == 1   # 撤回出错不挡着暂停
+    cfg = config.model.orochi.orochi_config
+    assert (cfg.limit_count, cfg.layer) == (12, Layer.TWELVE)   # 行参数没撤回成，随暂停存进了配置
+    p = saved()
+    assert p.phase == 'row_running' and p.saved_params == {LIMIT_COUNT: 30, 'orochi.orochi_config.layer': '悲鸣'}   # 原值不能丢
+
+    config.pending_task = [fn('restart', T0)]
+    runtime.pick()   # 下一次选任务：当作中断，用进度里的原值补还原
+    assert (cfg.limit_count, cfg.layer) == (30, Layer.ELEVEN) and config.saves == 2
+    p = saved()
+    assert p.phase == 'interrupted' and p.saved_params == {}
+
+
+def test_progress_is_written_before_the_row_params_reach_the_config_file():
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi', sub1='神罚', max_count=12)])
+    runtime.pick()
+    seen = []
+    config.save = lambda: seen.append(saved())   # 配置文件被写的那一刻，进度文件里应该已经记着原值了
+    runtime.before_run('Orochi')
+    assert len(seen) == 1
+    assert seen[0].phase == 'row_running' and seen[0].saved_params == {LIMIT_COUNT: 30,
+                                                                        'orochi.orochi_config.layer': '悲鸣'}
+    runtime.after_run('Orochi', False)
+
+
+class Killed(BaseException):
+    """模拟进程在两次落盘之间被杀。不是 Exception，钩子里的 except Exception 拦不住它。"""
+
+
+def test_a_kill_between_the_two_writes_leaves_originals_that_recovery_restores():
+    rows = [OrchestraRow(task='Orochi', sub1='神罚', max_count=12)]
+    runtime, _, config, _ = make(rows=rows)
+    runtime.pick()
+
+    def die():
+        raise Killed
+    config.save = die   # 进度已经落盘，配置文件还没写成
+    with pytest.raises(Killed):
+        runtime.before_run('Orochi')
+    p = saved()
+    assert p.phase == 'row_running' and p.saved_params == {LIMIT_COUNT: 30, 'orochi.orochi_config.layer': '悲鸣'}
+    assert heartbeat_threads() == []   # 心跳在两次落盘之后才起
+
+    # 重启：配置文件里还是原值，进度里是 row_running 与原值
+    restarted, _, config2, _ = make(rows=rows)
+    cfg = config2.model.orochi.orochi_config
+    assert (cfg.limit_count, cfg.layer) == (30, Layer.ELEVEN)
+    restarted.pick()
+    assert (cfg.limit_count, cfg.layer) == (30, Layer.ELEVEN)   # 写回的是同样的原值：幂等，没写坏
+    assert config2.saves == 1
+    p = saved()
+    assert p.phase == 'interrupted' and p.saved_params == {}
+
+
+def test_double_failure_keeps_the_originals_in_the_progress():
     runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi', sub1='神罚', max_count=12)])
     runtime.pick()
 
     def failing():
         raise OSError('disk full')
-    config.save = failing
+    real_save, config.save = config.save, failing   # 存配置一直失败：行参数写不进去，暂停也存不下来
     runtime.before_run('Orochi')   # 不抛异常
     cfg = config.model.orochi.orochi_config
-    assert (cfg.limit_count, cfg.layer) == (30, Layer.ELEVEN)   # 配置没存成就把内存里已写的行参数撤回
-    assert saved().phase == 'ready'
-    runtime.after_run('Orochi', True)
-    assert saved().phase == 'ready'
+    assert (cfg.limit_count, cfg.layer) == (30, Layer.ELEVEN)   # 内存里的行参数撤回了
+    assert config.model.orchestra.state == 'paused'   # 内存里已暂停，存不存得下来另说
+    p = saved()
+    assert p.phase == 'row_running' and p.saved_params == {LIMIT_COUNT: 30, 'orochi.orochi_config.layer': '悲鸣'}
+    runtime.after_run('Orochi', True)   # 行没起，什么都不做
+    assert saved().phase == 'row_running'
+
+    config.save = real_save   # 磁盘恢复后，下一次选任务把这当作中断，补还原
+    config.pending_task = [fn('restart', T0)]
+    runtime.pick()
+    assert config.saves == 1
+    p = saved()
+    assert p.phase == 'interrupted' and p.saved_params == {}
 
 
 def test_before_run_sets_next_run_to_now_and_clears_the_previous_task_object():
@@ -651,6 +818,26 @@ def test_non_integer_counter_is_ignored():
     assert p.phase == 'interrupted' and p.done_count is None
 
 
+def test_heartbeat_thread_that_cannot_start_does_not_break_the_row(monkeypatch):
+    rows = [OrchestraRow(task='Orochi', sub1='神罚', max_count=12), OrchestraRow(task='Orochi')]
+    runtime, _, config, clock = make(rows=rows)
+    runtime.pick()
+
+    def no_thread(self):
+        raise RuntimeError("can't start new thread")
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, 'start', no_thread)
+        runtime.before_run('Orochi')   # 不抛异常；行已经开始，只是没有心跳
+    cfg = config.model.orochi.orochi_config
+    assert (cfg.limit_count, cfg.layer) == (12, Layer.TWELVE) and saved().phase == 'row_running'
+    config.model.orochi.scheduler.next_run = T0 + timedelta(days=1)
+    clock.advance(minutes=3)
+    runtime.after_run('Orochi', True)   # 照常收尾：还原、判完成、推进，不会去 join 没启动的线程
+    assert (cfg.limit_count, cfg.layer) == (30, Layer.ELEVEN)
+    p = saved()
+    assert p.phase == 'resting' and p.row_index == 1 and p.saved_params == {}
+
+
 def test_heartbeat_leaves_done_count_alone_without_a_reliable_counter():
     # SixRealms 没有可靠的实例计数属性（counter_attr 为 None）：只写心跳时间，次数保持原样
     runtime, script, _, clock = make(rows=[OrchestraRow(task='SixRealms')], interval=0.02)
@@ -730,6 +917,7 @@ def test_internal_error_in_before_run_is_swallowed(monkeypatch):
     runtime.before_run('Orochi')   # 不抛异常
     cfg = config.model.orochi.orochi_config
     assert (cfg.limit_count, cfg.layer) == (30, Layer.ELEVEN)   # 已写的参数撤回，没有进度记着原值就不能留
+    assert config.model.orchestra.state == 'paused'   # 失败的一行不再被反复选中
     assert heartbeat_threads() == []
     runtime.after_run('Orochi', True)
 

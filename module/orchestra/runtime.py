@@ -1,6 +1,7 @@
 """编排引擎接入调度循环的运行时：在上游 Script 选任务、运行任务前、运行任务后三处各挂一个钩子。
 
-没有编排在跑时，pick 原样返回上游 config.get_next() 的结果，其余两个钩子什么都不做，实例的行为与上游一致。
+没有编排在进行时（state 是 idle，阶段是 idle 或 done），pick 原样返回上游 config.get_next() 的结果，
+其余两个钩子什么都不做，不改配置、不写进度文件，实例的行为与上游一致。
 调用顺序与 engine 模块说明一致：选任务前 recover、sync_controls、decide；行运行前 row_limits、on_row_start；
 行运行后先还原行参数，再 on_row_end。
 
@@ -10,7 +11,9 @@
 
 钩子不让异常漏进调度循环：pick 出错退回上游的选法，before_run、after_run 出错只记日志。
 行参数是用户配置的原值被临时覆盖，所以出错时宁可不跑编排，也不能让覆盖后的值留在配置里：
-before_run 写完参数后出错会撤回；after_run 没走完，进度里仍是 row_running 且带着 saved_params，下一次 pick 补还原。
+before_run 先把原值记进进度并存盘，再把行参数存进配置文件，两次落盘之间被杀，恢复时凭进度把原值写回即可；
+启动一行失败就撤回行参数并暂停编排，免得 decide 一直选中它、让它的任务一次次按原生设置跑；
+after_run 没走完，进度里仍是 row_running 且带着 saved_params，下一次 pick 补还原。
 """
 import random
 import threading
@@ -111,7 +114,9 @@ class OrchestraRuntime:
             self._log_skipped(settings, p, decision.row_index)
         if p.phase == 'done' and settings.state != 'idle':
             self._set_idle(config)
-        self._commit(replace(p, status_note=self._anti_ban_note(config, now)))
+        if settings.state in ('running', 'paused') or p.phase not in ('idle', 'done'):
+            p = replace(p, status_note=self._anti_ban_note(config, now))   # 提示只在编排进行中才更新，否则原样不动
+        self._commit(p)
         self._decision = decision
 
         if decision.kind == 'passthrough':
@@ -189,7 +194,8 @@ class OrchestraRuntime:
             logger.warning(f'编排表第 {skipped + 1} 行无效，已跳过（{detail}）')
 
     def _anti_ban_note(self, config, now: datetime) -> str:
-        """防封禁休眠的提示，给运行面板看。只读休眠窗口与 AntiBanGuard._rest_until，不调用 wake_time（它会改状态）。"""
+        """防封禁休眠的提示，给运行面板看，只在编排进行中才算（见 _pick）。
+        只读休眠窗口与 AntiBanGuard._rest_until，不调用 wake_time（它会改状态）。"""
         anti_ban = config.model.script.anti_ban
         if not anti_ban.enable:
             return ''
@@ -222,7 +228,8 @@ class OrchestraRuntime:
     # ---------- 行运行前 ----------
 
     def before_run(self, command: str) -> None:
-        """任务运行前：若这一轮是编排的行，把行参数写进任务配置，记下开始并启动心跳。其他情况什么都不做。"""
+        """任务运行前：若这一轮是编排的行，先在进度里记下开始和原值，再把行参数写进任务配置，启动心跳。
+        启动失败则撤回并暂停编排（见 _abort_start）。其他情况什么都不做。"""
         try:
             self._before_run(command)
         except Exception:
@@ -238,43 +245,61 @@ class OrchestraRuntime:
         index = decision.row_index
         if self._p is None or not 0 <= index < len(settings.rows) or settings.rows[index].task != command:
             return   # pick 之后表被改了，那一行已不是当时选中的
-        row, p, spec = settings.rows[index], self._p, TASK_SPECS[command]
-        # 剩余量只属于被中断的那一行；decide 跳过无效行选了别的行，它不沿用
-        count, minutes = (row_limits(row, p, settings.resume_policy) if index == p.row_index
-                          else (row.max_count, row.max_minutes))
+        row, p = settings.rows[index], self._p
+        saved = None
         try:
+            spec = TASK_SPECS[command]
+            # 剩余量只属于被中断的那一行；decide 跳过无效行选了别的行，它不沿用
+            count, minutes = (row_limits(row, p, settings.resume_policy) if index == p.row_index
+                              else (row.max_count, row.max_minutes))
             saved = apply_row(config.model, row, count, minutes)
-        except (ValueError, KeyError) as exc:
-            logger.error(f'编排：第 {index + 1} 行 {command} 的参数写不进去（{exc}），这一行按任务自己的设置运行')
-            return
-
-        now = self._clock()
-        next_run_path = f'{spec.model_key}.scheduler.next_run'
-        try:
+            now = self._clock()
+            # 先把原值记进进度并存盘，再把行参数存进配置文件：两次落盘之间被杀，恢复时凭进度把原值写回即可（幂等）
+            started = on_row_start(p, index, now, saved)
+            self._commit(started)
             # next_run 先设为现在（同 Config.task_call，截到秒）：任务正常结束会把它推到之后，
             # 推不动就说明没走到结束，after_run 凭它判定完成
+            next_run_path = f'{spec.model_key}.scheduler.next_run'
             if not ConfigModel.deep_set(config.model, next_run_path, now.replace(microsecond=0)):
                 raise ValueError(f'无法写入 {next_run_path}')
             config.save()   # 任务内部 task_delay 会 reload，没存盘的行参数会丢
-            started = on_row_start(p, index, now, saved)
-            self._commit(started)
-        except Exception:
-            self._rollback(config, saved)
-            raise
+        except Exception as exc:
+            self._abort_start(config, p, saved, index, command, exc)
+            return
         script.running_task_obj = None   # 心跳不能读到上一个任务的计数
         row_run = _Row(spec, base=started.done_count or 0)
         self._row = row_run
         self._start_heartbeat(row_run)
         logger.info(f'编排：第 {index + 1} 行 {command} 开始（次数上限 {count}，分钟上限 {minutes}）')
 
-    @staticmethod
-    def _rollback(config, saved: dict) -> None:
-        """before_run 写完参数后出错：进度里还没有这一行的 saved_params，参数不能留在配置里。撤回并尽力存盘。"""
+    def _abort_start(self, config, p: Progress, saved: dict | None, index: int, command: str,
+                     exc: Exception) -> None:
+        """启动一行失败（写参数、存进度、存配置，哪一步都算）：撤回行参数、记错误、暂停编排。
+
+        不暂停的话，decide 会一直选中这一行，它的任务就一次次按自己的设置原生运行。当前这个任务仍照常跑一次。
+        配置文件在最后一步 config.save() 之前没有写过行参数，所以撤回只改内存，暂停时的 config.save() 把撤回后的值一并存下；
+        撤回成功且存成了，进度才退回开始之前。否则保持原样：进度里若已有 row_running 与原值，下一次 pick 当作中断补还原。
+        撤回与暂停各自出错都只记日志，互不挡着。
+        """
+        logger.error(f'编排：第 {index + 1} 行 {command} 启动失败：{exc!r}，撤回行参数并暂停编排')
+        reverted = True
         try:
-            restore_params(config.model, saved)
-            config.save()
-        except Exception:
-            logger.exception('编排：撤回行参数时出错')
+            if saved:
+                restore_params(config.model, saved)
+        except Exception as err:
+            reverted = False
+            logger.error(f'编排：撤回第 {index + 1} 行的行参数时出错：{err!r}')
+        try:
+            self._pause(config)
+            if reverted:
+                self._commit(p)
+        except Exception as err:
+            logger.error(f'编排：暂停编排时出错：{err!r}')
+
+    @staticmethod
+    def _pause(config) -> None:
+        config.model.orchestra.state = 'paused'
+        config.save()
 
     # ---------- 行运行后 ----------
 
@@ -338,8 +363,9 @@ class OrchestraRuntime:
         return value if type(value) is int else None
 
     def _start_heartbeat(self, row: _Row) -> None:
-        row.thread = threading.Thread(target=self._heartbeat, args=(row,), name=_HEARTBEAT_THREAD, daemon=True)
-        row.thread.start()
+        thread = threading.Thread(target=self._heartbeat, args=(row,), name=_HEARTBEAT_THREAD, daemon=True)
+        thread.start()
+        row.thread = thread   # 线程没起来（start 抛异常）就不挂上去，_stop_heartbeat 不会去 join 一个没启动的线程
 
     def _heartbeat(self, row: _Row) -> None:
         """每个心跳间隔写一次 heartbeat_at 和累计次数，直到 row.stop 被设置。任何异常都只记日志，线程不退出。"""

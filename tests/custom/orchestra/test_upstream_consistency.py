@@ -31,14 +31,20 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
 
-def write_config(enabled: dict[str, tuple[datetime, int]], rule: str) -> None:
-    """把一份实例配置写进 config/t.json。enabled：模型字段名 -> (next_run, priority)，其余任务一律不启用（含默认启用的 Restart）。"""
+def write_config(enabled: dict[str, tuple[datetime, int]], rule: str, sleeping: bool = False) -> None:
+    """把一份实例配置写进 config/t.json。enabled：模型字段名 -> (next_run, priority)，其余任务一律不启用（含默认启用的 Restart）。
+    sleeping：开防封禁，休眠窗口取当前时刻前后各一小时，这样用真实时钟也落在窗口里。"""
     model = ConfigModel()
     model.restart.scheduler.enable = False
     for key, (next_run, priority) in enabled.items():
         scheduler = getattr(model, key).scheduler
         scheduler.enable, scheduler.next_run, scheduler.priority = True, next_run, priority
     model.script.optimization.schedule_rule = ScheduleRule(rule)
+    if sleeping:
+        now = datetime.now().replace(microsecond=0)
+        anti_ban = model.script.anti_ban
+        anti_ban.enable = True
+        anti_ban.sleep_start, anti_ban.sleep_end = (now - timedelta(hours=1)).time(), (now + timedelta(hours=1)).time()
     ConfigModel.write_json('t', model.model_dump())
 
 
@@ -79,8 +85,9 @@ def test_idle_with_nothing_enabled_raises_like_upstream():
         Config('t').get_next()
 
 
-def test_idle_leaves_no_trace():
-    write_config({'orochi': (PAST, 5)}, 'Filter')
+@pytest.mark.parametrize('sleeping', [False, True])   # 开着防封禁、此刻正在休眠窗口里，也不能留痕迹
+def test_idle_leaves_no_trace(sleeping):
+    write_config({'orochi': (PAST, 5)}, 'Filter', sleeping=sleeping)
     config_file = Path.cwd() / 'config' / 't.json'
     before = config_file.read_bytes()
     script = stand_in()
