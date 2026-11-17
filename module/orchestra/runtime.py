@@ -14,11 +14,13 @@
 before_run 先把原值记进进度并存盘，再把行参数存进配置文件，两次落盘之间被杀，恢复时凭进度把原值写回即可；
 启动一行失败就撤回行参数并暂停编排，免得 decide 一直选中它、让它的任务一次次按原生设置跑；
 after_run 没走完，进度里仍是 row_running 且带着 saved_params，下一次 pick 补还原。
+编排进行中（state 是 running 或 paused 且阶段不是 idle、done）上游没有任务可跑，不能让实例因此退出：
+改交一个 5 分钟后到点的占位 Function，上游睡到那时再选，配置一变（比如点了继续）就提前醒来。编排停了或跑完了，照上游重抛。
 """
 import random
 import threading
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -36,6 +38,7 @@ from module.orchestra.progress import Progress, load_progress, progress_path, sa
 
 _HEARTBEAT_THREAD = 'OrchestraHeartbeat'
 _JOIN_TIMEOUT = 5.0   # 等心跳线程退出的秒数上限：它在 Event 上等，被唤醒后至多还剩一次存盘（重试最多约 0.5 秒）
+_EMPTY_WAIT = timedelta(minutes=5)   # 编排进行中却没有任务可跑时，占位等待的时长
 
 
 def _function(command: str, when: datetime) -> Function:
@@ -74,7 +77,8 @@ class OrchestraRuntime:
     def pick(self) -> Function:
         """上游 get_next_task 里 config.get_next() 的替身，返回下一个要跑（或要等）的任务。
 
-        passthrough 原样返回上游的结果（上游没有任务可跑时仍抛 RequestHumanTakeover）；native 返回待办里同名的 Function；
+        passthrough 原样返回上游的结果；上游没有任务可跑（抛 RequestHumanTakeover）时，编排没在进行就照样重抛，
+        在进行（暂停也算）就改交一个 5 分钟后到点的占位 Function，不让实例退出。native 返回待办里同名的 Function；
         row 与 wait 另造一个：row 的 next_run 是现在，wait 的 next_run 是休息截止（或更早到点的插队任务），
         上游发现它没到点就睡到那一刻再重选，占位的任务不会被运行。
         """
@@ -85,12 +89,12 @@ class OrchestraRuntime:
         except Exception:
             logger.exception('编排选任务出错，本次按上游原逻辑选')
             self._decision = None   # 出错前也许已定下 row，这一轮不是编排的行
-            return self._script.config.get_next()
+            return self._upstream_next()
 
     def _pick(self) -> Function:
         config = self._script.config
         if not self._load(config):
-            return config.get_next()
+            return self._upstream_next()
         now = self._clock()
         settings = config.model.orchestra
         self._abandon_row()
@@ -120,14 +124,46 @@ class OrchestraRuntime:
         self._decision = decision
 
         if decision.kind == 'passthrough':
-            if error is not None:
-                raise error
-            return native
+            if error is None:
+                return native
+            if settings.state in ('running', 'paused') and p.phase not in ('idle', 'done'):
+                wait = self._wait_function(settings, p, now)   # 编排进行中（比如暂停了）：上游没任务可跑，也不让实例退出
+                if wait is not None:
+                    return wait
+            raise error
         if decision.kind == 'native':
             return self._pending_function(config, decision.command)
         if decision.kind == 'row':
             return _function(decision.command, now)
         return _function(decision.command or self._placeholder(settings, p), decision.at)
+
+    def _wait_function(self, settings: Orchestra, p: Progress, now: datetime) -> Function | None:
+        """上游没有任务可跑、编排又在进行时用：交一个 5 分钟后到点的占位 Function，上游睡到那时再选。
+        占位的任务名借 _placeholder 的，它不会被运行。造不出来返回 None，调用方照上游的来。"""
+        try:
+            return _function(self._placeholder(settings, p), now + _EMPTY_WAIT)
+        except Exception as exc:
+            logger.warning(f'编排：上游没有任务可跑，也造不出占位等待：{exc!r}，按上游原逻辑处理')
+            return None
+
+    def _upstream_next(self) -> Function:
+        """退回上游的选法（读进度失败、内部出错时用）：config.get_next() 的结果原样返回。
+        它抛 RequestHumanTakeover（没有任务可跑）而编排在进行时，不让实例退出，改交占位等待。
+        这里没有可靠的进度可看，只凭 orchestra.state（running 或 paused）判断；读不到 state、造不出占位，就照上游重抛。"""
+        config = self._script.config
+        try:
+            return config.get_next()
+        except RequestHumanTakeover:
+            wait = None
+            try:
+                settings = config.model.orchestra
+                if settings.state in ('running', 'paused'):
+                    wait = self._wait_function(settings, self._p if self._p is not None else Progress(), self._clock())
+            except Exception as exc:
+                logger.warning(f'编排：读不到 orchestra.state：{exc!r}，按上游原逻辑处理')
+            if wait is None:
+                raise
+            return wait
 
     def _load(self, config) -> bool:
         """首次调用时读进度文件。文件缺失或损坏时 load_progress 给默认进度，不算失败；
@@ -257,6 +293,8 @@ class OrchestraRuntime:
             # 先把原值记进进度并存盘，再把行参数存进配置文件：两次落盘之间被杀，恢复时凭进度把原值写回即可（幂等）
             started = on_row_start(p, index, now, saved)
             self._commit(started)
+            if self._dirty:   # 进度没存成：原值只在内存里，不能把行参数写进配置文件，当作启动失败
+                raise OSError('进度文件没能存盘，不写行参数')
             # next_run 先设为现在（同 Config.task_call，截到秒）：任务正常结束会把它推到之后，
             # 推不动就说明没走到结束，after_run 凭它判定完成
             next_run_path = f'{spec.model_key}.scheduler.next_run'

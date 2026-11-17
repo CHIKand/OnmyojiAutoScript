@@ -234,17 +234,27 @@ def apply_row(model: 'ConfigModel', row: 'OrchestraRow',
 def restore_params(model: 'ConfigModel', saved: dict[str, Any]) -> None:
     """按 apply_row 返回的字典还原字段。
 
-    无法解析的路径（映射或进度文件已过期）不挡住其余项的还原，处理完再统一抛 ValueError。
+    一项还原不了不挡住其余项：路径无法解析（映射或进度文件已过期），或原值转不回字段的类型、字段写不进去
+    （枚举值改了名、时间串损坏等），都先记下，其余照常还原，处理完统一抛一次 ValueError，列出所有没还原的路径。
+    原值转不回去的那一项，消息里带上原值，调用方清掉 saved_params 之后，人还能照着手工改回。
     """
-    unresolved = []
+    unresolved, failed = [], []
     for path, raw in saved.items():
         current = _get(model, path)
         if current is _MISSING:
             unresolved.append(path)
-        else:
+            continue
+        try:
             _set(model, path, _deserialize(raw, current))
+        except Exception:
+            failed.append(f'{path}（原值 {raw!r}）')
+    problems = []
     if unresolved:
-        raise ValueError(f'编排映射的字段路径无法解析，未还原：{", ".join(unresolved)}')
+        problems.append(f'编排映射的字段路径无法解析，未还原：{", ".join(unresolved)}')
+    if failed:
+        problems.append(f'原值无法写回字段，未还原：{", ".join(failed)}')
+    if problems:
+        raise ValueError('；'.join(problems))
 
 
 def catalog() -> list[dict]:

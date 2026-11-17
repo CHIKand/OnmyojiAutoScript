@@ -188,15 +188,26 @@ def test_crash_restores_saved_params_on_next_pick():
 
 
 def test_native_cut_in_does_not_apply_row_params():
-    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi', max_count=12)])
+    # 爬塔既在表里（还是当前行），又在插队名单里：原生插队的那一轮，不能把这一行的参数写进去
+    rows = [OrchestraRow(task='ActivityShikigami', sub1='ap', max_count=100, max_minutes=45), OrchestraRow(task='Orochi')]
+    runtime, _, config, _ = make(rows=rows)
+    climb = config.model.activity_shikigami.general_climb
+    before = climb.model_dump()
     config.pending_task = [fn('activity_shikigami', T0 - timedelta(minutes=1))]
-    before = config.model.activity_shikigami.general_climb.model_dump()
-    assert runtime.pick() is config.pending_task[0]   # 爬塔在插队名单里：原样放行
+    assert runtime.pick() is config.pending_task[0]   # 插队名单优先于当前行：待办里的爬塔原样放行
     runtime.before_run('ActivityShikigami')
-    assert config.model.activity_shikigami.general_climb.model_dump() == before
+    assert climb.model_dump() == before   # general_climb 一个字段没动
     assert config.saves == 0 and saved().phase == 'ready' and saved().saved_params == {}
     runtime.after_run('ActivityShikigami', True)   # 没启动行，什么都不做
-    assert saved().phase == 'ready' and config.saves == 0
+    assert saved().phase == 'ready' and config.saves == 0 and climb.model_dump() == before
+
+    # 对照：待办里没有爬塔了，同一个任务名作为表里的行运行，参数才写进去
+    config.pending_task = []
+    assert runtime.pick().command == 'ActivityShikigami'
+    runtime.before_run('ActivityShikigami')
+    assert (climb.run_sequence, climb.ap_limit, climb.limit_time) == ('ap', 100, dtime(0, 45))
+    assert saved().phase == 'row_running'
+    runtime.after_run('ActivityShikigami', False)
 
 
 def test_heartbeat_writes_done_count():
@@ -319,6 +330,54 @@ def test_pick_reraises_human_takeover_when_not_orchestrating():
     runtime, _, _, _ = make(state='idle')
     with pytest.raises(RequestHumanTakeover):   # 同上游：没有任何任务可跑时请求人工接管
         runtime.pick()
+
+
+def test_paused_with_nothing_to_run_waits_instead_of_exiting():
+    rows = [OrchestraRow(task='Orochi'), OrchestraRow(task='GoryouRealm')]
+    resting = Progress(phase='resting', row_index=1, sequence_started_at=T0, rest_until=T0 + timedelta(minutes=10))
+    runtime, _, config, clock = make(rows=rows, state='paused', progress=resting)
+    picked = runtime.pick()   # 两张表都空：上游会请求人工接管、实例退出，暂停中不能这样
+    assert picked.next_run == T0 + timedelta(minutes=5) and picked.next_run > clock.now   # 5 分钟后到点，上游睡到那时再选
+    assert picked.command == 'GoryouRealm'   # 占位的任务名借自继续后要跑的那一行（第 2 行），不是表里的第一行
+    p = saved()
+    assert p.paused and p.phase == 'resting'   # 暂停照常记进进度
+    runtime.before_run('GoryouRealm')   # 占位不是编排的行
+    assert config.saves == 0 and saved().phase == 'resting'
+
+
+@pytest.mark.parametrize('state, progress', [
+    ('idle', None),                                                 # 停着
+    ('idle', Progress(phase='done', sequence_started_at=T0)),       # 跑完了
+    ('paused', None),                                               # 暂停了，但序列根本没开始：不算进行中
+])
+def test_nothing_to_run_still_raises_when_stopped_finished_or_never_started(state, progress):
+    runtime, _, _, _ = make(rows=[OrchestraRow(task='Orochi')], state=state, progress=progress)
+    with pytest.raises(RequestHumanTakeover):   # 同上游：请求人工接管
+        runtime.pick()
+
+
+def test_no_placeholder_can_be_built_without_a_runnable_row_so_the_upstream_exit_stands(caplog):
+    started = Progress(phase='ready', row_index=0, sequence_started_at=T0)
+    runtime, _, _, _ = make(rows=[OrchestraRow(task='NoSuchTask')], state='paused', progress=started)
+    with caplog.at_level(logging.WARNING), pytest.raises(RequestHumanTakeover):   # 表里没有可运行的行，借不到占位的任务名：照上游重抛
+        runtime.pick()
+    assert [r for r in warnings(caplog) if '占位' in r.getMessage()]   # 预期内的情形：记警告
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]   # 不是内部错误，不走 pick 的兜底
+
+
+@pytest.mark.parametrize('state, waits', [('running', True), ('paused', True), ('idle', False)])
+def test_progress_load_failure_fallback_waits_only_while_orchestrating(state, waits, monkeypatch):
+    runtime, _, _, _ = make(rows=[OrchestraRow(task='Orochi')], state=state)   # 两张表都空
+
+    def unreadable(path):
+        raise PermissionError('locked')
+    monkeypatch.setattr(runtime_module, 'load_progress', unreadable)
+    if waits:
+        picked = runtime.pick()   # 进度读不到，只能凭 state 判断编排在不在进行
+        assert (picked.command, picked.next_run) == ('Orochi', T0 + timedelta(minutes=5))
+    else:
+        with pytest.raises(RequestHumanTakeover):
+            runtime.pick()
 
 
 def test_pick_native_returns_the_pending_function_itself():
@@ -466,6 +525,20 @@ def test_restore_error_is_logged_and_saved_params_still_cleared(caplog):
     assert config.model.orochi.orochi_config.limit_count == 30   # 能还原的照常还原
     assert saved().saved_params == {}   # 清掉，免得每次选任务都重试
     assert any('no_such_group' in r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)   # 对不上的字段记在日志里
+
+
+def test_restore_goes_on_past_an_undeserializable_original(caplog):
+    stale = Progress(phase='interrupted', row_index=0, sequence_started_at=T0,
+                     saved_params={'orochi.orochi_config.layer': '不存在的层', LIMIT_COUNT: 30})   # 转不回去的排在前面
+    runtime, _, config, _ = make(state='idle', progress=stale)
+    config.model.orochi.orochi_config.limit_count = 99
+    config.pending_task = [fn('restart', T0)]
+    with caplog.at_level(logging.ERROR):
+        runtime.pick()
+    assert config.model.orochi.orochi_config.limit_count == 30   # 排在后面的原值照样还原了
+    assert saved().saved_params == {}
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any('orochi.orochi_config.layer' in m and '不存在的层' in m for m in errors)   # 路径和原值都在日志里，人能手工改回
 
 
 def test_config_save_failure_keeps_saved_params_for_the_next_pick(monkeypatch):
@@ -620,6 +693,30 @@ def test_a_failing_revert_does_not_stop_the_pause_and_keeps_the_originals_record
     assert (cfg.limit_count, cfg.layer) == (30, Layer.ELEVEN) and config.saves == 2
     p = saved()
     assert p.phase == 'interrupted' and p.saved_params == {}
+
+
+def test_row_params_are_not_written_when_the_progress_could_not_be_saved(monkeypatch, caplog):
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi', sub1='神罚', max_count=12)])
+    assert runtime.pick().command == 'Orochi'
+    real = runtime_module.save_progress
+
+    def refuse_row_running(path, p):
+        if p.phase == 'row_running':
+            raise PermissionError('locked')   # 记着原值的那次存盘失败（重试用尽）
+        real(path, p)
+    monkeypatch.setattr(runtime_module, 'save_progress', refuse_row_running)
+    cfg = config.model.orochi.orochi_config
+    seen = []
+    config.save = lambda: seen.append((cfg.limit_count, cfg.layer))   # 每次存配置的那一刻，行参数在不在
+    with caplog.at_level(logging.ERROR):
+        runtime.before_run('Orochi')   # 不抛异常
+    assert seen == [(30, Layer.ELEVEN)]   # 只存过一次（暂停），存的时候是原值：配置文件没见过行参数
+    assert (cfg.limit_count, cfg.layer) == (30, Layer.ELEVEN)
+    assert config.model.orchestra.state == 'paused'   # 当作启动失败：撤回、记错误、暂停
+    assert any('第 1 行' in r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    assert saved().phase == 'ready' and saved().saved_params == {}   # 进度文件里没有这一行的记录
+    assert heartbeat_threads() == []
+    runtime.after_run('Orochi', True)   # 行没起，什么都不做
 
 
 def test_progress_is_written_before_the_row_params_reach_the_config_file():
@@ -897,13 +994,38 @@ def test_error_after_the_decision_is_made_still_voids_it(monkeypatch):
     assert config.model.orochi.orochi_config.limit_count == 30 and config.saves == 0
 
 
-def test_internal_error_in_pick_still_raises_upstreams_human_takeover(monkeypatch):
-    runtime, _, _, _ = make(rows=[OrchestraRow(task='Orochi')])
+def test_internal_error_in_pick_still_raises_upstreams_human_takeover_when_stopped(monkeypatch):
+    runtime, _, _, _ = make(rows=[OrchestraRow(task='Orochi')], state='idle')
 
     def boom(*args, **kwargs):
         raise RuntimeError('引擎出错')
     monkeypatch.setattr(runtime_module, 'sync_controls', boom)
-    with pytest.raises(RequestHumanTakeover):   # 兜底就是上游自己的 get_next，它抛什么就抛什么
+    with pytest.raises(RequestHumanTakeover):   # 编排没在进行：兜底就是上游自己的 get_next，它抛什么就抛什么
+        runtime.pick()
+
+
+@pytest.mark.parametrize('state', ['running', 'paused'])
+def test_internal_error_fallback_waits_instead_of_exiting_while_orchestrating(state, monkeypatch):
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi')], state=state)   # 两张表都空
+
+    def boom(*args, **kwargs):
+        raise RuntimeError('引擎出错')
+    monkeypatch.setattr(runtime_module, 'sync_controls', boom)
+    picked = runtime.pick()   # 上游会请求人工接管、实例退出；编排在进行，不能这样
+    assert (picked.command, picked.next_run) == ('Orochi', T0 + timedelta(minutes=5))
+    runtime.before_run('Orochi')   # 占位不是编排的行
+    runtime.after_run('Orochi', True)
+    assert config.saves == 0
+
+
+def test_fallback_reraises_when_the_orchestra_state_cannot_be_read(monkeypatch):
+    runtime, _, config, _ = make(rows=[OrchestraRow(task='Orochi')])
+
+    def break_the_model(*args, **kwargs):
+        config.model = None   # 连 orchestra.state 都读不到
+        raise RuntimeError('引擎出错')
+    monkeypatch.setattr(runtime_module, 'sync_controls', break_the_model)
+    with pytest.raises(RequestHumanTakeover):   # 读不到就照上游：原样重抛
         runtime.pick()
 
 
