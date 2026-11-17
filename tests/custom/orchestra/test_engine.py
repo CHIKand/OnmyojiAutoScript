@@ -1,6 +1,7 @@
 import copy
 import json
 import random
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 import pytest
@@ -32,8 +33,9 @@ def started(s: Orchestra, now: datetime = T0) -> Progress:
 
 
 def run_row(p, s, minutes, completed=True, start=T0, done_count=None, rng=None):
-    """依次调用 on_row_start 与 on_row_end，返回新进度。行号取进度里的当前行。"""
-    p = on_row_start(p, p.row_index, start, {})
+    """依次调用 on_row_start 与 on_row_end，返回新进度。行号取进度里的当前行，任务取表里那一行的，同运行时。"""
+    task = s.rows[p.row_index].task if 0 <= p.row_index < len(s.rows) else None
+    p = on_row_start(p, p.row_index, start, {}, task)
     return on_row_end(p, s, start + timedelta(minutes=minutes), completed, done_count, rng or random.Random(0))
 
 
@@ -426,7 +428,7 @@ def test_interrupted_row_resumes_with_remaining_limits_and_total_counts_every_ru
 
 def test_completed_row_end_writes_history_and_clears_run_state():
     s = running(SIX)
-    p = on_row_start(started(s), 0, T0, {'k': 1})
+    p = on_row_start(started(s), 0, T0, {'k': 1}, 'Orochi')
     p.heartbeat_at = at(1)
     out = on_row_end(p, s, at(3), True, 30, random.Random(0))
     assert out.total_elapsed == 180 and out.saved_params == {} and out.heartbeat_at is None
@@ -527,6 +529,7 @@ def test_functions_do_not_mutate_their_input():
         (resting, lambda p: sync_controls(Orchestra(rows=SIX, state='idle'), p, at(10))),
         (resting, lambda p: sync_controls(running(SIX[:3]), p, at(10))),   # 表被改短
         (done, lambda p: sync_controls(running(SIX), p, at(10))),   # 重新开始
+        (resting, lambda p: sync_controls(running(SIX, command='start', command_seq=9), p, at(10))),   # 开始命令
         (in_row, lambda p: recover(p, at(300))),
         (resting, lambda p: on_row_start(p, 1, at(10), {'a': 1})),
         (in_row, lambda p: on_row_end(p, s, at(10), True, 3, random.Random(0))),
@@ -539,3 +542,186 @@ def test_functions_do_not_mutate_their_input():
         assert out is not p and out.saved_params is not p.saved_params and out.history is not p.history
     decide(s, resting, [TaskRef('MetaDemon', T0)], [TaskRef('Restart', at(5))], at(1))
     assert resting.rest_until == at(30) and s.model_dump() == s_before
+
+
+# ---------- 最终评审修正 ----------
+
+# I2：上游的自愈任务 SoulsTidy 与 Restart 一样永远放行，Restart 在前
+
+def test_souls_tidy_is_always_let_through():
+    s = running(SIX, cut_in_tasks=[])
+    assert decide(s, started(s), [TaskRef('SoulsTidy', T0)], [], T0) == Decision('native', 'SoulsTidy')
+
+
+def test_restart_then_souls_tidy_then_the_cut_in_list():
+    s = running(SIX)
+    p = Progress(phase='resting', row_index=1, rest_until=at(30))
+    pending = [TaskRef('MetaDemon', T0), TaskRef('SoulsTidy', T0)]
+    assert decide(s, p, pending, [], T0) == Decision('native', 'SoulsTidy')   # 自愈先于插队名单，不看待办顺序
+    pending = [TaskRef('SoulsTidy', T0), TaskRef('Restart', T0)]
+    assert decide(s, p, pending, [], T0) == Decision('native', 'Restart')
+
+
+def test_wait_target_honours_souls_tidy_in_waiting():
+    s = running(SIX, cut_in_tasks=[])
+    p = Progress(phase='resting', row_index=1, rest_until=at(30))
+    assert decide(s, p, [], [TaskRef('SoulsTidy', at(10))], T0) == Decision('wait', 'SoulsTidy', at=at(10))
+
+
+def test_a_cut_in_task_beyond_the_catalog_runs_natively():
+    s = running(SIX, cut_in_tasks=['TrueOrochi'])
+    assert decide(s, started(s), [TaskRef('TrueOrochi', T0)], [], T0) == Decision('native', 'TrueOrochi')
+    assert decide(s, started(s), [TaskRef('MetaDemon', T0)], [], T0) == Decision('row', 'Orochi', row_index=0)
+
+
+# I3：开始命令，"停止后马上开始"在实例读到配置之前也不会丢
+
+def test_start_command_restarts_a_sequence_in_progress():
+    old = Progress(phase='resting', row_index=3, loop_count=1, sequence_started_at=T0, rest_until=at(30),
+                   total_elapsed=600.0, history=[{'row_index': 2}], saved_params={'k': 1}, last_command_seq=4,
+                   status_note='防封禁休眠中，08:00 继续')
+    p = sync_controls(running(SIX, command='start', command_seq=5), old, at(10))
+    assert p == Progress(phase='ready', sequence_started_at=at(10), saved_params={'k': 1}, last_command_seq=5)
+
+
+@pytest.mark.parametrize('phase', ['ready', 'resting', 'interrupted', 'idle', 'done'])
+def test_start_command_resets_whatever_the_phase(phase):
+    old = Progress(phase=phase, row_index=4, row_task='GoryouRealm', row_elapsed_before=720.0, done_count=18,
+                   sequence_started_at=T0, rest_until=at(30), paused=True, rest_remaining=60.0)
+    p = sync_controls(running(SIX, command='start', command_seq=1), old, at(10))
+    assert (p.phase, p.row_index, p.sequence_started_at, p.last_command_seq) == ('ready', 0, at(10), 1)
+    assert (p.row_task, p.row_elapsed_before, p.done_count, p.paused, p.rest_until) == (None, 0.0, None, False, None)
+
+
+def test_start_command_with_the_instance_off_does_not_resume_yesterdays_row():
+    crashed = Progress(phase='row_running', row_index=2, row_task='GoryouRealm', sequence_started_at=T0,
+                       row_started_at=T0, heartbeat_at=at(5), saved_params={'k': 1})
+    s = running(SIX, command='start', command_seq=1)
+    p = sync_controls(s, recover(crashed, at(600)), at(600))   # 进程起来后的第一次选任务：先 recover 再同步
+    assert (p.phase, p.row_index, p.sequence_started_at, p.saved_params) == ('ready', 0, at(600), {'k': 1})
+    assert decide(s, p, [], [], at(600)) == Decision('row', 'Orochi', row_index=0)
+
+
+def test_start_command_is_handled_once():
+    s = running(SIX, command='start', command_seq=1)
+    p = run_row(sync_controls(s, Progress(phase='resting', row_index=3), T0), s, 1)
+    assert (p.phase, p.row_index) == ('resting', 1)
+    assert sync_controls(s, p, at(2)) == p   # 同一条命令处理过了，之后每次选任务都不再重来
+
+
+def test_start_command_then_pause_starts_paused():
+    s = Orchestra(rows=SIX, state='paused', command='start', command_seq=1)
+    p = sync_controls(s, Progress(phase='resting', row_index=3, rest_until=at(30)), at(10))
+    assert (p.phase, p.row_index, p.paused) == ('ready', 0, True)
+    assert decide(s, p, [], [], at(10)) == Decision('passthrough')
+
+
+def test_start_command_then_stop_ends_idle_and_keeps_the_originals():
+    s = Orchestra(rows=SIX, state='idle', command='start', command_seq=1)
+    p = sync_controls(s, Progress(phase='resting', row_index=3, rest_until=at(30), saved_params={'k': 1}), at(10))
+    assert (p.phase, p.row_index, p.rest_until, p.saved_params, p.last_command_seq) == ('idle', 0, None, {'k': 1}, 1)
+
+
+# N1：表在运行中被改过，凭 row_task 认行
+
+def test_row_start_resumes_only_the_same_task_at_the_same_index():
+    p = Progress(phase='interrupted', row_index=2, row_task='GoryouRealm', row_elapsed_before=720.0, done_count=18)
+    same = on_row_start(p, 2, at(60), {}, 'GoryouRealm')
+    assert (same.row_elapsed_before, same.done_count, same.row_task) == (720.0, 18, 'GoryouRealm')
+    other = on_row_start(p, 2, at(60), {}, 'Orochi')   # 同一个行号，表里已经换成别的任务
+    assert (other.row_elapsed_before, other.done_count, other.row_task) == (0.0, None, 'Orochi')
+
+
+def test_history_records_the_task_that_ran_not_the_edited_table():
+    s = running(SIX)
+    p = on_row_start(started(s), 0, T0, {}, 'Orochi')
+    edited = running([OrchestraRow(task='GoryouRealm')] + SIX[1:])   # 第 1 行运行中被改成了御灵
+    assert on_row_end(p, edited, at(3), True, 30, random.Random(0)).history[-1]['task'] == 'Orochi'
+
+
+def test_row_task_stays_while_interrupted_and_clears_once_the_row_completes():
+    s = running(SIX)
+    p = on_row_start(started(s), 0, T0, {}, 'Orochi')
+    assert on_row_end(p, s, at(3), False, 5, random.Random(0)).row_task == 'Orochi'
+    assert on_row_end(p, s, at(3), True, 5, random.Random(0)).row_task is None
+
+
+def test_table_edit_drops_the_task_of_the_vanished_row_too():
+    p = Progress(phase='interrupted', row_index=5, row_task='Orochi', row_elapsed_before=720, done_count=18)
+    out = sync_controls(running(SIX[:3], after_finish='loop'), p, T0)
+    assert (out.phase, out.row_index, out.row_task) == ('ready', 0, None)
+
+
+# N5：跑完与停止时清掉防封禁提示
+
+def test_done_and_stop_clear_the_status_note():
+    note = '防封禁休眠中，08:00 继续'
+    s = running([OrchestraRow(task='Orochi')])
+    p = on_row_start(started(s), 0, T0, {}, 'Orochi')
+    p.status_note = note
+    assert on_row_end(p, s, at(1), True, None, random.Random(0)).status_note == ''   # 跑完
+    resting = Progress(phase='resting', row_index=1, rest_until=at(30), status_note=note)
+    assert sync_controls(Orchestra(rows=SIX, state='idle'), resting, T0).status_note == ''   # 停止
+    assert sync_controls(running(SIX[:3]), replace(resting, row_index=5), T0).status_note == ''   # 改表改到跑完
+    assert sync_controls(running(SIX), resting, T0).status_note == note   # 其余时候不动
+
+
+# N12：行运行中落下的暂停（运行时只在选任务时同步，今天走不到，引擎先兜住）
+
+def test_rest_after_a_row_that_ended_while_paused_keeps_its_full_length():
+    s = running(SIX)
+    p = on_row_start(started(s), 0, T0, {}, 'Orochi')
+    p.paused = True
+    out = on_row_end(p, s, at(1), True, None, random.Random(0))
+    assert (out.phase, out.paused, out.rest_remaining) == ('resting', True, 300.0)
+    resumed = sync_controls(running(SIX), out, at(60))
+    assert (resumed.paused, resumed.rest_until, resumed.rest_remaining) == (False, at(65), None)   # 继续时休满 5 分钟
+
+
+def test_finish_clears_paused():
+    s = running([OrchestraRow(task='Orochi')])
+    p = on_row_start(started(s), 0, T0, {}, 'Orochi')
+    p.paused = True
+    out = on_row_end(p, s, at(1), True, None, random.Random(0))
+    assert (out.phase, out.paused, out.rest_remaining) == ('done', False, None)
+
+
+# N13：休息分钟夹在 0–1439（手改的配置不会让 timedelta 溢出）
+
+@pytest.mark.parametrize('rest_minutes, default, seconds', [
+    (None, 10 ** 11, 1439 * 60), (None, -5, 0), (5000, 5, 1439 * 60), (-3, 5, 0),
+], ids=['default-huge', 'default-negative', 'row-huge', 'row-negative'])
+def test_rest_minutes_are_clamped_to_a_day(rest_minutes, default, seconds):
+    s = Orchestra(rows=[OrchestraRow(task='Orochi', rest_minutes=rest_minutes), OrchestraRow(task='Orochi')],
+                  state='running', default_rest_minutes=default)   # 第 1 行开跑之后被手改成这样
+    p = on_row_start(Progress(phase='ready'), 0, T0, {}, 'Orochi')
+    out = on_row_end(p, s, at(1), True, None, random.Random(0))
+    if seconds:
+        assert out.phase == 'resting' and out.rest_until == at(1) + timedelta(seconds=seconds)
+    else:
+        assert out.phase == 'ready' and out.rest_until is None
+
+
+# N14：引擎用例的空白
+
+@pytest.mark.parametrize('bad', [
+    OrchestraRow(task='Orochi', max_minutes=2000),
+    OrchestraRow(task='Orochi', rest_minutes=-1),
+    OrchestraRow(task='Orochi', sub1='十三层'),
+], ids=['minutes-2000', 'rest-negative', 'sub1-out-of-range'])
+def test_rows_with_bad_values_are_skipped(bad):
+    s = running([bad, OrchestraRow(task='GoryouRealm')])
+    assert next_row_index(s.rows, 0) == 1
+    assert decide(s, Progress(phase='ready'), [], [], T0) == Decision('row', 'GoryouRealm', row_index=1)
+
+
+def test_recover_without_a_start_time_adds_nothing():
+    p = Progress(phase='row_running', row_index=1, row_started_at=None, heartbeat_at=at(5), row_elapsed_before=60.0)
+    out = recover(p, at(300))
+    assert (out.phase, out.row_elapsed_before) == ('interrupted', 60.0)
+
+
+def test_resume_without_a_recorded_rest_keeps_the_deadline():
+    p = Progress(phase='resting', row_index=1, rest_until=at(30), paused=True, rest_remaining=None)
+    out = sync_controls(running(SIX), p, at(20))
+    assert (out.paused, out.rest_until, out.rest_remaining) == (False, at(30), None)

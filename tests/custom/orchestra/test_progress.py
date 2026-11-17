@@ -1,6 +1,7 @@
 import errno
 import json
 import logging
+import os
 import sys
 from dataclasses import fields
 from datetime import datetime, timedelta
@@ -11,7 +12,9 @@ import pytest
 
 from module.config import atomicwrites
 from module.orchestra import progress as progress_module
-from module.orchestra.progress import Progress, load_progress, progress_path, progress_to_dict, save_progress
+from module.logger import cleanup_logs
+from module.orchestra.progress import (Progress, adopt_legacy_progress, legacy_progress_path, load_progress,
+                                       progress_path, progress_to_dict, save_progress)
 
 T0 = datetime(2026, 11, 17, 10, 0, 0, 123456)   # 带微秒：往返之后必须原样相等
 COMPUTED = {'row_elapsed_seconds', 'rest_remaining_seconds'}
@@ -22,6 +25,7 @@ def full_progress() -> Progress:
     return Progress(
         phase='resting',
         row_index=3,
+        row_task='Orochi',
         loop_count=2,
         sequence_started_at=T0,
         row_started_at=T0 + timedelta(minutes=5, microseconds=7),
@@ -73,9 +77,50 @@ def test_history_capped_at_20(tmp_path):
 
 
 def test_progress_path_layout(tmp_path, monkeypatch):
-    assert progress_path('oas1', tmp_path) == tmp_path / 'log' / '.orchestra_oas1.json'
+    assert progress_path('oas1', tmp_path) == tmp_path / 'log' / 'orchestra' / 'oas1.json'
+    assert legacy_progress_path('oas1', tmp_path) == tmp_path / 'log' / '.orchestra_oas1.json'
     monkeypatch.chdir(tmp_path)
-    assert progress_path('oas1') == Path.cwd() / 'log' / '.orchestra_oas1.json'   # 缺省取当前目录
+    assert progress_path('oas1') == Path.cwd() / 'log' / 'orchestra' / 'oas1.json'   # 缺省取当前目录
+    assert legacy_progress_path('oas1') == Path.cwd() / 'log' / '.orchestra_oas1.json'
+
+
+def test_upstream_log_cleanup_leaves_the_progress_file_alone(tmp_path):
+    """上游每次启动删 log/ 根目录下超过 14 天的文件，子目录里只进 log/error：进度文件放在 log/orchestra/ 才留得住。"""
+    path = progress_path('oas1', tmp_path)
+    save_progress(path, full_progress())
+    stale_root_file = tmp_path / 'log' / '2026-01-01_oas1.txt'
+    stale_root_file.write_text('old', encoding='utf-8')
+    month_ago = (datetime.now() - timedelta(days=30)).timestamp()
+    for old in (path, path.parent, stale_root_file):
+        os.utime(old, (month_ago, month_ago))
+    cleanup_logs(str(tmp_path / 'log'))
+    assert not stale_root_file.exists()   # 清理确实跑了
+    assert load_progress(path) == full_progress()
+
+
+# ---- 旧位置 log/.orchestra_<实例名>.json 的一次性迁移 ----
+
+def test_adopt_moves_the_legacy_file_when_the_new_one_is_missing(tmp_path):
+    legacy = legacy_progress_path('oas1', tmp_path)
+    save_progress(legacy, full_progress())   # 旧版本写下的、还在进行中的进度
+    raw = legacy.read_bytes()
+    assert adopt_legacy_progress('oas1', tmp_path) is True
+    assert not legacy.exists()
+    assert progress_path('oas1', tmp_path).read_bytes() == raw   # 原样搬过来，saved_params 一个不少
+    assert adopt_legacy_progress('oas1', tmp_path) is False      # 只搬一次
+
+
+def test_adopt_leaves_both_alone_when_the_new_file_exists(tmp_path):
+    legacy, path = legacy_progress_path('oas1', tmp_path), progress_path('oas1', tmp_path)
+    save_progress(legacy, Progress(row_index=1))
+    save_progress(path, Progress(row_index=2))
+    assert adopt_legacy_progress('oas1', tmp_path) is False
+    assert (load_progress(legacy).row_index, load_progress(path).row_index) == (1, 2)   # 新的为准，旧的不动
+
+
+def test_adopt_without_a_legacy_file_creates_nothing(tmp_path):
+    assert adopt_legacy_progress('oas1', tmp_path) is False
+    assert list(tmp_path.iterdir()) == []   # 连 log/ 都不建：没编排过的实例不留痕迹
 
 
 @pytest.mark.parametrize('content', [
@@ -258,6 +303,17 @@ def test_load_does_not_retry_other_os_errors(tmp_path, monkeypatch, sleeps):
     assert len(calls) == 1 and sleeps == []
 
 
+def test_adopt_retries_a_denied_move_and_keeps_the_legacy_file_when_it_gives_up(tmp_path, monkeypatch, sleeps):
+    legacy = legacy_progress_path('oas1', tmp_path)
+    save_progress(legacy, full_progress())
+    calls = []
+    monkeypatch.setattr(progress_module.os, 'replace', flaky(os.replace, None, calls, errno.EACCES))
+    with pytest.raises(PermissionError):
+        adopt_legacy_progress('oas1', tmp_path)
+    assert len(calls) == ATTEMPTS and len(sleeps) == ATTEMPTS - 1
+    assert load_progress(legacy) == full_progress() and not progress_path('oas1', tmp_path).exists()
+
+
 @pytest.mark.skipif(sys.platform != 'win32', reason='只有 Windows 会因为读者开着文件而拒绝替换')
 def test_save_waits_for_a_reader_that_has_the_file_open(tmp_path, monkeypatch):
     path = progress_path('oas1', tmp_path)
@@ -271,6 +327,6 @@ def test_save_waits_for_a_reader_that_has_the_file_open(tmp_path, monkeypatch):
 
         monkeypatch.setattr(progress_module, 'time', SimpleNamespace(sleep=let_go))
         save_progress(path, Progress(row_index=2))
-    assert waits == [progress_module._RETRY_DELAY]   # 第一次尝试被真实的 PermissionError 拒绝，等一次后成功
+    assert waits[:1] == [progress_module._RETRY_DELAY]   # 第一次尝试被真实的 PermissionError 拒绝，等过之后成功（杀毒等扫描器占着临时文件时可能多等几次）
     assert load_progress(path).row_index == 2
     assert [f.name for f in path.parent.iterdir()] == [path.name]

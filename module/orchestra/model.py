@@ -4,8 +4,8 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
-    # 只用于类型标注。mapping 按名字导入上游十个任务的枚举，而 config_model 导入本文件，
-    # 加载 ConfigModel（实例启动）不该依赖那些导入，所以顶层不导入 mapping，校验函数用到时才在函数内导入。
+    # 只用于类型标注。config_model 在顶层导入本文件，mapping 又在顶层导入 config_model，
+    # 本文件顶层导入 mapping 或 config_model 都会成环，所以校验函数用到时才在函数内导入。
     from module.orchestra.mapping import TaskSpec
 
 
@@ -22,8 +22,9 @@ class OrchestraRow(BaseModel):
 class Orchestra(BaseModel):
     """一个实例的编排配置，存在实例配置的 orchestra 字段里。
 
-    字段只用宽松的普通类型，读取时不会因取值非法而抛异常，坏配置挡不住实例启动；
-    取值是否合法由保存时的 validate_settings 把关。
+    字段只用宽松的普通类型：取值非法（未知任务名、越界的数、不认识的 state）读取时不抛异常，挡不住实例启动，
+    取值是否合法由保存时的 validate_settings 把关；类型不对（次数写成字符串、行里缺 task、rows 不是列表）
+    仍会让加载失败，与上游其他字段一样。
     state、command、command_seq 是界面与引擎之间的运行控制字段，只由命令接口和引擎写入，不属于用户设置。
     """
     rows: list[OrchestraRow] = []
@@ -93,12 +94,20 @@ def validate_rows(rows: list[OrchestraRow]) -> list[RowError]:
     return errors
 
 
+def _scheduled_commands() -> set[str]:
+    """上游调度器能排的任务命令名：ConfigModel 上类型带 scheduler 的字段，命令名取类型的类名（同上游 Function.command）。"""
+    from module.config.config_model import ConfigModel   # 函数内导入，原因见文件顶部
+    return {field.annotation.__name__ for field in ConfigModel.model_fields.values()
+            if isinstance(field.annotation, type) and issubclass(field.annotation, BaseModel)
+            and 'scheduler' in field.annotation.model_fields}
+
+
 def validate_settings(o: Orchestra) -> list[RowError]:
     """校验用户可改的设置项，再接上 validate_rows 的结果。
 
     设置项的错误 index 为 -1，field 是属性名。state、command、command_seq 不查，原因见 Orchestra 的说明。
+    插队名单可以是任何上游调度器能排的任务（比如真蛇），不限于映射表里的 17 个；Restart、SoulsTidy 写不写都永远放行。
     """
-    from module.orchestra.mapping import TASK_SPECS
     invalid: list[str] = []
     if o.after_finish not in ('stop', 'loop'):
         invalid.append('after_finish')
@@ -108,6 +117,6 @@ def validate_settings(o: Orchestra) -> list[RowError]:
         invalid.append('default_rest_minutes')
     if o.resume_policy not in ('remaining', 'rerun'):
         invalid.append('resume_policy')
-    if any(task not in TASK_SPECS for task in o.cut_in_tasks):  # 界面只提供目录里的任务
+    if o.cut_in_tasks and not set(o.cut_in_tasks) <= _scheduled_commands():
         invalid.append('cut_in_tasks')
     return [RowError(-1, name, '取值不合法') for name in invalid] + validate_rows(o.rows)

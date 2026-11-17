@@ -81,6 +81,15 @@ def test_a_field_that_cannot_be_written_is_reported_and_skipped(monkeypatch):
     assert model.orochi.orochi_config.limit_count == 30
 
 
+def test_the_message_carries_each_underlying_exception():
+    model = dirty_model()
+    with pytest.raises(ValueError) as info:
+        restore_params(model, {LAYER: '不存在的层', LIMIT_TIME: 123})
+    message = str(info.value)
+    assert 'is not a valid Layer' in message   # 枚举转不回去：ValueError 的原文
+    assert 'TypeError' in message              # 时间不是字符串：fromisoformat 的 TypeError
+
+
 def test_nothing_to_report_when_every_field_restores():
     model = dirty_model()
     restore_params(model, {LAYER: '悲鸣', COUNT: 30, LIMIT_TIME: '00:20:00'})   # 不抛异常

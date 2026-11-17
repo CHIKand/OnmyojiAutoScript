@@ -1,8 +1,11 @@
 """编排引擎的运行进度文件。
 
-每个实例一份，放在 log/.orchestra_<实例名>.json，与上游的 log/.queue_state.json 同处。里面记着当前第几行、
-处于哪个阶段、心跳、休息截止时间，以及被行参数覆盖之前的用户原值：进程中断后凭它续跑或还原，
-接口也读它给运行面板。
+每个实例一份，放在 log/orchestra/<实例名>.json。里面记着当前第几行、处于哪个阶段、心跳、休息截止时间，
+以及被行参数覆盖之前的用户原值：进程中断后凭它续跑或还原，接口也读它给运行面板。
+不放在 log/ 根目录：上游每次启动会删掉 log/ 根目录下超过 14 天的文件（module/logger.py 的 cleanup_logs，
+子目录里只清 log/error），停了半个月的实例会连同没还原的原值一起丢掉进度。也不放在 config/：
+上游把那里的每个 json 都当作一个实例。早先版本放在 log/.orchestra_<实例名>.json，实例第一次读进度时
+用 adopt_legacy_progress 搬过来。
 
 只有本模块写这个文件，写入走 atomic_write，不会读到写了一半的内容。
 文件不存在或内容损坏时读成默认进度，不抛异常。
@@ -11,6 +14,7 @@ Windows 上有读者开着文件时，写者的替换会被拒；读者赶上替
 双方占用文件的时间都很短，所以读写遇到 PermissionError 时有限次重试，见 _retry_on_permission_error。
 """
 import json
+import os
 import time
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
@@ -31,6 +35,7 @@ class Progress:
     """一个实例的编排运行进度。datetime 不带时区信息，用 isoformat 原样存取。"""
     phase: str = 'idle'                    # idle / ready / row_running / resting / interrupted / done
     row_index: int = 0
+    row_task: str | None = None            # 正在跑或被打断的那一行的任务；表在运行中被改过时，凭它认出是不是同一行
     loop_count: int = 0
     sequence_started_at: datetime | None = None
     row_started_at: datetime | None = None
@@ -86,8 +91,28 @@ def _retry_on_permission_error(operation: Callable[[], Any]) -> Any:
 
 
 def progress_path(config_name: str, root: Path | None = None) -> Path:
-    """某个实例的进度文件路径：<root，缺省为当前目录>/log/.orchestra_<实例名>.json。"""
+    """某个实例的进度文件路径：<root，缺省为当前目录>/log/orchestra/<实例名>.json。"""
+    return (root if root is not None else Path.cwd()) / 'log' / 'orchestra' / f'{config_name}.json'
+
+
+def legacy_progress_path(config_name: str, root: Path | None = None) -> Path:
+    """早先版本的进度文件路径：<root，缺省为当前目录>/log/.orchestra_<实例名>.json。"""
     return (root if root is not None else Path.cwd()) / 'log' / f'.orchestra_{config_name}.json'
+
+
+def adopt_legacy_progress(config_name: str, root: Path | None = None) -> bool:
+    """新位置还没有进度文件、旧位置有时，把旧文件原样搬到新位置并返回 True，进行中的序列和没还原的原值都跟着过来；
+    否则什么都不动，返回 False。
+
+    只该由实例进程调用，它是进度文件唯一的写者，所以"新文件不存在"在搬之前不会变。搬遇到 PermissionError
+    同样有限次重试，仍然失败就抛出，旧文件原样留着，下次再搬。
+    """
+    path, legacy = progress_path(config_name, root), legacy_progress_path(config_name, root)
+    if path.exists() or not legacy.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _retry_on_permission_error(lambda: os.replace(legacy, path))
+    return True
 
 
 def load_progress(path: Path) -> Progress:
