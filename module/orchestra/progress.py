@@ -6,17 +6,23 @@
 
 只有本模块写这个文件，写入走 atomic_write，不会读到写了一半的内容。
 文件不存在或内容损坏时读成默认进度，不抛异常。
+
+Windows 上有读者开着文件时，写者的替换会被拒；读者赶上替换的瞬间，读也会被拒，都表现为 PermissionError。
+双方占用文件的时间都很短，所以读写遇到 PermissionError 时有限次重试，见 _retry_on_permission_error。
 """
 import json
+import time
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from module.config.atomicwrites import atomic_write
 from module.logger import logger
 
 HISTORY_LIMIT = 20  # 文件里最多留多少条历史
+_RETRY_ATTEMPTS = 10  # 读写遇到 PermissionError 时，一次操作最多尝试的次数
+_RETRY_DELAY = 0.05   # 两次尝试之间等待的秒数
 _DATETIME_FIELDS = ('sequence_started_at', 'row_started_at', 'heartbeat_at', 'rest_until')
 
 
@@ -63,6 +69,22 @@ def _from_json(raw: Any) -> Progress:
     return Progress(**data)
 
 
+def _retry_on_permission_error(operation: Callable[[], Any]) -> Any:
+    """执行 operation 并返回它的结果；遇到 PermissionError 就隔 _RETRY_DELAY 秒再来，一共最多 _RETRY_ATTEMPTS 次。
+
+    只重试 PermissionError，其他异常立刻抛出；最后一次仍失败，就把最后一次的 PermissionError 抛出去。
+    """
+    attempt = 1
+    while True:
+        try:
+            return operation()
+        except PermissionError:
+            if attempt >= _RETRY_ATTEMPTS:
+                raise
+            attempt += 1
+            time.sleep(_RETRY_DELAY)
+
+
 def progress_path(config_name: str, root: Path | None = None) -> Path:
     """某个实例的进度文件路径：<root，缺省为当前目录>/log/.orchestra_<实例名>.json。"""
     return (root if root is not None else Path.cwd()) / 'log' / f'.orchestra_{config_name}.json'
@@ -73,11 +95,13 @@ def load_progress(path: Path) -> Progress:
 
     损坏指：不是合法 JSON、顶层不是对象、日期字段无法解析。文件里的未知键忽略，缺的键取默认值，
     其余字段的类型不检查，因为文件只由本模块原子写入。
-    读文件时的其他错误（无权限、被占用等）既不是不存在也不是损坏，照常抛出：拿默认值顶替的话，
+    读文件遇到 PermissionError（Windows 上正赶上写者替换文件）会先有限次重试。读文件时的其他错误，
+    以及重试后仍然失败的 PermissionError，既不是不存在也不是损坏，照常抛出：拿默认值顶替的话，
     调用方接着保存就会把真实进度连同 saved_params 一起覆盖掉。
     """
     try:
-        return _from_json(json.loads(path.read_text(encoding='utf-8')))
+        text = _retry_on_permission_error(lambda: path.read_text(encoding='utf-8'))
+        return _from_json(json.loads(text))
     except FileNotFoundError:
         return Progress()
     except (TypeError, ValueError) as exc:   # JSONDecodeError、UnicodeDecodeError 都是 ValueError 的子类
@@ -86,11 +110,20 @@ def load_progress(path: Path) -> Progress:
 
 
 def save_progress(path: Path, p: Progress) -> None:
-    """原子写进度文件，目录不存在时先建。历史只写最后 HISTORY_LIMIT 条，p 本身不动。"""
+    """原子写进度文件，目录不存在时先建。历史只写最后 HISTORY_LIMIT 条，p 本身不动。
+
+    Windows 上有读者开着文件时替换会被拒，遇到 PermissionError 就把整个原子写重做一遍，
+    次数与间隔见 _RETRY_ATTEMPTS、_RETRY_DELAY；仍然失败则抛出最后一次的 PermissionError。
+    失败的那次写下的临时文件，由 atomic_write 回滚时删掉，旧文件原样保留。
+    """
     text = json.dumps(_to_json_dict(p), ensure_ascii=False, indent=2)   # 序列化放在写入之前，出错时不碰磁盘
     path.parent.mkdir(parents=True, exist_ok=True)
-    with atomic_write(path, overwrite=True, encoding='utf-8', newline='') as f:
-        f.write(text)
+
+    def write() -> None:
+        with atomic_write(path, overwrite=True, encoding='utf-8', newline='') as f:
+            f.write(text)
+
+    _retry_on_permission_error(write)
 
 
 def progress_to_dict(p: Progress, now: datetime) -> dict:

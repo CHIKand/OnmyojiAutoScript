@@ -1,11 +1,16 @@
+import errno
 import json
 import logging
+import sys
 from dataclasses import fields
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from module.config import atomicwrites
+from module.orchestra import progress as progress_module
 from module.orchestra.progress import Progress, load_progress, progress_path, progress_to_dict, save_progress
 
 T0 = datetime(2026, 11, 17, 10, 0, 0, 123456)   # 带微秒：往返之后必须原样相等
@@ -146,3 +151,126 @@ def test_dict_view_is_file_form_plus_computed_fields(tmp_path):
     assert d['sequence_started_at'] == '2026-11-17T10:00:00.123456'   # datetime 存 ISO 字符串，微秒保留
     assert progress_to_dict(Progress(), T0)['heartbeat_at'] is None
     json.dumps(d)   # 能直接交给 HTTP 响应序列化
+
+
+# ---- Windows 上读者开着文件时的重试 ----
+# 读者开着文件时，atomic_write 的替换会被拒（PermissionError）；读者赶上替换的瞬间，读也会被拒。
+ATTEMPTS = progress_module._RETRY_ATTEMPTS
+
+
+@pytest.fixture
+def sleeps(monkeypatch) -> list:
+    """重试间隔改成 0，并记下每次 sleep 的秒数：测试不用真等，也能核对只在两次尝试之间等待。"""
+    recorded = []
+    monkeypatch.setattr(progress_module, '_RETRY_DELAY', 0)
+    monkeypatch.setattr(progress_module, 'time', SimpleNamespace(sleep=recorded.append))
+    return recorded
+
+
+def flaky(real, failures, calls, code):
+    """包一层 real：前 failures 次（None 表示每次）抛 OSError(code, 'attempt N')，之后转调 real；calls 记下每次尝试。
+
+    code 为 EACCES 时抛出的就是 PermissionError，与读者开着文件时 Windows 的拒绝同类。
+    """
+    def wrapper(*args, **kwargs):
+        calls.append(args)
+        if failures is None or len(calls) <= failures:
+            raise OSError(code, f'attempt {len(calls)}')
+        return real(*args, **kwargs)
+    return wrapper
+
+
+def deny_replace(monkeypatch, failures, code=errno.EACCES) -> list:
+    """让 atomic_write 的替换步骤（读者开着文件时被拒的那一步）按 flaky 的规则失败，返回每次尝试的记录。"""
+    calls = []
+    monkeypatch.setattr(atomicwrites, 'replace_atomic', flaky(atomicwrites.replace_atomic, failures, calls, code))
+    return calls
+
+
+def deny_read(monkeypatch, failures, code=errno.EACCES) -> list:
+    """让 Path.read_text 按 flaky 的规则失败，返回每次尝试的记录。"""
+    calls = []
+    monkeypatch.setattr(Path, 'read_text', flaky(Path.read_text, failures, calls, code))
+    return calls
+
+
+@pytest.mark.parametrize('failures', [1, 3, ATTEMPTS - 1])
+def test_save_retries_when_replace_is_denied(tmp_path, monkeypatch, sleeps, failures):
+    path = progress_path('oas1', tmp_path)
+    calls = deny_replace(monkeypatch, failures)
+    save_progress(path, full_progress())
+    assert len(calls) == failures + 1   # 失败几次就多试几次，成功的那次是最后一次
+    assert sleeps == [0] * failures     # 只在两次尝试之间等待
+    assert [f.name for f in path.parent.iterdir()] == [path.name]   # 失败的几次没有留下临时文件
+    assert load_progress(path) == full_progress()
+
+
+def test_save_gives_up_after_all_attempts(tmp_path, monkeypatch, sleeps):
+    path = progress_path('oas1', tmp_path)
+    save_progress(path, Progress(row_index=1))   # 已有的旧文件
+    calls = deny_replace(monkeypatch, None)
+    with pytest.raises(PermissionError) as excinfo:
+        save_progress(path, Progress(row_index=2))
+    assert len(calls) == ATTEMPTS
+    assert len(sleeps) == ATTEMPTS - 1                       # 最后一次失败后不再等
+    assert excinfo.value.strerror == f'attempt {ATTEMPTS}'   # 抛出的是最后一次的异常
+    assert [f.name for f in path.parent.iterdir()] == [path.name]   # 每次失败写下的临时文件都清掉了
+    assert load_progress(path).row_index == 1                       # 旧文件原封不动
+
+
+def test_save_does_not_retry_other_os_errors(tmp_path, monkeypatch, sleeps):
+    path = progress_path('oas1', tmp_path)
+    calls = deny_replace(monkeypatch, None, code=errno.EIO)
+    with pytest.raises(OSError) as excinfo:
+        save_progress(path, Progress())
+    assert type(excinfo.value) is OSError   # 不是 PermissionError
+    assert len(calls) == 1 and sleeps == []
+
+
+@pytest.mark.parametrize('failures', [1, 3, ATTEMPTS - 1])
+def test_load_retries_when_read_is_denied(tmp_path, monkeypatch, sleeps, failures):
+    path = progress_path('oas1', tmp_path)
+    save_progress(path, full_progress())
+    calls = deny_read(monkeypatch, failures)
+    assert load_progress(path) == full_progress()
+    assert len(calls) == failures + 1
+    assert sleeps == [0] * failures
+
+
+def test_load_gives_up_after_all_attempts_and_raises(tmp_path, monkeypatch, sleeps):
+    path = progress_path('oas1', tmp_path)
+    save_progress(path, full_progress())
+    calls = deny_read(monkeypatch, None)
+    with pytest.raises(PermissionError) as excinfo:   # 不能拿默认进度顶替：调用方接着保存会覆盖真实的 saved_params
+        load_progress(path)
+    assert len(calls) == ATTEMPTS
+    assert len(sleeps) == ATTEMPTS - 1
+    assert excinfo.value.strerror == f'attempt {ATTEMPTS}'
+
+
+def test_load_does_not_retry_other_os_errors(tmp_path, monkeypatch, sleeps):
+    path = progress_path('oas1', tmp_path)
+    save_progress(path, full_progress())
+    calls = deny_read(monkeypatch, None, code=errno.EIO)
+    with pytest.raises(OSError) as excinfo:
+        load_progress(path)
+    assert type(excinfo.value) is OSError
+    assert len(calls) == 1 and sleeps == []
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='只有 Windows 会因为读者开着文件而拒绝替换')
+def test_save_waits_for_a_reader_that_has_the_file_open(tmp_path, monkeypatch):
+    path = progress_path('oas1', tmp_path)
+    save_progress(path, Progress(row_index=1))
+    waits = []
+    with open(path, encoding='utf-8') as reader:   # 真的有一个读者开着文件，不是模拟
+
+        def let_go(seconds):   # 第一次被拒、进入等待时，读者放手
+            waits.append(seconds)
+            reader.close()
+
+        monkeypatch.setattr(progress_module, 'time', SimpleNamespace(sleep=let_go))
+        save_progress(path, Progress(row_index=2))
+    assert waits == [progress_module._RETRY_DELAY]   # 第一次尝试被真实的 PermissionError 拒绝，等一次后成功
+    assert load_progress(path).row_index == 2
+    assert [f.name for f in path.parent.iterdir()] == [path.name]
