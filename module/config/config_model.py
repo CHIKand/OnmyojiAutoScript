@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError, Field
 
 from module.config.utils import *
 from module.logger import logger
+from module.orchestra.model import Orchestra
 
 # 导入配置的Python文件
 from tasks.Component.config_base import ConfigBase, TimeDelta
@@ -154,6 +155,7 @@ class ConfigModel(ConfigBase):
     demon_retreat: DemonRetreat = Field(default_factory=DemonRetreat)
     guild_activity_monitor: GuildActivityMonitor = Field(default_factory=GuildActivityMonitor)
     budokai_tournament: BudokaiTournament = Field(default_factory=BudokaiTournament)
+    orchestra: Orchestra = Field(default_factory=Orchestra)
 
     def __init__(self, config_name: str=None) -> None:
         """
