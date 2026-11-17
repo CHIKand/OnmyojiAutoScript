@@ -44,6 +44,8 @@ class ConfigMenu:
         self.menu["Activity Task"] = ['ActivityShikigami', 'MetaDemon', 'FrogBoss', 'FloatParade', 'Quiz', 'KittyShop', 'DyeTrials', 'BudokaiTournament']
         # 开发工具
         self.menu["Tools"] = ['Image Rule', 'Ocr Rule', 'Click Rule', 'Long Click Rule', 'Swipe Rule', 'List Rule']
+        from module.config.config_menu_custom import custom_menu
+        self.menu = custom_menu(self.menu)
 
     @cached_property
     def gui_menu(self) -> str:
