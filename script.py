@@ -39,6 +39,7 @@ from module.logger import logger
 from module.exception import *
 from module.server.i18n import I18n
 from module.ocr.rpc import ensure_ocr_server_started
+from module.orchestra.runtime import orchestra_pick, orchestra_before_run, orchestra_after_run
 
 
 
@@ -326,7 +327,7 @@ class Script:
         :return:
         """
         while True:
-            task = self.config.get_next()
+            task = orchestra_pick(self)
             self.config.task = task
             if self.state_queue:
                 self.state_queue.put({"schedule": self.config.get_schedule_data()})
@@ -571,7 +572,8 @@ class Script:
             module_path = str(Path.cwd() / 'tasks' / command / (module_name+'.py'))
             logger.info(f'module_path: {module_path}, module_name: {module_name}')
             task_module = load_module(module_name, module_path)
-            task_module.ScriptTask(config=self.config, device=self.device).run()
+            self.running_task_obj = task_module.ScriptTask(config=self.config, device=self.device)
+            self.running_task_obj.run()
         except TaskEnd:
             return True
         except GameNotRunningError as e:
@@ -706,7 +708,9 @@ class Script:
             logger.hr(task, level=0)
             self.config.model.running_task = task
             _task_start = datetime.now()
+            orchestra_before_run(self, inflection.camelize(task))
             success = self.run(inflection.camelize(task))
+            orchestra_after_run(self, inflection.camelize(task), success)
             self.config.model.running_task = ''
             logger.info(f'Scheduler: End task `{task}`')
             self.is_first_task = False
