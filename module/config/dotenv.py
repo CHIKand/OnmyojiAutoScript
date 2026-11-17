@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 
@@ -7,6 +8,9 @@ def read_env(key: str, default: str | None = None, env_file: Path | None = None)
 
     env_file 缺省为 Path.cwd() / '.env'。文件按 UTF-8 读取（兼容 BOM），无法解码的
     字节以替换符代替而不抛异常，GBK 存的中文注释不影响 ASCII 键值的解析。
+    文件问题一律不抛异常：文件不存在按未设置处理；存在但读不了（无权限、被占用、是目录等，
+    即其余 OSError）时，向 'oas' 日志记一条 WARNING，同样按未设置处理，返回 default。
+    调用方无需自行捕获。
     逐行按 KEY=VALUE 解析：跳过空行和 # 开头的行，键和值两边去空格，再去掉成对的
     单引号或双引号；同名键以后出现的为准。仅用标准库，每次调用都重新读文件，不做缓存。
     """
@@ -17,6 +21,10 @@ def read_env(key: str, default: str | None = None, env_file: Path | None = None)
     try:
         text = path.read_text(encoding='utf-8-sig', errors='replace')
     except FileNotFoundError:
+        return default
+    except OSError as exc:
+        # 与 module.logger.logger 是同一个对象；这里不 import module.logger，保持只依赖标准库
+        logging.getLogger('oas').warning(f'读取 .env 失败（{path}）：{exc!r}，按未设置处理')
         return default
     result = default
     for line in text.splitlines():

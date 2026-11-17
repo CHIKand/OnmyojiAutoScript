@@ -1,3 +1,5 @@
+import logging
+
 from module.config.dotenv import read_env
 
 def test_missing_env_file_returns_default(tmp_path, monkeypatch):
@@ -28,3 +30,13 @@ def test_default_env_file_is_cwd(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / '.env').write_text('A=cwd\n', encoding='utf-8')
     assert read_env('A') == 'cwd'
+
+def test_unreadable_env_file_returns_default(tmp_path, monkeypatch, caplog):
+    monkeypatch.delenv('A', raising=False)
+    f = tmp_path / '.env'
+    f.mkdir()  # .env 是目录：读取必抛 OSError（Windows 上为 PermissionError）
+    assert read_env('A', 'd', env_file=f) == 'd'
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert 'Error' in warnings[0].getMessage()
+    assert str(f) in warnings[0].getMessage()
