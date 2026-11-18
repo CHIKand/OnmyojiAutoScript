@@ -4,10 +4,14 @@
 上层 ForkUpdater 负责读部署配置、渲染提示文案、接入真实的 assets.py 生成和导入自检；
 M3b 的素材页复用 commit_paths 和 push。只用标准库。
 
+合并之前先拉取 fork（origin 的部署分支）：fork 上有运行目录还没有的提交（开发克隆部署了新代码、服务还没重启）就不合并，
+返回 fork_ahead，两边各有对方没有的提交返回 diverged，免得在旧基点上做出推不上去的本地合并。
 合并先做成"待提交"状态（merge --no-commit --no-ff）：在工作区里按顺序处理素材冲突、重新生成 assets.py、
 跑调用方传入的自检，全部通过才提交并推送。代码冲突、自检不过、处理途中的任何异常，都会 merge --abort，
-分支和工作区回到合并之前，不留合并到一半的仓库。每次 git 调用都不等待输入（GIT_TERMINAL_PROMPT=0、
-GIT_EDITOR=true、GCM_INTERACTIVE=Never、stdin 接空设备），也从不加 --force。
+分支和工作区回到合并之前，不留合并到一半的仓库。唯一的例外是自检只因为上游新增的第三方依赖还没装而导入失败
+（needs_install）：照常提交推送，由用户重启服务时启动器装依赖。每次 git 调用都不等待输入（GIT_TERMINAL_PROMPT=0、
+GIT_EDITOR=true、GCM_INTERACTIVE=Never、stdin 接空设备），不弹控制台窗口（Windows 上加 CREATE_NO_WINDOW：
+服务由 pythonw 起，没有控制台），也从不加 --force。
 联网的命令（fetch、push、ls-remote）另有 NETWORK_TIMEOUT 秒的超时，超时就杀掉 git 并按该步骤失败处理，
 免得网络卡死时整个更新流程（以及等着它的服务接口和后台线程）一直挂着。
 上游没有新提交时，merge_upstream 还会把留在本地、没推到 fork 的提交补推上去（比如上次推送失败留下的合并提交），
@@ -16,6 +20,7 @@ GIT_EDITOR=true、GCM_INTERACTIVE=Never、stdin 接空设备），也从不加 -
 dirty，从不抛异常。
 """
 import os
+import re
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -23,10 +28,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 UPSTREAM_REMOTE = 'upstream'
+FORK_REMOTE = 'origin'
 ASSET_SUFFIXES = {'.png', '.jpg', '.jpeg', '.bmp', '.json'}
 NETWORK_TIMEOUT = 300       # 秒，联网命令的超时
 NETWORK_COMMANDS = frozenset({'fetch', 'push', 'ls-remote'})
 _REAP_TIMEOUT = 10          # 秒，杀掉进程后等它收尾的上限
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0   # 子进程的 creationflags：不弹控制台窗口
+_MISSING_MODULE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
 
 
 def _git_env() -> dict[str, str]:
@@ -41,7 +49,7 @@ def _kill_tree(process: subprocess.Popen) -> None:
     if os.name == 'nt' and process.poll() is None:      # 已经退出的进程，PID 可能已被别的进程占用，不能按 PID 去杀
         try:
             subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], capture_output=True,
-                           stdin=subprocess.DEVNULL, timeout=_REAP_TIMEOUT)
+                           stdin=subprocess.DEVNULL, timeout=_REAP_TIMEOUT, creationflags=NO_WINDOW)
         except (OSError, subprocess.SubprocessError):
             pass
     process.kill()
@@ -81,7 +89,7 @@ class GitRunner:
         if args[:1] and args[0] in NETWORK_COMMANDS:
             return self._run_with_timeout(command, check)
         return subprocess.run(command, cwd=self.repo, capture_output=True, encoding='utf-8', errors='replace',
-                              stdin=subprocess.DEVNULL, check=check, env=self._env())
+                              stdin=subprocess.DEVNULL, check=check, env=self._env(), creationflags=NO_WINDOW)
 
     def _run_with_timeout(self, command: list[str], check: bool) -> subprocess.CompletedProcess:
         """输出写临时文件而不是管道：git-remote-https 这类帮手进程会继承管道，卡住时即使杀了 git，
@@ -90,7 +98,7 @@ class GitRunner:
         with tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as out, \
                 tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as err:
             process = subprocess.Popen(command, cwd=self.repo, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                       env=self._env())
+                                       env=self._env(), creationflags=NO_WINDOW)
             try:
                 process.wait(timeout=NETWORK_TIMEOUT)
             except BaseException:       # 超时，或者被 Ctrl+C 打断
@@ -108,16 +116,24 @@ class GitRunner:
 class MergeResult:
     """merge_upstream 的结果。
 
-    status：up_to_date / merged / pushed / conflict_aborted / push_failed / fetch_failed / dirty / smoke_failed。
-    merged 是并入了上游的新提交并且推送成功；pushed 是上游没有新提交，只是把之前没推上去的本地提交补推成功了；
+    status：up_to_date / merged / needs_install / pushed / conflict_aborted / push_failed / fetch_failed / dirty /
+    smoke_failed / fork_ahead / diverged。
+    merged 是并入了上游的新提交并且推送成功；needs_install 也一样提交推送了，只是自检因为上游新增的第三方依赖还没装
+    而导入失败（缺的模块名在 missing_module）；pushed 是上游没有新提交，只是把之前没推上去的本地提交补推成功了；
+    fork_ahead 是 fork 上有 HEAD 没有的提交、HEAD 没有 fork 之外的提交（等启动器对齐，不合并）；diverged 是两边各有
+    对方没有的提交（不合并也不推送，要人处理）；fetch_failed 是拉取 fork 或上游失败（fetch_remote 说是哪个）；
     dirty 是已跟踪文件有未提交的改动，或者上次留下的合并没清理成（上游改动范围之外的文件被改过，或者放弃不了；
     message 里写明合并和有改动的文件）。
-    commits：merged 和紧跟在合并之后推送失败的 push_failed 里，是已并入 HEAD 的上游提交数；pushed 和补推失败的
-    push_failed 里，是 HEAD 领先 origin/<分支> 的本地提交数（origin/<分支> 不存在时记 0）；其余状态为 0。
+    commits：merged、needs_install 和紧跟在合并之后推送失败的 push_failed 里，是已并入 HEAD 的上游提交数；pushed 和
+    补推失败的 push_failed 里，是 HEAD 领先 origin/<分支> 的本地提交数（origin/<分支> 不存在时记 0）；fork_ahead 里
+    是 fork 多出的提交数；其余状态为 0。
     resolved 是素材冲突里取了上游版本的路径，conflicts 是让合并中止的代码冲突路径。
-    message 是 git 或自检给出的原文，可能为空，面向用户的固定文案由上层生成。
-    requirements_changed 表示 requirements.txt 有了变化：merged 比的是合并前的 HEAD；pushed 比的是推送前的
-    origin/<分支>，该引用不存在时记 False。
+    message 是 git 或自检给出的原文，可能为空，面向用户的文案由上层生成。
+    requirements_changed 表示 requirements.txt 有了变化，server_code_changed 表示服务进程启动时就加载的代码有了变化
+    （见 is_server_code_path）：merged、needs_install 和合并之后推送失败的 push_failed 比的是合并前的 HEAD；
+    pushed 和补推失败的 push_failed 比的是推送前的 origin/<分支>，该引用不存在时都记 False。
+    merged_locally 表示这次调用造出了合并提交（merged、needs_install，以及它们推送失败变成的 push_failed）：
+    磁盘上的代码变了，与"补推失败、这次什么都没合并"的 push_failed 区分开。
     """
     status: str
     commits: int
@@ -125,6 +141,10 @@ class MergeResult:
     conflicts: list[str]
     message: str
     requirements_changed: bool = False
+    merged_locally: bool = False
+    server_code_changed: bool = False
+    missing_module: str = ''
+    fetch_remote: str = ''          # fetch_failed 时拉取失败的远端：origin（fork）或 upstream（上游）
 
 
 def ensure_remote(r: GitRunner, name: str, url: str) -> None:
@@ -155,6 +175,14 @@ def is_asset_path(path: str) -> bool:
     return pure.name == 'assets.py' or pure.suffix.lower() in ASSET_SUFFIXES
 
 
+def is_server_code_path(path: str) -> bool:
+    """服务进程启动时就加载、改了要重启服务才完整生效的文件：server.py、module/ 和 deploy/ 下的一切，
+    以及 tasks/ 下（任意深度）的 config*.py（配置模型从它们组装）。"""
+    if path == 'server.py' or path.startswith(('module/', 'deploy/')):
+        return True
+    return path.startswith('tasks/') and PurePosixPath(path).match('config*.py')
+
+
 def commit_paths(r: GitRunner, paths: list[str], message: str) -> str | None:
     """只提交给定的路径（含删除），返回新提交的 sha；这些路径没有变化时返回 None。
     索引里别处已暂存的内容不会被带进这次提交。"""
@@ -183,63 +211,116 @@ def merge_upstream(r: GitRunner, upstream: str, upstream_branch: str, push_branc
                    verify: Callable[[Path], tuple[bool, str]] | None = None) -> MergeResult:
     """把上游的 upstream_branch 合并进当前分支并推送到 origin 的 push_branch。
 
+    顺序：清理上次留下的合并 → 查已跟踪文件的改动 → 拉取 fork 并比较 → 拉取上游 → 合并或补推。
+    合并之前先 fetch origin <push_branch>（NETWORK_TIMEOUT 内）：失败返回 fetch_failed（fetch_remote 为 origin，
+    仓库没动过）。fork 上有 HEAD 没有的提交时不合并：HEAD 没有 fork 之外的提交是 fork_ahead（commits 是 fork 多出的
+    提交数，等用户重启服务、启动器把运行目录对齐到 fork），两边各有对方没有的提交是 diverged（不合并也不推送）。
     素材冲突取上游版本，之后对受影响的任务目录调用 regenerate(任务目录)：普通任务是 tasks/ 下的目录名，
     组件是 Component/<组件>，各取各的 assets.py。有代码冲突就整体中止。
     verify 在提交之前收到仓库路径，返回 (是否通过, 原因)，None 表示不做自检。自检不通过，或者 verify、regenerate
-    抛异常，或者处理合并结果时 git 命令失败，都 merge --abort 并返回 smoke_failed，message 里是原因。
+    抛异常，或者处理合并结果时 git 命令失败，都 merge --abort 并返回 smoke_failed，message 里是原因。例外：
+    原因里有 ModuleNotFoundError: No module named 'X'、X 不是仓库自己的包或模块、这次合并又改了 requirements.txt，
+    就当作上游新增了第三方依赖，照常提交推送，返回 needs_install（missing_module 为 X）。
     fetch 或 push 超过 NETWORK_TIMEOUT 秒没完成：fetch 返回 fetch_failed（仓库没动过），
     push 返回 push_failed（本地合并保留），message 都是 "git <命令> timed out after <秒数>s"。
-    上游没有新提交时看 origin/<push_branch>：HEAD 领先它（或者它不存在）就补推，成功返回 pushed，失败返回
-    push_failed，所以合并成功、推送失败之后再调用一次就能把本地合并推上去；不领先返回 up_to_date，不联网推送。
+    上游没有新提交时看刚拉取的 origin/<push_branch>：HEAD 领先它（或者它不存在）就补推，成功返回 pushed，失败返回
+    push_failed，所以合并成功、推送失败之后再调用一次就能把本地合并推上去；不领先返回 up_to_date，不推送。
     开头清理上次留下的合并，只动上游那一侧改动的文件，别的文件有改动就返回 dirty，见 _abort_leftover_merge。
 
-    不可重入：开头会放弃仓库里已有的合并，同一个仓库同时有两次调用时，后一次会把前一次进行中的合并放弃掉，
-    调用方要自己保证同一时刻只有一次。
+    不可重入，调用方要保证同一个仓库同一时刻只有一次调用（ForkUpdater 用 MERGE_LOCK）：开头把仓库里已有的合并
+    当作上次被杀留下的残留来处理，同时进行的另一次调用的合并也会被当成残留——只在上游改动的文件上被放弃掉，
+    别的文件有改动时本次返回 dirty。
     """
     stuck = _abort_leftover_merge(r)                      # 上次合并途中进程被杀留下的状态
     if stuck:
         return MergeResult('dirty', 0, [], [], stuck)
-    dirty = r.run('status', '--porcelain', '--untracked-files=no').stdout.rstrip()
-    if dirty:                                             # 运行目录里总有未跟踪的文件，只看已跟踪文件的改动
+    # 运行目录里总有未跟踪的文件，只看已跟踪文件的改动；core.quotepath=off 让中文路径在说明里照原样显示
+    dirty = r.run('-c', 'core.quotepath=off', 'status', '--porcelain', '--untracked-files=no').stdout.rstrip()
+    if dirty:
         return MergeResult('dirty', 0, [], [], dirty)
+    failed = _fetch(r, FORK_REMOTE, push_branch)
+    if failed:
+        return failed
+    fork = _fork_state(r, push_branch)
+    if fork:
+        return fork
     ensure_remote(r, UPSTREAM_REMOTE, upstream)
-    try:
-        fetched = r.run('fetch', UPSTREAM_REMOTE, upstream_branch, check=False)
-    except subprocess.TimeoutExpired:
-        return MergeResult('fetch_failed', 0, [], [], _timed_out('fetch'))
-    if fetched.returncode != 0:
-        return MergeResult('fetch_failed', 0, [], [], fetched.stderr.strip())
+    failed = _fetch(r, UPSTREAM_REMOTE, upstream_branch)
+    if failed:
+        return failed
     ref = f'{UPSTREAM_REMOTE}/{upstream_branch}'
     behind = count_behind(r, ref)
     if behind == 0:
         return _push_unpushed_commits(r, push_branch)
     result = _merge_and_commit(r, ref, upstream_branch, behind, regenerate, verify)
-    if result.status != 'merged':
+    if not result.merged_locally:
         return result
     ok, error = push(r, push_branch)
     return result if ok else replace(result, status='push_failed', message=error)
 
 
+def _fetch(r: GitRunner, remote: str, branch: str) -> MergeResult | None:
+    """git fetch <remote> <branch>（顺带更新 <remote>/<branch>）。成功返回 None，失败或超时返回 fetch_failed。"""
+    try:
+        fetched = r.run('fetch', remote, branch, check=False)
+    except subprocess.TimeoutExpired:
+        return MergeResult('fetch_failed', 0, [], [], _timed_out('fetch'), fetch_remote=remote)
+    if fetched.returncode != 0:
+        return MergeResult('fetch_failed', 0, [], [], fetched.stderr.strip(), fetch_remote=remote)
+    return None
+
+
+def _ref_exists(r: GitRunner, ref: str) -> bool:
+    return r.run('rev-parse', '-q', '--verify', ref, check=False).returncode == 0
+
+
+def _count(r: GitRunner, revisions: str) -> int:
+    """rev-list --count 的结果，比如 _count(r, 'A..B') 是 B 有、A 没有的提交数。"""
+    return int(r.run('rev-list', '--count', revisions).stdout.strip())
+
+
+def _fork_state(r: GitRunner, push_branch: str) -> MergeResult | None:
+    """刚拉取的 fork（origin/<push_branch>）有 HEAD 没有的提交时返回 fork_ahead 或 diverged，否则返回 None。
+
+    fork 领先、HEAD 没有 fork 之外的提交（HEAD 是 origin/<push_branch> 的祖先）：fork_ahead，commits 是 fork 多出的
+    提交数。这时合并会落在旧基点上、推送必然被拒；启动器守卫看不到只在本地的提交，用户重启服务就能对齐到 fork。
+    两边各有对方没有的提交：diverged，要人把 fork 的分支合并进来再推送。
+    origin/<push_branch> 不存在（远端的取回规则不覆盖这个分支，拉取只写了 FETCH_HEAD）时比不了，返回 None。
+    """
+    tracked = f'{FORK_REMOTE}/{push_branch}'
+    if not _ref_exists(r, tracked):
+        return None
+    fork_only = _count(r, f'HEAD..{tracked}')
+    if fork_only == 0:
+        return None
+    local_only = _count(r, f'{tracked}..HEAD')
+    if local_only == 0:
+        return MergeResult('fork_ahead', fork_only, [], [], f'{tracked} has {fork_only} commit(s) that HEAD does not')
+    return MergeResult('diverged', 0, [], [], f'HEAD and {tracked} have diverged: {local_only} commit(s) only here, '
+                                              f'{fork_only} only on the fork')
+
+
 def _push_unpushed_commits(r: GitRunner, push_branch: str) -> MergeResult:
     """上游没有新提交时的收尾：把还没推到 fork 的本地提交推上去，比如上次合并成功、推送失败，合并提交一直留在本地。
 
-    HEAD 领先 origin/<push_branch>，或者这个引用不存在（本地没取过）就推送：成功是 pushed，失败是 push_failed
-    （commits 都是领先的提交数），不领先是 up_to_date，这时不碰网络。引用不存在时数不出提交、也比不了
-    requirements.txt，commits 记 0、requirements_changed 记 False。
-    领先数和 requirements.txt 的比较都要在推送之前做：推送成功后 git 会把 origin/<push_branch> 挪到 HEAD，
-    之后什么差别都比不出来。
+    调用前刚拉取过 fork，并且 fork 不领先 HEAD（_fork_state）。HEAD 领先 origin/<push_branch>，或者这个引用不存在
+    就推送：成功是 pushed，失败是 push_failed（commits 都是领先的提交数），不领先是 up_to_date，这时不推送。
+    引用不存在时数不出提交、也比不了文件，commits 记 0、requirements_changed 和 server_code_changed 记 False。
+    领先数和文件的比较都要在推送之前做：推送成功后 git 会把 origin/<push_branch> 挪到 HEAD，之后什么差别都比不出来。
+    列不出有差别的文件时两个标志都记 False：它们只影响提示，不挡着推送。
     """
-    tracked = f'origin/{push_branch}'
-    known = r.run('rev-parse', '-q', '--verify', tracked, check=False).returncode == 0
-    ahead = int(r.run('rev-list', '--count', f'{tracked}..HEAD').stdout.strip()) if known else 0
+    tracked = f'{FORK_REMOTE}/{push_branch}'
+    known = _ref_exists(r, tracked)
+    ahead = _count(r, f'{tracked}..HEAD') if known else 0
     if known and ahead == 0:
         return MergeResult('up_to_date', 0, [], [], '')
-    requirements_changed = known and r.run('diff', '--quiet', tracked, 'HEAD', '--', 'requirements.txt',
-                                           check=False).returncode == 1
+    changed = (_changed_paths(r, tracked, 'HEAD') or []) if known else []
+    flags = {'requirements_changed': 'requirements.txt' in changed,
+             'server_code_changed': any(is_server_code_path(path) for path in changed)}
     ok, error = push(r, push_branch)
     if not ok:
-        return MergeResult('push_failed', ahead, [], [], error, requirements_changed)
-    return MergeResult('pushed', ahead, [], [], '', requirements_changed)
+        return MergeResult('push_failed', ahead, [], [], error, **flags)
+    return MergeResult('pushed', ahead, [], [], '', **flags)
 
 
 def _abort_merge(r: GitRunner, *, stage_edits: bool = False) -> None:
@@ -325,7 +406,9 @@ def _one_line(text: str) -> str:
 
 def _merge_and_commit(r: GitRunner, ref: str, branch: str, behind: int, regenerate: Callable[[str], None],
                       verify: Callable[[Path], tuple[bool, str]] | None) -> MergeResult:
-    """合并、处理素材冲突、自检、提交，返回 merged、conflict_aborted 或 smoke_failed；除 merged 外都已 abort。"""
+    """合并、处理素材冲突、自检、提交，返回 merged、needs_install、conflict_aborted 或 smoke_failed。
+    前两种已经提交（merged_locally 为真），其余都已 abort。requirements.txt 和服务端代码有没有变化在自检之前就比好：
+    自检失败时要靠前者判断是不是上游新增了依赖。"""
     merge = r.run('merge', '--no-commit', '--no-ff', ref, check=False)
     try:
         unmerged = _unmerged_paths(r)
@@ -336,16 +419,36 @@ def _merge_and_commit(r: GitRunner, ref: str, branch: str, behind: int, regenera
             return MergeResult('conflict_aborted', 0, [], code, merge.stderr.strip())
         resolved = _take_upstream(r, unmerged)
         _regenerate(r, resolved, regenerate)
-        requirements_changed = r.run('diff', '--cached', '--quiet', 'HEAD', '--', 'requirements.txt',
-                                     check=False).returncode == 1
+        changed = _changed_paths(r, '--cached', 'HEAD')          # 这次合并相对合并前的 HEAD 改了哪些文件
+        if changed is None:
+            raise RuntimeError('git diff could not list the files the merge changes')
+        requirements_changed = 'requirements.txt' in changed
+        server_code_changed = any(is_server_code_path(path) for path in changed)
         ok, error = verify(r.repo) if verify else (True, '')
-        if ok:
+        missing = '' if ok or not requirements_changed else _missing_dependency(r.repo, error)
+        if ok or missing:
             r.run('commit', '--no-edit', '-m', f'合并上游 {branch} 分支（{behind} 个提交）')
-            return MergeResult('merged', behind, resolved, [], '', requirements_changed)
+            return MergeResult('merged' if ok else 'needs_install', behind, resolved, [], error, requirements_changed,
+                               merged_locally=True, server_code_changed=server_code_changed, missing_module=missing)
     except Exception as exc:
         error = _describe(exc)
     _abort_merge(r, stage_edits=True)
     return MergeResult('smoke_failed', 0, [], [], error)
+
+
+def _missing_dependency(repo: Path, reason: str) -> str:
+    """自检失败的原因如果是缺了第三方模块，返回模块名，否则返回空串。
+
+    看原因里最后一处 ModuleNotFoundError: No module named 'X'：X 的顶层名是仓库根目录下的目录或 .py 文件时，缺的是
+    仓库自己的东西（上游改名、删文件），装依赖解决不了，返回空串，合并照常中止。"""
+    found = _MISSING_MODULE.findall(reason)
+    if not found:
+        return ''
+    name = found[-1]
+    top = name.split('.')[0]
+    if not top or (repo / top).is_dir() or (repo / f'{top}.py').is_file():
+        return ''
+    return name
 
 
 def _unmerged_paths(r: GitRunner) -> dict[str, set[str]]:
