@@ -1,27 +1,31 @@
 """后台任务线程与每日定时合并（module.server.custom_jobs）的测试。
 
 每个用例都先 chdir 到 tmp_path：状态文件 log/custom_jobs/state.json 和 .env 都落在那里，不碰仓库自己的 config/、log/ 和 .env。
-fork_updater.run_update 一律换成假的（自动夹具 fake_update），没有哪个用例会真去合并，也不联网。
+fork_updater.run_update_result 一律换成假的（自动夹具 fake_update），没有哪个用例会真去合并，也不联网；只有核对"文案只记一次"
+的用例换回真的，它下面的 ForkUpdater 和实例重启仍是假的。
 事件循环是真的，跑在辅助线程里；时钟是假的，用 tick() 一轮一轮驱动，不靠睡眠。起真线程的用例只做有限时长的等待。
 本文件不导入 module.server.app，也不导入 main_manager（它一导入就扫 config/、起线程）；app.py 的接线用 ast 静态核对。
 """
 import ast
 import asyncio
 import gc
+import json
 import threading
 import time
 import warnings
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from module.server import custom_jobs, custom_routes, fork_updater
-from module.server.custom_jobs import CustomJobs, merge_due, register_job, start_custom_jobs
+from module.server.custom_jobs import CustomJobs, MergeState, merge_due, register_job, start_custom_jobs
+from module.server.fork_git import MergeResult
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MERGE_TIME_KEY = 'OAS_UPSTREAM_MERGE_TIME'
 UP_TO_DATE = '已是最新，无需合并'
+REAL_RUN_UPDATE_RESULT = fork_updater.run_update_result      # 自动夹具换掉它之前先留一份
 
 
 # ---- merge_due：计划给的四个用例，原样 -------------------------------------------------------------------------
@@ -88,20 +92,30 @@ def state_file() -> Path:
 
 
 def test_the_state_round_trips_through_a_file_in_a_subdirectory():
-    custom_jobs._save_last_run(date(2026, 11, 17))
+    state = MergeState(date(2026, 11, 17), 2, datetime(2026, 11, 18, 4, 40, 5))
+    custom_jobs._save_state(state)
     assert state_file().is_file()                                    # 子目录：上游的 14 天清理够不着
-    assert custom_jobs._load_last_run() == date(2026, 11, 17)
+    assert custom_jobs._load_state() == state
     assert list(state_file().parent.iterdir()) == [state_file()]     # atomic_write 的临时文件不留
+    custom_jobs._save_state(MergeState())                            # 没有日期、没试过也存得下
+    assert custom_jobs._load_state() == MergeState()
 
 
-def test_a_later_save_replaces_the_date():
-    custom_jobs._save_last_run(date(2026, 11, 17))
-    custom_jobs._save_last_run(date(2026, 11, 18))
-    assert custom_jobs._load_last_run() == date(2026, 11, 18)
+def test_a_later_save_replaces_the_state():
+    custom_jobs._save_state(MergeState(date(2026, 11, 17)))
+    custom_jobs._save_state(MergeState(date(2026, 11, 18), 1, datetime(2026, 11, 18, 4, 30)))
+    assert custom_jobs._load_state() == MergeState(date(2026, 11, 18), 1, datetime(2026, 11, 18, 4, 30))
+
+
+def test_a_state_file_written_before_the_retry_counter_still_loads(log):
+    state_file().parent.mkdir(parents=True)
+    state_file().write_text('{"upstream_merge_last_run": "2026-11-17"}', encoding='utf-8')     # 只记日期的旧格式
+    assert custom_jobs._load_state() == MergeState(date(2026, 11, 17))
+    assert log.records == []
 
 
 def test_a_missing_state_file_means_never_ran_and_is_not_logged(log):
-    assert custom_jobs._load_last_run() is None
+    assert custom_jobs._load_state() == MergeState()
     assert log.records == []                                         # 首次运行的常态
 
 
@@ -109,17 +123,22 @@ def test_a_missing_state_file_means_never_ran_and_is_not_logged(log):
     b'', b'{', b'\xff\xfe\x00garbage', b'[]', b'"2026-11-17"', b'null', b'{}',
     b'{"upstream_merge_last_run": 20261117}', b'{"upstream_merge_last_run": "yesterday"}',
     b'{"upstream_merge_last_run": "2026-13-45"}',
+    b'{"upstream_merge_last_run": null, "upstream_merge_attempts": "2"}',
+    b'{"upstream_merge_last_run": null, "upstream_merge_attempts": -1}',
+    b'{"upstream_merge_last_run": null, "upstream_merge_attempts": true}',
+    b'{"upstream_merge_last_run": null, "upstream_merge_last_attempt": "soon"}',
+    b'{"upstream_merge_last_run": null, "upstream_merge_last_attempt": 5}',
 ])
 def test_a_corrupt_state_file_means_never_ran(content, log):
     state_file().parent.mkdir(parents=True)
     state_file().write_bytes(content)
-    assert custom_jobs._load_last_run() is None
+    assert custom_jobs._load_state() == MergeState()
     assert log.levels == ['warning']
 
 
 def test_an_unreadable_state_file_means_never_ran(log):
     state_file().mkdir(parents=True)                                 # 路径是个目录：读它抛 OSError
-    assert custom_jobs._load_last_run() is None
+    assert custom_jobs._load_state() == MergeState()
     assert log.levels == ['warning']
 
 
@@ -158,17 +177,20 @@ class LogSpy:
 
 
 class FakeUpdate:
-    """换掉 fork_updater.run_update：记下被调用的次数和跑在哪个事件循环上。error 非空就抛它，delay 大于 0 就先等一会儿。"""
+    """换掉 fork_updater.run_update_result：记下被调用的次数和跑在哪个事件循环上，返回 (合并结果, 文案)。
+    statuses 依次给出每次调用的结果状态（用完了就一直是最后一个；状态写 None 表示没有合并结果）；
+    error 非空就抛它，delay 大于 0 就先等一会儿。"""
 
     def __init__(self):
         self.message = UP_TO_DATE
+        self.statuses: list[str | None] = ['up_to_date']
         self.error: Exception | None = None
         self.delay = 0.0
         self.calls = 0
         self.loops: list[asyncio.AbstractEventLoop] = []
         self.finished = threading.Event()
 
-    async def __call__(self) -> str:
+    async def __call__(self) -> tuple[MergeResult | None, str]:
         self.calls += 1
         self.loops.append(asyncio.get_running_loop())
         try:
@@ -176,7 +198,8 @@ class FakeUpdate:
                 await asyncio.sleep(self.delay)
             if self.error is not None:
                 raise self.error
-            return self.message
+            status = self.statuses[min(self.calls, len(self.statuses)) - 1]
+            return (None if status is None else MergeResult(status, 0, [], [], '')), self.message
         finally:
             self.finished.set()
 
@@ -226,7 +249,7 @@ def log(monkeypatch) -> LogSpy:
 @pytest.fixture(autouse=True)
 def fake_update(monkeypatch) -> FakeUpdate:
     fake = FakeUpdate()
-    monkeypatch.setattr(fork_updater, 'run_update', fake)
+    monkeypatch.setattr(fork_updater, 'run_update_result', fake)
     return fake
 
 
@@ -274,8 +297,8 @@ def test_the_daily_merge_runs_once_on_the_server_loop_and_is_remembered(new_jobs
     jobs.tick(loop)
     assert fake_update.calls == 1
     assert fake_update.loops == [loop]                               # 在服务的事件循环上跑，与更新页按钮同一条路径
-    assert custom_jobs._load_last_run() == date(2026, 11, 17)
-    assert log.mentions(UP_TO_DATE)                                  # run_update 返回的文案进日志
+    assert custom_jobs._load_state().last_run == date(2026, 11, 17)
+    assert log.mentions(UP_TO_DATE)                                  # run_update_result 返回的文案进日志
     jobs.tick(loop)
     clock.now = datetime(2026, 11, 17, 23, 0)
     jobs.tick(loop)
@@ -283,7 +306,7 @@ def test_the_daily_merge_runs_once_on_the_server_loop_and_is_remembered(new_jobs
     clock.now = datetime(2026, 11, 18, 4, 30)
     jobs.tick(loop)
     assert fake_update.calls == 2                                    # 第二天再跑一次
-    assert custom_jobs._load_last_run() == date(2026, 11, 18)
+    assert custom_jobs._load_state().last_run == date(2026, 11, 18)
 
 
 def test_nothing_runs_before_the_time(new_jobs, clock, loop, monkeypatch, fake_update):
@@ -310,7 +333,7 @@ def test_an_empty_value_means_off_without_a_log(new_jobs, loop, monkeypatch, fak
 
 def test_a_missed_minute_is_caught_up_once_later_the_same_day(new_jobs, clock, loop, monkeypatch, fake_update):
     monkeypatch.setenv(MERGE_TIME_KEY, '04:30')
-    custom_jobs._save_last_run(date(2026, 11, 16))                   # 昨天跑过
+    custom_jobs._save_state(MergeState(date(2026, 11, 16)))          # 昨天跑过
     clock.now = datetime(2026, 11, 17, 9, 0)                         # 4:30 电脑在休眠，现在才醒
     jobs = new_jobs()
     jobs.tick(loop)
@@ -357,7 +380,7 @@ def test_an_invalid_time_is_off_and_logged_once_per_distinct_value(new_jobs, loo
     assert fake_update.calls == 1
 
 
-# ---- 每日定时合并：无论结果如何，一天只试一次 -------------------------------------------------------------------
+# ---- 每日定时合并：除了拉取失败，无论结果如何，一天只试一次 ------------------------------------------------------
 
 def test_a_failing_attempt_still_counts_and_never_raises(new_jobs, loop, monkeypatch, fake_update, log):
     monkeypatch.setenv(MERGE_TIME_KEY, '04:30')
@@ -366,7 +389,7 @@ def test_a_failing_attempt_still_counts_and_never_raises(new_jobs, loop, monkeyp
     jobs.tick(loop)
     jobs.tick(loop)
     assert fake_update.calls == 1
-    assert custom_jobs._load_last_run() == date(2026, 11, 17)
+    assert custom_jobs._load_state().last_run == date(2026, 11, 17)
     assert 'exception' in log.levels                                 # 带调用栈记下
 
 
@@ -392,7 +415,7 @@ def test_a_closed_loop_still_counts_and_leaves_no_orphan_coroutine(new_jobs, mon
         gc.collect()
     assert not [w for w in caught if 'never awaited' in str(w.message)]
     assert fake_update.calls == 0
-    assert custom_jobs._load_last_run() == date(2026, 11, 17)
+    assert custom_jobs._load_state().last_run == date(2026, 11, 17)
     assert 'exception' in log.levels
 
 
@@ -403,7 +426,7 @@ def test_a_merge_that_takes_too_long_is_given_up_on_but_still_counts(new_jobs, l
     jobs = new_jobs()
     jobs.tick(loop)                                                  # 等了 0.05 秒就放弃，不抛
     assert log.levels.count('error') == 1
-    assert custom_jobs._load_last_run() == date(2026, 11, 17)
+    assert custom_jobs._load_state().last_run == date(2026, 11, 17)
     assert fake_update.finished.wait(5)                              # 合并本身还在循环上继续，让它做完再收场
     jobs.tick(loop)
     assert fake_update.calls == 1
@@ -412,15 +435,142 @@ def test_a_merge_that_takes_too_long_is_given_up_on_but_still_counts(new_jobs, l
 def test_a_failed_state_write_does_not_cause_repeated_merges(new_jobs, loop, monkeypatch, fake_update, log):
     monkeypatch.setenv(MERGE_TIME_KEY, '04:30')
 
-    def broken(day):
+    def broken(state):
         raise PermissionError('state.json is locked')
 
-    monkeypatch.setattr(custom_jobs, '_save_last_run', broken)
+    monkeypatch.setattr(custom_jobs, '_save_state', broken)
     jobs = new_jobs()
     for _ in range(3):
         jobs.tick(loop)
     assert fake_update.calls == 1                                    # 内存里记着，不会每分钟合并一次
     assert len(log.messages('warning')) == 1
+
+
+@pytest.mark.parametrize('status', ['merged', 'pushed', 'up_to_date', 'push_failed', 'needs_install',
+                                    'conflict_aborted', 'dirty', 'smoke_failed', 'fork_ahead', 'diverged', 'error',
+                                    None])
+def test_every_outcome_but_a_fetch_failure_uses_up_the_day(new_jobs, clock, loop, monkeypatch, fake_update, status):
+    monkeypatch.setenv(MERGE_TIME_KEY, '04:30')
+    fake_update.statuses = [status]                                  # None：合并没给出结果（比如读不了部署配置）
+    jobs = new_jobs()
+    jobs.tick(loop)
+    clock.now = datetime(2026, 11, 17, 6, 0)
+    jobs.tick(loop)
+    assert fake_update.calls == 1
+    assert custom_jobs._load_state() == MergeState(date(2026, 11, 17), 1, datetime(2026, 11, 17, 4, 31))
+
+
+# ---- 每日定时合并：拉取失败不占用当天，10 分钟后重试，一天最多 6 次 -----------------------------------------------
+
+NOW = datetime(2026, 11, 17, 5, 0)
+
+
+@pytest.mark.parametrize('state, expected', [
+    (MergeState(), 1),                                                         # 从没试过
+    (MergeState(date(2026, 11, 16), 3, datetime(2026, 11, 16, 23, 50)), 1),    # 昨天的次数不算
+    (MergeState(None, 1, NOW - timedelta(minutes=9, seconds=59)), 0),          # 不到 10 分钟
+    (MergeState(None, 1, NOW - timedelta(minutes=10)), 2),
+    (MergeState(None, 5, NOW - timedelta(hours=1)), 6),
+    (MergeState(None, 6, NOW - timedelta(hours=1)), 0),                        # 今天试满了（状态文件不一致时的兜底）
+    (MergeState(None, 2, NOW + timedelta(minutes=30)), 3),                     # 时钟往回拨过：不卡着等
+])
+def test_attempt_number(state, expected):
+    assert custom_jobs.attempt_number(NOW, state) == expected
+
+
+def test_a_fetch_failure_does_not_use_up_the_day_and_is_retried_ten_minutes_later(new_jobs, clock, loop, monkeypatch,
+                                                                                  fake_update, log):
+    monkeypatch.setenv(MERGE_TIME_KEY, '04:30')
+    custom_jobs._save_state(MergeState(date(2026, 11, 16)))          # 昨天合并过
+    fake_update.statuses = ['fetch_failed', 'up_to_date']
+    fake_update.message = '拉取上游失败，未改动任何文件：fatal: unable to access x'
+    jobs = new_jobs()
+    jobs.tick(loop)                                                  # 04:31，电脑刚醒，网络还没通
+    assert fake_update.calls == 1
+    assert custom_jobs._load_state() == MergeState(date(2026, 11, 16), 1, datetime(2026, 11, 17, 4, 31))
+    assert log.mentions('10 分钟后重试')
+    clock.now = datetime(2026, 11, 17, 4, 40)
+    jobs.tick(loop)
+    assert fake_update.calls == 1                                    # 不到 10 分钟不重试
+    clock.now = datetime(2026, 11, 17, 4, 41)
+    jobs.tick(loop)
+    assert fake_update.calls == 2                                    # 这次拉取成功：今天用掉了
+    assert custom_jobs._load_state() == MergeState(date(2026, 11, 17), 2, datetime(2026, 11, 17, 4, 41))
+    clock.now = datetime(2026, 11, 17, 5, 30)
+    jobs.tick(loop)
+    assert fake_update.calls == 2
+
+
+def test_fetch_failures_stop_after_six_attempts_a_day(new_jobs, clock, loop, monkeypatch, fake_update, log):
+    monkeypatch.setenv(MERGE_TIME_KEY, '04:30')
+    fake_update.statuses = ['fetch_failed']
+    jobs = new_jobs()
+    start = clock.now
+    for minutes in range(0, 180, 5):                                 # 每 5 分钟检查一次，查 3 个小时
+        clock.now = start + timedelta(minutes=minutes)
+        jobs.tick(loop)
+    assert fake_update.calls == 6                                    # 04:31、04:41……05:21
+    assert custom_jobs._load_state() == MergeState(date(2026, 11, 17), 6, datetime(2026, 11, 17, 5, 21))
+    assert log.mentions('明天')                                      # 第 6 次也失败：说清今天到此为止
+    clock.now = datetime(2026, 11, 18, 4, 30)
+    jobs.tick(loop)
+    assert fake_update.calls == 7                                    # 第二天从头算
+
+
+def test_the_retry_wait_and_count_survive_a_server_restart(new_jobs, clock, loop, monkeypatch, fake_update):
+    monkeypatch.setenv(MERGE_TIME_KEY, '04:30')
+    fake_update.statuses = ['fetch_failed']
+    new_jobs().tick(loop)                                            # 04:31 第 1 次，拉取失败
+    clock.now = datetime(2026, 11, 17, 4, 35)
+    new_jobs().tick(loop)                                            # 服务重启了：状态文件记得 4 分钟前刚试过
+    assert fake_update.calls == 1
+    custom_jobs._save_state(MergeState(None, 5, datetime(2026, 11, 17, 4, 31)))    # 今天已经失败了 5 次
+    clock.now = datetime(2026, 11, 17, 4, 45)
+    jobs = new_jobs()
+    jobs.tick(loop)
+    assert fake_update.calls == 2                                    # 第 6 次，也是今天最后一次
+    assert custom_jobs._load_state() == MergeState(date(2026, 11, 17), 6, datetime(2026, 11, 17, 4, 45))
+    clock.now = datetime(2026, 11, 17, 5, 0)
+    jobs.tick(loop)
+    assert fake_update.calls == 2
+
+
+def test_yesterdays_failed_attempts_do_not_count_today(new_jobs, clock, loop, monkeypatch, fake_update):
+    monkeypatch.setenv(MERGE_TIME_KEY, '04:30')
+    custom_jobs._save_state(MergeState(date(2026, 11, 15), 4, datetime(2026, 11, 16, 23, 50)))
+    fake_update.statuses = ['fetch_failed']
+    new_jobs().tick(loop)
+    assert fake_update.calls == 1
+    assert custom_jobs._load_state() == MergeState(date(2026, 11, 15), 1, datetime(2026, 11, 17, 4, 31))
+
+
+def test_the_state_file_records_the_attempts_next_to_the_date(new_jobs, loop, monkeypatch, fake_update):
+    monkeypatch.setenv(MERGE_TIME_KEY, '04:30')
+    fake_update.statuses = ['fetch_failed']
+    new_jobs().tick(loop)
+    assert json.loads(state_file().read_text(encoding='utf-8')) == {
+        'upstream_merge_last_run': None, 'upstream_merge_attempts': 1,
+        'upstream_merge_last_attempt': '2026-11-17T04:31:00'}
+
+
+def test_the_daily_merge_writes_its_text_to_the_log_once(new_jobs, loop, monkeypatch, log):
+    # 真的 run_update_result，下面的合并和实例重启是假的；两个模块的日志记到同一处
+    monkeypatch.setenv(MERGE_TIME_KEY, '04:30')
+    monkeypatch.setattr(fork_updater, 'run_update_result', REAL_RUN_UPDATE_RESULT)
+
+    class Updater:
+        def execute(self):
+            return MergeResult('merged', 2, [], [], '', merged_locally=True)
+
+    async def restart():
+        return ['oas1']
+
+    monkeypatch.setattr(fork_updater, 'ForkUpdater', Updater)
+    monkeypatch.setattr(fork_updater, 'restart_running_instances', restart)
+    monkeypatch.setattr(fork_updater, 'logger', log)
+    new_jobs().tick(loop)
+    text = '已合并上游 2 个提交并推送到 fork；已重启实例：oas1'
+    assert len([message for _, message in log.records if text in message]) == 1
 
 
 # ---- 注册的周期任务 --------------------------------------------------------------------------------------------
