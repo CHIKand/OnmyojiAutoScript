@@ -11,8 +11,9 @@ GIT_EDITOR=true、GCM_INTERACTIVE=Never、stdin 接空设备），也从不加 -
 联网的命令（fetch、push、ls-remote）另有 NETWORK_TIMEOUT 秒的超时，超时就杀掉 git 并按该步骤失败处理，
 免得网络卡死时整个更新流程（以及等着它的服务接口和后台线程）一直挂着。
 上游没有新提交时，merge_upstream 还会把留在本地、没推到 fork 的提交补推上去（比如上次推送失败留下的合并提交），
-结果是 pushed。进程在合并途中被杀留下的合并状态，下次调用开头会放弃；放弃不了时只自愈本工具自己留下的改动，
-否则返回 dirty，把现场原样留给人处理，什么都不丢弃，也不抛异常。
+结果是 pushed。进程在合并途中被杀留下的合并状态，下次调用开头会清理，但只清理上游那一侧改动的文件：别的已跟踪文件
+被改过（暂存的或没暂存的），本次调用就停下来返回 dirty，一个文件都不动，合并状态原样留着；清理本身没成功也返回
+dirty，从不抛异常。
 """
 import os
 import subprocess
@@ -99,7 +100,8 @@ class MergeResult:
 
     status：up_to_date / merged / pushed / conflict_aborted / push_failed / fetch_failed / dirty / smoke_failed。
     merged 是并入了上游的新提交并且推送成功；pushed 是上游没有新提交，只是把之前没推上去的本地提交补推成功了；
-    dirty 是已跟踪文件有未提交的改动，或者上次留下的合并放弃不了（message 里写明合并和有改动的文件）。
+    dirty 是已跟踪文件有未提交的改动，或者上次留下的合并没清理成（上游改动范围之外的文件被改过，或者放弃不了；
+    message 里写明合并和有改动的文件）。
     commits：merged 和紧跟在合并之后推送失败的 push_failed 里，是已并入 HEAD 的上游提交数；pushed 和补推失败的
     push_failed 里，是 HEAD 领先 origin/<分支> 的本地提交数（origin/<分支> 不存在时记 0）；其余状态为 0。
     resolved 是素材冲突里取了上游版本的路径，conflicts 是让合并中止的代码冲突路径。
@@ -179,7 +181,7 @@ def merge_upstream(r: GitRunner, upstream: str, upstream_branch: str, push_branc
     push 返回 push_failed（本地合并保留），message 都是 "git <命令> timed out after <秒数>s"。
     上游没有新提交时看 origin/<push_branch>：HEAD 领先它（或者它不存在）就补推，成功返回 pushed，失败返回
     push_failed，所以合并成功、推送失败之后再调用一次就能把本地合并推上去；不领先返回 up_to_date，不联网推送。
-    开头放弃上次留下的合并，放不了就返回 dirty，见 _abort_leftover_merge。
+    开头清理上次留下的合并，只动上游那一侧改动的文件，别的文件有改动就返回 dirty，见 _abort_leftover_merge。
 
     不可重入：开头会放弃仓库里已有的合并，同一个仓库同时有两次调用时，后一次会把前一次进行中的合并放弃掉，
     调用方要自己保证同一时刻只有一次。
@@ -245,43 +247,55 @@ def _abort_merge(r: GitRunner, *, stage_edits: bool = False) -> None:
 
 
 def _abort_leftover_merge(r: GitRunner) -> str | None:
-    """放弃上次进程被杀时留下的合并。放弃成功（或者本来就没有合并）返回 None；放弃不了返回一段说明，
-    调用方据此返回 dirty。不抛异常，也不丢弃任何改动：能丢的只有本工具自己留下的。
+    """清理上次进程被杀时留下的合并。清理成功（或者本来就没有合并）返回 None；没清理成就返回一段说明，调用方据此
+    返回 dirty。不抛异常。
 
-    典型的放不了：regenerate 写完 assets.py、还没 git add 进程就被杀，merge --abort 遇到"合并涉及、又有
-    未暂存改动"的文件会拒绝（Entry ... not uptodate），合并状态留着，之后每次调用都卡在这里。这是本工具自己留下的，
-    能自愈：先确认所有有改动的已跟踪文件（暂存的和未暂存的都算，abort 会把暂存的改动悄悄还原成 HEAD 的内容）都在
-    "合并涉及的文件"里——HEAD 和 MERGE_HEAD 之间有差异的路径，加上这些路径所属任务目录的 assets.py（重新生成的那份）——
-    再把其中有未暂存改动的文件逐个 git add，重试一次 abort。范围之外只要有一个文件有改动（可能是人手改的），
-    或者重试还不行，就一个字不动，把现场原样留着。
+    保证：中断的合并只在上游那一侧改动的文件上被清理——合并基点到 MERGE_HEAD 的差异，加上这些路径所属任务目录的
+    assets.py（regenerate 生成的那份）。已跟踪文件里只要有别的文件被改过，不管暂存没暂存、这个合并能不能直接
+    abort，本次调用都停下来返回 dirty：一次 abort 都不试，什么都不丢弃，合并状态原样留着，交给人处理。
+    范围不能取 HEAD 与 MERGE_HEAD 的差异：那里面还有只有 fork 改过的文件，人在这些文件上的改动会被 abort
+    悄悄还原成 HEAD 的内容。上游改动范围之内的文件，人手改的和本工具留下的分不开，清理时一并丢掉。
+
+    典型的卡住：regenerate 写完 assets.py、还没 git add 进程就被杀，merge --abort 遇到"合并涉及、又有未暂存改动"
+    的文件会拒绝（Entry ... not uptodate），之后每次调用都卡在这里。这时有改动的文件都在上述范围里，就把其中有
+    未暂存改动的文件逐个 git add，重试一次 abort；重试还不行也返回 dirty。
     """
     merge_head = r.run('rev-parse', '-q', '--verify', 'MERGE_HEAD', check=False)
     if merge_head.returncode != 0:
         return None
+    sha = merge_head.stdout.strip()[:7]
+
+    def left(reason: str) -> str:
+        return f'leftover merge {sha} was left as it is: {reason}'
+
+    def failed(error: str, detail: str) -> str:
+        return f'leftover merge {sha} could not be aborted: {_one_line(error)} ({detail})'
+
+    merge_base = r.run('merge-base', 'HEAD', 'MERGE_HEAD', check=False)
+    base = merge_base.stdout.strip() if merge_base.returncode == 0 else ''
+    upstream_changes = _changed_paths(r, base, 'MERGE_HEAD') if base else None
+    if upstream_changes is None:
+        return left('could not list the files the merge touches')
+    units = {_task_dir(path) for path in upstream_changes if is_asset_path(path)} - {None}
+    allowed = set(upstream_changes) | {f'tasks/{unit}/assets.py' for unit in units}
+    unstaged = _changed_paths(r)
+    staged = _changed_paths(r, '--cached')
+    if unstaged is None or staged is None:
+        return left('could not list the modified files')
+    outside = sorted((set(unstaged) | set(staged)) - allowed)
+    if outside:
+        return left(f'modified files outside the upstream changes: {", ".join(outside)}')
+
     aborted = r.run('merge', '--abort', check=False)
     if aborted.returncode == 0:
         return None
-
-    def stuck(error: str, detail: str) -> str:
-        return f'leftover merge {merge_head.stdout.strip()[:7]} could not be aborted: {_one_line(error)} ({detail})'
-
-    unstaged = _changed_paths(r)
-    staged = _changed_paths(r, '--cached')
-    touched = _changed_paths(r, 'HEAD', 'MERGE_HEAD')
-    if unstaged is None or staged is None or touched is None:
-        return stuck(aborted.stderr, 'could not list the modified files')
-    units = {_task_dir(path) for path in touched if is_asset_path(path)} - {None}
-    allowed = set(touched) | {f'tasks/{unit}/assets.py' for unit in units}
-    outside = sorted((set(unstaged) | set(staged)) - allowed)
-    if outside:
-        return stuck(aborted.stderr, f'modified files outside the merge: {", ".join(outside)}')
     if unstaged:
         added = r.run('add', '--', *sorted(unstaged), check=False)
         if added.returncode != 0:
-            return stuck(aborted.stderr, f'git add failed: {_one_line(added.stderr)}')
+            return failed(aborted.stderr, f'git add failed: {_one_line(added.stderr)}')
     retried = r.run('merge', '--abort', check=False)
     if retried.returncode != 0:
-        return stuck(retried.stderr, f'retried after staging: {", ".join(sorted(unstaged)) or "nothing to stage"}')
+        return failed(retried.stderr, f'retried after staging: {", ".join(sorted(unstaged)) or "nothing to stage"}')
     return None
 
 

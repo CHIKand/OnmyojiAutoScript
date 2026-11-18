@@ -17,6 +17,7 @@ from module.server.fork_git import (NETWORK_TIMEOUT, GitRunner, commit_paths, co
 
 BASE = {
     'script.py': 'base\n',
+    'other.py': 'base-other\n',          # 之后两边都不改的一个文件
     'requirements.txt': 'pkg==1\n',
     'tasks/Foo/as/a.png': b'\x89PNG\x00base',
     'tasks/Foo/as/image.json': '[{"v": 0}]\n',
@@ -133,11 +134,12 @@ def abort_fails(repo):
     return aborted.returncode != 0 and merging(repo)
 
 
-def leave_half_regenerated_merge(trio):
+def leave_half_regenerated_merge(trio, fork_files=None):
     """评审重现的状态：fork 和上游都改了 image.json（素材冲突），上游还改了 assets.py 和一张中文名的图（都干净地
     并进了索引）。素材冲突取上游之后 regenerate 写完 assets.py，进程在 git add 之前被杀：assets.py 在索引里是
-    上游的版本，工作区里是写出来的版本，merge --abort 因此拒绝。"""
-    trio.fork_commit({'tasks/Foo/as/image.json': '[{"v": 2}]\n'})
+    上游的版本，工作区里是写出来的版本，merge --abort 因此拒绝。fork_files 是 fork 顺手在同一个提交里改的别的文件，
+    上游没改它们。"""
+    trio.fork_commit({'tasks/Foo/as/image.json': '[{"v": 2}]\n', **(fork_files or {})})
     trio.upstream_commit({'tasks/Foo/as/image.json': '[{"v": 1}]\n', 'tasks/Foo/assets.py': '# upstream assets\n',
                           'tasks/Foo/as/斗町.png': b'\x89PNG\x00up-cn'})
 
@@ -148,6 +150,17 @@ def leave_half_regenerated_merge(trio):
     with pytest.raises(Killed):
         trio.merge(killed)
     assert abort_fails(trio.work)
+
+
+def leave_plain_merge(trio, fork_files=None):
+    """进程在 merge --no-commit 之后、提交之前被杀：干净的合并，裸 git merge --abort 此刻不会被拒绝。
+    fork_files 同上：fork 改了、上游没改的文件。"""
+    if fork_files:
+        trio.fork_commit(fork_files)
+    trio.upstream_commit({'new.txt': 'hello\n'})
+    sh(trio.work, 'fetch', '-q', 'upstream', 'dev')
+    subprocess.run(['git', 'merge', '--no-commit', '--no-ff', 'upstream/dev'], cwd=trio.work, capture_output=True)
+    assert merging(trio.work)
 
 
 class StalledGit:
@@ -395,11 +408,15 @@ def test_leftover_merge_with_half_written_assets_heals_then_merges(trio, git_cal
     healing = git_calls[:git_calls.index(('status', '--porcelain', '--untracked-files=no'))]
     assert [call for call in healing if call[0] == 'add'] == [('add', '--', 'tasks/Foo/assets.py')]
     assert healing.count(('merge', '--abort')) == 2
+    # 第一次 abort 之前只看清单：合并基点、上游改了哪些文件、哪些文件有改动
+    before_first_abort = healing[:healing.index(('merge', '--abort'))]
+    assert {call[0] for call in before_first_abort} == {'rev-parse', 'merge-base', 'diff'}
 
 
 def test_leftover_merge_heals_a_generated_assets_file_outside_the_merge_diff(trio):
-    # 上游和 fork 都只改了 image.json，assets.py 不在 HEAD 与 MERGE_HEAD 的差异里：它是 regenerate 生成后登记进索引的，
-    # 自检又动了它，进程在这时被杀。所属任务目录被合并碰过，所以它的 assets.py 也算合并自己留下的
+    # 上游和 fork 都只改了 image.json，assets.py 不在上游那一侧改动的文件里（合并基点到 MERGE_HEAD 的差异）：它是
+    # regenerate 生成后登记进索引的，自检又动了它，进程在这时被杀。所属任务目录被上游改过，所以它的 assets.py
+    # 也算合并自己留下的
     trio.fork_commit({'tasks/Foo/as/image.json': '[{"v": 2}]\n'})
     trio.upstream_commit({'tasks/Foo/as/image.json': '[{"v": 1}]\n'})
 
@@ -409,7 +426,7 @@ def test_leftover_merge_heals_a_generated_assets_file_outside_the_merge_diff(tri
 
     with pytest.raises(Killed):
         trio.merge(verify=killed)
-    assert 'tasks/Foo/assets.py' not in sh(trio.work, 'diff', '--name-only', 'HEAD', 'MERGE_HEAD').split()
+    assert sh(trio.work, 'diff', '--name-only', 'HEAD...MERGE_HEAD').split() == ['tasks/Foo/as/image.json']
     assert abort_fails(trio.work)
 
     result = trio.merge()
@@ -418,38 +435,47 @@ def test_leftover_merge_heals_a_generated_assets_file_outside_the_merge_diff(tri
     assert sh(trio.work, 'show', 'HEAD:tasks/Foo/assets.py') == '# regenerated Foo'
 
 
-@pytest.mark.parametrize('foreign', ['script.py', 'tasks/Component/Buy/assets.py'],
-                         ids=['code-file', 'assets-of-an-untouched-task'])
-def test_leftover_merge_with_a_foreign_edit_is_dirty_and_nothing_is_discarded(trio, git_calls, foreign):
-    leave_half_regenerated_merge(trio)
-    write(trio.work, {foreign: '# edited by hand\n'})
+# 清理残留的合并只动上游那一侧改动的文件（合并基点到 MERGE_HEAD 的差异，加所属任务目录的 assets.py）。人改了别的文件，
+# 不管暂存没暂存、残留的合并能不能直接 abort，都停下来返回 dirty：不 abort、不 add、不丢弃。
+# (残留合并的种类, 人改的文件, fork 也改了它, 改完又暂存)
+HUMAN_EDITS = [
+    pytest.param('blocked', 'script.py', True, False, id='blocked-fork-only-unstaged'),          # 评审 S1
+    pytest.param('blocked', 'script.py', True, True, id='blocked-fork-only-staged'),             # S1s
+    pytest.param('plain', 'script.py', True, False, id='plain-fork-only-unstaged'),              # S1v
+    pytest.param('plain', 'script.py', True, True, id='plain-fork-only-staged'),
+    pytest.param('plain', 'other.py', False, False, id='plain-untouched-unstaged'),
+    pytest.param('plain', 'other.py', False, True, id='plain-untouched-staged'),                 # S7
+    pytest.param('blocked', 'other.py', False, False, id='blocked-untouched-unstaged'),
+    pytest.param('blocked', 'other.py', False, True, id='blocked-untouched-staged'),
+    pytest.param('blocked', 'tasks/Component/Buy/assets.py', False, False, id='blocked-untouched-task-assets'),
+]
+
+
+@pytest.mark.parametrize('leftover, edited, fork_changes_it, staged', HUMAN_EDITS)
+def test_leftover_merge_stops_with_dirty_on_a_human_edit_outside_the_upstream_changes(
+        trio, git_calls, leftover, edited, fork_changes_it, staged):
+    fork_files = {edited: 'fork\n'} if fork_changes_it else None
+    (leave_half_regenerated_merge if leftover == 'blocked' else leave_plain_merge)(trio, fork_files)
+    write(trio.work, {edited: '# human edit\n'})
+    if staged:
+        sh(trio.work, 'add', edited)
     head = trio.head
     git_calls.clear()
     result = trio.merge()                                  # 不抛异常
     assert result.status == 'dirty'
-    assert 'leftover merge' in result.message and foreign in result.message
+    assert 'leftover merge' in result.message and edited in result.message
     assert sh(trio.work, 'rev-parse', '--short=7', 'MERGE_HEAD') in result.message
     assert merging(trio.work) and trio.head == head       # 合并状态原样留着
-    assert (trio.work / foreign).read_bytes() == b'# edited by hand\n'
-    assert (trio.work / 'tasks/Foo/assets.py').read_bytes() == b'# half written'
-    # 除了试一次 abort 和看清单，什么都没做
-    assert {call[0] for call in git_calls} <= {'rev-parse', 'merge', 'diff'}
-    assert git_calls.count(('merge', '--abort')) == 1
+    assert (trio.work / edited).read_bytes() == b'# human edit\n'
+    assert (edited in sh(trio.work, 'diff', '--cached', '--name-only').split()) is staged      # 暂存与否也没变
+    if leftover == 'blocked':
+        assert (trio.work / 'tasks/Foo/assets.py').read_bytes() == b'# half written'
+    # abort 一次都没试，也没有任何会改动东西的命令：只看了清单
+    assert {call[0] for call in git_calls} <= {'rev-parse', 'merge-base', 'diff'}
 
-    # 人把自己的改动处理掉以后，下一次调用自愈并正常合并
-    sh(trio.work, 'checkout', '--', foreign)
+    # 人把自己的改动处理掉以后，下一次调用清理残留的合并并正常合并
+    sh(trio.work, 'checkout', 'HEAD', '--', edited)
     assert trio.merge().status == 'merged'
-
-
-def test_leftover_merge_keeps_a_staged_edit_that_an_abort_would_revert(trio):
-    leave_half_regenerated_merge(trio)
-    write(trio.work, {'script.py': 'staged by hand\n'})
-    sh(trio.work, 'add', 'script.py')          # 只暂存、工作区没再改：重试 abort 会把它悄悄还原成 HEAD 的内容
-    result = trio.merge()
-    assert result.status == 'dirty' and 'script.py' in result.message
-    assert merging(trio.work)
-    assert (trio.work / 'script.py').read_bytes() == b'staged by hand\n'
-    assert 'script.py' in sh(trio.work, 'diff', '--cached', '--name-only').split()
 
 
 def test_leftover_merge_that_still_cannot_be_aborted_after_staging_is_dirty(trio, broken_git):
@@ -464,16 +490,21 @@ def test_leftover_merge_that_still_cannot_be_aborted_after_staging_is_dirty(trio
     assert (trio.work / 'tasks/Foo/assets.py').read_bytes() == b'# half written'    # 内容还在（登记进了索引，没丢）
 
 
-@pytest.mark.parametrize('command, expected', [('diff', 'could not list the modified files'),
-                                               ('add', 'git add failed: fatal: simulated failure')])
-def test_leftover_merge_heal_failing_midway_is_dirty_not_an_exception(trio, git_calls, broken_git, command, expected):
+@pytest.mark.parametrize('command, expected, aborts', [
+    (('merge-base',), 'could not list the files the merge touches', 0),
+    (('diff',), 'could not list the files the merge touches', 0),            # 第一个 diff 就是上游改动的清单
+    (('diff', '--no-renames', '--name-only', '-z', '--cached'), 'could not list the modified files', 0),
+    (('add',), 'git add failed: fatal: simulated failure', 1),
+], ids=['merge-base', 'upstream-listing', 'staged-listing', 'add'])
+def test_leftover_merge_heal_failing_midway_is_dirty_not_an_exception(trio, git_calls, broken_git, command, expected,
+                                                                      aborts):
     leave_half_regenerated_merge(trio)
-    broken_git(command)
+    broken_git(*command)
     git_calls.clear()
     result = trio.merge()
     assert result.status == 'dirty'
     assert 'leftover merge' in result.message and expected in result.message
-    assert git_calls.count(('merge', '--abort')) == 1       # 没走到重试
+    assert git_calls.count(('merge', '--abort')) == aborts   # 清单拿不到就一个 abort 都不试；add 失败了没走到重试
     assert merging(trio.work)
     assert (trio.work / 'tasks/Foo/assets.py').read_bytes() == b'# half written'
 
