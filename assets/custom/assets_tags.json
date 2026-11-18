@@ -1,0 +1,272 @@
+{
+  "ActivityShikigami": {
+    "as/pages.json": {
+      "shi": {
+        "periodic": true,
+        "screen": "活动主页"
+      },
+      "back_green": {
+        "periodic": true,
+        "screen": "退出时"
+      },
+      "skip_button": {
+        "periodic": true,
+        "screen": "退出时"
+      },
+      "red_exit": {
+        "periodic": true,
+        "screen": "退出时"
+      },
+      "to_battle_main": {
+        "periodic": true,
+        "screen": "活动主页"
+      },
+      "to_battle_boss": {
+        "periodic": true,
+        "screen": "活动主页"
+      },
+      "check_battle_main": {
+        "periodic": true,
+        "screen": "普通挑战页"
+      },
+      "check_battle_boss": {
+        "periodic": true,
+        "screen": "Boss挑战页"
+      },
+      "battle_main_to_records": {
+        "periodic": true,
+        "screen": "普通挑战页"
+      },
+      "to_battle_main_2": {
+        "periodic": true,
+        "screen": "未分类"
+      },
+      "confirm_skip": {
+        "periodic": true,
+        "screen": "退出时"
+      }
+    },
+    "as/image.json": {
+      "lock": {
+        "periodic": false,
+        "screen": "普通挑战页"
+      },
+      "unlock": {
+        "periodic": false,
+        "screen": "普通挑战页"
+      },
+      "climb_mode_pass": {
+        "periodic": true,
+        "screen": "普通挑战页"
+      },
+      "climb_mode_ap": {
+        "periodic": true,
+        "screen": "普通挑战页"
+      },
+      "climb_mode_switch": {
+        "periodic": true,
+        "screen": "普通挑战页"
+      }
+    },
+    "fire/ocr.json": {
+      "fire": {
+        "periodic": true,
+        "screen": "普通挑战页"
+      },
+      "remain_ap": {
+        "periodic": true,
+        "screen": "普通挑战页"
+      },
+      "remain_pass": {
+        "periodic": true,
+        "screen": "普通挑战页"
+      },
+      "remain_buy": {
+        "periodic": true,
+        "screen": "普通挑战页"
+      },
+      "remain_pass2": {
+        "periodic": true,
+        "screen": "普通挑战页"
+      },
+      "remain_boss": {
+        "periodic": true,
+        "screen": "Boss挑战页"
+      },
+      "remain_ap100": {
+        "periodic": true,
+        "screen": "普通挑战页"
+      },
+      "enter_ap100": {
+        "periodic": true,
+        "screen": "未分类"
+      }
+    },
+    "fire/image.json": {
+      "pass_1": {
+        "periodic": false,
+        "screen": "战斗中"
+      },
+      "pass_2": {
+        "periodic": false,
+        "screen": "战斗中"
+      },
+      "pass_3": {
+        "periodic": false,
+        "screen": "战斗中"
+      },
+      "pass_4": {
+        "periodic": false,
+        "screen": "战斗中"
+      },
+      "pass_5": {
+        "periodic": false,
+        "screen": "战斗中"
+      },
+      "pass_6": {
+        "periodic": false,
+        "screen": "战斗中"
+      },
+      "pass_7": {
+        "periodic": false,
+        "screen": "战斗中"
+      },
+      "pass_8": {
+        "periodic": false,
+        "screen": "战斗中"
+      },
+      "pass_9": {
+        "periodic": false,
+        "screen": "战斗中"
+      },
+      "pass_10": {
+        "periodic": false,
+        "screen": "战斗中"
+      },
+      "pass_11": {
+        "periodic": false,
+        "screen": "战斗中"
+      },
+      "pass12": {
+        "periodic": false,
+        "screen": "战斗中"
+      },
+      "pass_13": {
+        "periodic": false,
+        "screen": "战斗中"
+      }
+    }
+  },
+  "MetaDemon": {
+    "md/image.json": {
+      "md_battle_failure": {
+        "periodic": false,
+        "screen": "超鬼王战斗"
+      },
+      "md_win": {
+        "periodic": false,
+        "screen": "超鬼王战斗"
+      }
+    },
+    "md/image_2025.json": {
+      "right_enter": {
+        "periodic": false,
+        "screen": "未分类"
+      },
+      "enter2": {
+        "periodic": false,
+        "screen": "未分类"
+      },
+      "find_demon": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      },
+      "battle_demon": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      },
+      "boss_empty": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      },
+      "boss_convene": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      },
+      "boss_empty_1": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      },
+      "boss_empty_2": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      },
+      "crafting_1": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      },
+      "crafting_empty": {
+        "periodic": false,
+        "screen": "合成页"
+      },
+      "crafting_card_star_1": {
+        "periodic": false,
+        "screen": "合成页"
+      },
+      "crafting_start": {
+        "periodic": false,
+        "screen": "合成页"
+      },
+      "crafting_empty_new": {
+        "periodic": false,
+        "screen": "合成页"
+      },
+      "star56_pos_1": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      },
+      "star56_hp_threshold_t": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      },
+      "star56_hp_threshold_f": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      },
+      "enter_ensure": {
+        "periodic": false,
+        "screen": "未分类"
+      },
+      "boos_public": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      }
+    },
+    "md/ocr.json": {
+      "md_exhaustion": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      },
+      "md_ticket": {
+        "periodic": false,
+        "screen": "未分类"
+      },
+      "md_count_info": {
+        "periodic": false,
+        "screen": "未分类"
+      },
+      "crafting_card_1": {
+        "periodic": false,
+        "screen": "合成页"
+      },
+      "md_full_name": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      },
+      "boss_empty_1": {
+        "periodic": false,
+        "screen": "超鬼王主页"
+      }
+    }
+  }
+}
