@@ -15,7 +15,7 @@ from module.logger import logger
 from module.server.home_router import home_app
 from module.server.script_router import script_app
 from module.server.tool_router import tool_app
-from module.server.custom_routes import register_custom
+from module.server.custom_routes import register_custom, start_custom_jobs
 from module.server.setting import State
 from module.server.main_manager import mm
 from starlette.staticfiles import StaticFiles
@@ -76,6 +76,7 @@ async def on_startup():
     logger.info('OAS web service startup done')
     if app.state.script_instances:
         await mm.restart_processes(app.state.script_instances)
+    start_custom_jobs()
 
 
 async def on_shutdown():
