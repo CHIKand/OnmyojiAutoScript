@@ -5,9 +5,11 @@ OASX 的"更新"页调用 /home/update_info 和 /home/execute_update。上游 ho
 部署配置出什么问题都不抛异常（接口不返回 500），出错记日志并给出文案。
 
 合并（execute）和检查更新（update_info）共用 MERGE_LOCK，同一时刻只有一个在动仓库：merge_upstream 不可重入，
-后到的调用等前一个做完再开始。每日定时合并也走 run_update，规则一样。
-合并成功并推送（merged），或者补推了之前没推上去的提交（pushed）之后才重启在跑的实例，让它们换上新代码；
-推送失败时不重启，本地提交由启动器守卫保护，用户重试一次就会补推并重启。
+后到的调用等前一个做完再开始。每日定时合并走 run_update_result（run_update 的核心，多返回合并结果），规则一样。
+磁盘上的代码变了就重启在跑的实例，让它们换上新代码：合并并推送成功（merged）、补推了之前没推上去的提交（pushed）、
+本地合并了但推送失败（push_failed 且 merged_locally；本地提交由启动器守卫保护，重试会补推）。上游新增了第三方依赖
+（needs_install，或者它推送失败）不重启：新进程一启动就缺模块，要等用户在 OASX 重启服务、启动器装好依赖。
+提示文案只放一行摘要，git 的原文整段写进日志。
 """
 import asyncio
 import os
@@ -19,20 +21,40 @@ from pathlib import Path
 
 from module.config.dotenv import read_env
 from module.logger import logger
-from module.server.fork_git import (UPSTREAM_REMOTE, GitRunner, MergeResult, count_behind, ensure_remote,
-                                    merge_upstream, upstream_commits)
+from module.server.fork_git import (FORK_REMOTE, UPSTREAM_REMOTE, GitRunner, MergeResult, count_behind,
+                                    ensure_remote, merge_upstream, upstream_commits)
 from module.server.instance_control import restart_running_instances
 
 DEFAULT_UPSTREAM_URL = 'https://gitcode.com/OnmyojiAutoScript/OnmyojiAutoScript.git'
 DEFAULT_UPSTREAM_BRANCH = 'dev'
 HISTORY_LIMIT = 15                     # 更新页列出的上游提交数，与上游 Updater.get_commit(n=15) 一致
 ERROR_STATUS = 'error'                 # 不是 merge_upstream 给的状态：合并过程中出了意外，没有来得及得出结果
-RESTART_STATUSES = frozenset({'merged', 'pushed'})
+RESTART_STATUSES = frozenset({'merged', 'pushed'})     # 另外还有本地合并了、推送失败的 push_failed，见 _restarts
+CHECKOUT_CHANGED = frozenset({'merged', 'pushed', 'needs_install'})   # 同上，见 _changed_checkout
 DEPENDENCY_NOTE = '；依赖有变化，请在 OASX 重启服务以安装新依赖'
-DIRTY_LINES = 10                       # 未提交改动的提示最多列出的行数
-SMOKE_CODE = 'import script; import module.server.custom_routes; import module.orchestra.runtime'
+SERVER_CODE_NOTE = '；服务端代码有变化，请在 OASX 重启服务以完整生效'
+RESTART_FAILED_NOTE = '；重启实例失败，请在总览页手动重启'
+DIRTY_HINT = '需要保留的改动请到素材维护页提交；不需要的，在 OASX 重启服务会把它们还原为 fork 版本（会丢失这些改动）'
+PUSH_REJECTED = 'fork 上有更新的提交，推送被拒'
+PUSH_CREDENTIALS = '凭据无效或需要登录'
+PUSH_NETWORK = '网络不通或超时'
+LIST_LIMIT = 10                        # 提示里最多列出的条目数：未提交的改动、代码冲突的文件、git 列出的文件
+SMOKE_CODE = ('import script; import module.server.custom_routes; import module.orchestra.runtime; '
+              'import module.server.app')
 SMOKE_TIMEOUT = 120                    # 秒
 SMOKE_LINES = 20                       # 自检失败时带回的 stderr 末尾行数
+
+# 推送失败原因的归类，按顺序判断，比较时不分大小写。都对不上就取 stderr 第一行有内容的话
+_NON_FAST_FORWARD = ('(fetch first)', 'non-fast-forward')
+_CREDENTIAL_SIGNS = ('authentication failed', 'could not read username', 'could not read password',
+                     'terminal prompts disabled', 'user interactivity has been disabled',
+                     'invalid username or password', 'password authentication was removed', 'permission denied',
+                     ' denied to ', 'returned error: 401', 'returned error: 403', 'http basic: access denied')
+_NETWORK_SIGNS = ('timed out', 'could not resolve host', 'could not resolve proxy', 'failed to connect',
+                  "couldn't connect to server", 'connection refused', 'connection reset', 'connection was reset',
+                  'network is unreachable', 'recv failure', 'send failure', 'empty reply from server',
+                  'ssl_error_syscall', 'failed to receive handshake', 'unexpected disconnect',
+                  'the remote end hung up unexpectedly', 'early eof', 'rpc failed')
 
 MERGE_LOCK = threading.Lock()
 
@@ -166,9 +188,12 @@ def _smoke_python() -> str:
 
 
 def default_verify(repo: Path) -> tuple[bool, str]:
-    """合并结果提交之前的导入自检：在仓库里另起一个 Python，导入 script、module.server.custom_routes 和
-    module.orchestra.runtime。上游改名了什么东西、合并没有冲突却会让实例和服务一重启就起不来，这里先拦住，
-    merge_upstream 据此把合并中止。返回 (是否通过, 原因)：失败时是 stderr 的最后 20 行，超时是 'timed out'。
+    """合并结果提交之前的导入自检：在仓库里另起一个 Python，导入 script、module.server.custom_routes、
+    module.orchestra.runtime 和 module.server.app。上游改名了什么东西、合并没有冲突却会让实例和服务一重启就起不来，
+    这里先拦住，merge_upstream 据此把合并中止（只缺上游新增的第三方依赖时例外，见 merge_upstream）。
+    导入 module.server.app 会在子进程里建 MainManager（读 config/ 下的实例配置，一个都没有时像服务启动那样从模板建
+    oas1.json；起一个守护线程），不起服务、不占端口，子进程随即退出。
+    返回 (是否通过, 原因)：失败时是 stderr 的最后 20 行，超时是 'timed out'。
     子进程的 stderr 用 PYTHONIOENCODING 定成 UTF-8：管道里的 Python 在中文 Windows 上默认写 GBK，按 UTF-8 解码会乱码。
     """
     try:
@@ -189,39 +214,113 @@ def _lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def message_of(result: MergeResult, restarted: list[str]) -> str:
-    """合并结果的提示文案，OASX 更新页和日志里都显示它。restarted 是实际重启了的实例名。
+def _capped(items: list[str]) -> str:
+    """用"、"连起来，最多 LIST_LIMIT 项，多出来的记成" 等 N 项"。"""
+    more = len(items) - LIST_LIMIT
+    return '、'.join(items[:LIST_LIMIT]) + (f' 等 {more} 项' if more > 0 else '')
+
+
+def _summary(text: str) -> str:
+    """git 报错的一行摘要：第一行有内容的话（跳过 hint: 提示、推送开头的 To <地址>），紧跟其后缩进列出的文件
+    （比如会被合并覆盖的未跟踪文件）接在同一行。"""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('hint:') or stripped == 'remote:' or line.startswith('To '):
+            continue
+        items = []
+        for following in lines[index + 1:]:
+            if not following.strip() or not following[:1].isspace():
+                break
+            items.append(following.strip())
+        return f'{stripped} {_capped(items)}' if items else stripped
+    return ''
+
+
+def push_reason(detail: str) -> str:
+    """推送失败的原因，归成一句：fork 上有更新的提交（非快进被拒）、凭据问题、网络或超时；都不是就取 git 报错的
+    第一行。原文由 run_update_result 整段写进日志。"""
+    text = detail.lower()
+    if any(sign in text for sign in _NON_FAST_FORWARD):
+        return PUSH_REJECTED
+    if any(sign in text for sign in _CREDENTIAL_SIGNS):
+        return PUSH_CREDENTIALS
+    if any(sign in text for sign in _NETWORK_SIGNS):
+        return PUSH_NETWORK
+    return _summary(detail)
+
+
+def _restarts(result: MergeResult) -> bool:
+    """合并之后要不要重启在跑的实例：磁盘上的代码变了就重启（merged、pushed、本地合并了但推送失败的 push_failed），
+    缺上游新增的第三方依赖时不重启（新进程一启动就缺模块）。"""
+    if result.missing_module:
+        return False
+    return result.status in RESTART_STATUSES or (result.status == 'push_failed' and result.merged_locally)
+
+
+def _changed_checkout(result: MergeResult) -> bool:
+    """这次调用之后，运行目录里的代码与服务进程启动时加载的可能不一样了。"""
+    return result.status in CHECKOUT_CHANGED or (result.status == 'push_failed' and result.merged_locally)
+
+
+def message_of(result: MergeResult, restarted: list[str] | None) -> str:
+    """合并结果的提示文案，OASX 更新页和日志里都显示它。restarted 是实际重启了的实例名，None 表示重启时出错。
 
     几个固定文案（已是最新、合并成功、代码冲突、推送失败）出自计划，不要改字；其余状态的文案与它们同风格。
-    requirements_changed 为真时，不管什么状态，末尾都追加依赖有变化的提示。
-    dirty 的说明只列前 DIRTY_LINES 行，多出来的行数记在末尾（"等 N 项"）；fetch_failed 只留最后一个非空行（git 的
-    最终报错）；conflict_aborted 没有冲突文件（合并根本没开始）时，{files} 处改放 git 的说明。
+    推送失败分两种：这次合并了、没推上去（merged_locally）用计划的文案，末尾接重启结果；补推之前的本地提交又失败了，
+    说还有几个提交没推上去，不重启。推送失败的原因归成一句（push_reason）。
+    重启了实例的状态，末尾写"已重启实例：<名字>"（一个都没有写"无"），重启出错时改写"重启实例失败……"。
+    缺上游新增的依赖时（needs_install，或者它推送失败）末尾改说依赖的事，实例没有重启。
+    之后按顺序追加：服务端代码有变化的提示（只在这次改了运行目录代码的状态上）、依赖有变化的提示（requirements_changed
+    为真时，不管什么状态，都在最末尾）。
+    dirty 的说明只列前 LIST_LIMIT 行，多出来的行数记在末尾（"等 N 项"），再接一句怎么处理这些改动；代码冲突的文件
+    最多列 LIST_LIMIT 个；fetch_failed 只留最后一个非空行（git 的最终报错），并说清拉取的是 fork 还是上游；
+    conflict_aborted 没有冲突文件时合并根本没开始，不说成代码冲突。
     """
     status, commits, detail = result.status, result.commits, result.message.strip()
-    names = '、'.join(restarted) or '无'
+    if restarted is None:
+        restart = RESTART_FAILED_NOTE
+    else:
+        restart = f'；已重启实例：{"、".join(restarted) or "无"}'
+    dependency = f'；上游新增依赖 {result.missing_module}，请在 OASX 重启服务（启动器会先安装依赖），实例暂未重启'
     if status == 'up_to_date':
         text = '已是最新，无需合并'
     elif status == 'merged':
-        text = f'已合并上游 {commits} 个提交并推送到 fork；已重启实例：{names}'
+        text = f'已合并上游 {commits} 个提交并推送到 fork{restart}'
+    elif status == 'needs_install':
+        text = f'已合并上游 {commits} 个提交并推送到 fork{dependency}'
     elif status == 'pushed':
         pushed = f'已把之前未推送的 {commits} 个提交推送到 fork' if commits else '已把本地提交推送到 fork'
-        text = f'{pushed}；已重启实例：{names}'
-    elif status == 'conflict_aborted':
-        files = '、'.join(result.conflicts) or detail
-        text = f'合并上游遇到代码冲突，已中止，分支未改动：{files}'
-    elif status == 'push_failed':
-        text = f'已在本地合并上游 {commits} 个提交，但推送失败：{detail}。启动器守卫会保护本地提交，请检查网络或令牌后重试'
+        text = f'{pushed}{restart}'
+    elif status == 'conflict_aborted' and result.conflicts:
+        text = f'合并上游遇到代码冲突，已中止，分支未改动：{_capped(result.conflicts)}'
+    elif status == 'conflict_aborted':      # 合并根本没开始（有未跟踪的文件挡着、index.lock……）
+        text = f'合并未能开始，分支未改动：{_summary(detail)}'
+    elif status == 'push_failed' and result.merged_locally:
+        text = (f'已在本地合并上游 {commits} 个提交，但推送失败：{push_reason(detail)}。启动器守卫会保护本地提交，'
+                f'请检查网络或令牌后重试' + (dependency if result.missing_module else restart))
+    elif status == 'push_failed':           # 上游没有新提交，补推之前留下的本地提交又失败了
+        unpushed = f'仍有 {commits} 个本地提交没推送到 fork' if commits else '仍有本地提交没推送到 fork'
+        text = f'{unpushed}：{push_reason(detail)}。启动器守卫会保护本地提交，请检查后重试'
+    elif status == 'fork_ahead':
+        text = (f'fork 上有运行目录还没有的 {commits} 个新提交，已暂停合并：请先在 OASX 重启服务（启动器会更新到 fork 最新），'
+                f'再合并上游')
+    elif status == 'diverged':
+        text = '运行目录和 fork 各有对方没有的提交，已停止，需要人工处理：先把 fork 的 custom 合并进运行目录再推送'
     elif status == 'dirty':
         lines = _lines(detail)
-        shown, more = '\n'.join(lines[:DIRTY_LINES]), len(lines) - DIRTY_LINES
-        text = f'运行目录有未提交的改动，已跳过合并：{shown}' + (f'\n等 {more} 项' if more > 0 else '')
+        shown, more = '\n'.join(lines[:LIST_LIMIT]), len(lines) - LIST_LIMIT
+        text = f'运行目录有未提交的改动，已跳过合并：{shown}' + (f'\n等 {more} 项' if more > 0 else '') + f'\n{DIRTY_HINT}'
     elif status == 'fetch_failed':
         last = _lines(detail)[-1] if detail else ''
-        text = f'拉取上游失败，未改动任何文件：{last}'
+        source = ' fork ' if result.fetch_remote == FORK_REMOTE else '上游'     # 合并前先拉取 fork，失败时说清是哪个
+        text = f'拉取{source}失败，未改动任何文件：{last}'
     elif status == 'smoke_failed':
         text = f'合并上游后自检失败，已中止，分支未改动：{detail}'
     else:                       # ERROR_STATUS，以及 fork_git 以后新增、这里还不认识的状态
         text = f'合并上游时出现意外错误，请查看服务日志：{detail or status}'
+    if result.server_code_changed and _changed_checkout(result):
+        text += SERVER_CODE_NOTE
     return text + (DEPENDENCY_NOTE if result.requirements_changed else '')
 
 
@@ -242,21 +341,33 @@ async def check_update() -> dict | None:
         return None
 
 
-async def run_update() -> str:
-    """GET /home/execute_update 的实现，每日定时合并也调它：在工作线程里合并，merged 或 pushed 之后重启在跑的
-    实例，返回提示文案。任何错误都转成文案，不往外抛。重启失败（restart_running_instances 自己已经逐个实例兜住错误）
-    不能把已经成功的合并报成失败：记日志，文案里的重启名单按空算。"""
+async def run_update_result() -> tuple[MergeResult | None, str]:
+    """合并上游的核心，返回 (合并结果, 提示文案)。按钮的 run_update 和每日定时合并都走这里，M4 的通知也用它。
+
+    在工作线程里合并；磁盘上的代码变了就重启在跑的实例（见 _restarts）。任何错误都转成文案，不往外抛：合并没能给出
+    结果（比如读不了部署配置）时结果为 None。重启失败（restart_running_instances 自己已经逐个实例兜住错误）不能把已经
+    成功的合并报成失败：记日志，文案里如实写重启失败。合并结果里 git 或自检的原文整段写进日志（文案里只有一行摘要）；
+    文案本身不在这里记，由调用方各记一次。
+    """
     try:
         result = await asyncio.to_thread(_merge)
     except Exception as exc:                    # 比如读不了部署配置；合并本身的意外已经在 execute 里转成结果
         logger.exception('合并上游失败')
-        result = _failure(exc)
-    restarted: list[str] = []
-    if result.status in RESTART_STATUSES:
+        return None, message_of(_failure(exc), [])
+    if result.message and result.status != ERROR_STATUS:     # error 的原文 execute 已经连同调用栈记过了
+        logger.warning(f'合并上游（{result.status}）的详细说明（git 或自检的原文）：\n{result.message}')
+    restarted: list[str] | None = []
+    if _restarts(result):
         try:
             restarted = await restart_running_instances()
         except Exception:
             logger.exception('合并上游后重启实例失败')
-    message = message_of(result, restarted)
+            restarted = None
+    return result, message_of(result, restarted)
+
+
+async def run_update() -> str:
+    """GET /home/execute_update 的实现：run_update_result 的文案，记一次日志后返回。不往外抛。"""
+    _, message = await run_update_result()
     logger.info(message)
     return message

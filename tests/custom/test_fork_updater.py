@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,11 +27,18 @@ import pytest
 from module.server import fork_updater
 from module.server.fork_git import GitRunner, MergeResult
 from module.server.fork_updater import (DEFAULT_UPSTREAM_BRANCH, DEFAULT_UPSTREAM_URL, MERGE_LOCK, ForkUpdater,
-                                        check_update, default_verify, message_of, run_update)
-from test_fork_git import is_clean, merging, sh, stall, trio, trio_template, write  # noqa: F401  后三个是夹具
+                                        check_update, default_verify, message_of, push_reason, run_update,
+                                        run_update_result)
+# stall、trio、trio_template 是夹具
+from test_fork_git import (is_clean, merging, missing_module, parents, push_fails, rival_pushes, sh,  # noqa: F401
+                           stall, trio, trio_template, write)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPENDENCY_NOTE = '；依赖有变化，请在 OASX 重启服务以安装新依赖'
+SERVER_CODE_NOTE = '；服务端代码有变化，请在 OASX 重启服务以完整生效'
+RESTART_FAILED = '；重启实例失败，请在总览页手动重启'
+DIRTY_HINT = '需要保留的改动请到素材维护页提交；不需要的，在 OASX 重启服务会把它们还原为 fork 版本（会丢失这些改动）'
+REJECTED, CREDENTIALS, NETWORK = 'fork 上有更新的提交，推送被拒', '凭据无效或需要登录', '网络不通或超时'
 VERIFY_OK = lambda repo: (True, '')  # noqa: E731   换掉默认自检：临时仓库里没有能导入的 script.py
 
 
@@ -79,8 +87,8 @@ def make_updater(trio) -> ForkUpdater:
     return ForkUpdater(repo=trio.work, git='git', branch='custom')
 
 
-def result(status, commits=0, conflicts=(), message='', requirements=False) -> MergeResult:
-    return MergeResult(status, commits, [], list(conflicts), message, requirements)
+def result(status, commits=0, conflicts=(), message='', requirements=False, **flags) -> MergeResult:
+    return MergeResult(status, commits, [], list(conflicts), message, requirements, **flags)
 
 
 class BlockedMerge:
@@ -220,6 +228,19 @@ def test_env_example_documents_the_upstream_keys():
     assert any(line.lstrip('# ').startswith('OAS_UPSTREAM_MERGE_TIME=') for line in lines)
 
 
+def test_env_example_explains_how_the_daily_merge_behaves():
+    lines = (REPO_ROOT / '.env.example').read_text(encoding='utf-8').splitlines()
+    start = lines.index(f'OAS_UPSTREAM_BRANCH={DEFAULT_UPSTREAM_BRANCH}') + 1
+    sample = next(index for index, line in enumerate(lines) if line.lstrip('# ').startswith('OAS_UPSTREAM_MERGE_TIME='))
+    assert all(line.startswith('#') for line in lines[start:sample])     # 注释都单独占一行
+    comment = '\n'.join(lines[start:sample])
+    for words in ('服务启动', '补跑', '重启运行中的实例',                    # 错过的时间什么时候补、补跑也重启实例
+                  '一天最多', '拉取失败', '10 分钟', '6 次',                # 一天一次，只有拉取失败会重试
+                  '不用重启服务',                                          # 改 .env 即时生效
+                  '第一次推送'):                                           # 有人值守地确认过第一次推送之前别开
+        assert words in comment, words
+
+
 # ---- execute ---------------------------------------------------------------------------------------------------
 
 def test_execute_merges_upstream_and_pushes_to_the_deploy_branch(local_upstream, monkeypatch):
@@ -230,6 +251,51 @@ def test_execute_merges_upstream_and_pushes_to_the_deploy_branch(local_upstream,
     assert (outcome.status, outcome.commits) == ('merged', 1)
     assert (trio.work / 'new.txt').is_file()
     assert trio.fork_tip == trio.head                    # push origin HEAD:custom
+
+
+def use_trio_updater(monkeypatch, trio, verify=VERIFY_OK):
+    """run_update_result 里无参构造的 ForkUpdater() 换成指向 trio 的真对象，默认自检换成 verify。"""
+    monkeypatch.setattr(fork_updater, 'ForkUpdater', lambda: make_updater(trio))
+    monkeypatch.setattr(fork_updater, 'default_verify', verify)
+
+
+def test_a_new_dependency_is_pushed_but_instances_are_not_restarted(local_upstream, monkeypatch):
+    trio = local_upstream
+    trio.upstream_commit({'requirements.txt': 'pkg==1\nbrandnew==1.0\n', 'module/server/x.py': 'import brandnew\n'})
+    use_trio_updater(monkeypatch, trio, missing_module('brandnew'))
+    calls = use_restart(monkeypatch)
+    outcome, text = asyncio.run(run_update_result())
+    assert (outcome.status, outcome.missing_module, outcome.merged_locally) == ('needs_install', 'brandnew', True)
+    assert trio.fork_tip == trio.head
+    assert calls == []                                   # 新进程一启动就缺模块：等用户重启服务、启动器装好依赖
+    assert text == ('已合并上游 1 个提交并推送到 fork；上游新增依赖 brandnew，请在 OASX 重启服务（启动器会先安装依赖），'
+                    '实例暂未重启' + SERVER_CODE_NOTE + DEPENDENCY_NOTE)
+
+
+def test_a_local_merge_whose_push_fails_still_restarts_the_instances(local_upstream, monkeypatch, tmp_path):
+    trio = local_upstream
+    trio.upstream_commit({'new.txt': 'hello\n'})
+    push_fails(trio, tmp_path)
+    use_trio_updater(monkeypatch, trio)
+    calls = use_restart(monkeypatch)
+    outcome, text = asyncio.run(run_update_result())
+    assert (outcome.status, outcome.merged_locally) == ('push_failed', True)
+    assert calls == ['restart']                          # 磁盘上的代码已经变了，在跑的实例不能停在旧代码上
+    assert text.startswith('已在本地合并上游 1 个提交，但推送失败：fatal: ') and 'missing.git' in text
+    assert text.endswith('。启动器守卫会保护本地提交，请检查网络或令牌后重试；已重启实例：oas1、oas2')
+    assert '\n' not in text                              # git 的多行报错只留一行
+
+
+def test_fork_ahead_pauses_the_update_with_its_text(local_upstream, monkeypatch, tmp_path):
+    trio = local_upstream
+    rival_pushes(trio, tmp_path)
+    trio.upstream_commit({'new.txt': 'hello\n'})
+    before = trio.head
+    use_trio_updater(monkeypatch, trio)
+    calls = use_restart(monkeypatch)
+    outcome, text = asyncio.run(run_update_result())
+    assert (outcome.status, calls, trio.head) == ('fork_ahead', [], before)
+    assert text == 'fork 上有运行目录还没有的 1 个新提交，已暂停合并：请先在 OASX 重启服务（启动器会更新到 fork 最新），再合并上游'
 
 
 def test_execute_regenerates_assets_with_the_real_extractor(local_upstream, monkeypatch):
@@ -396,13 +462,20 @@ def test_check_update_never_raises(monkeypatch, log):
     assert 'exception' in log.levels
 
 
-@pytest.mark.parametrize('status, restarts', [
-    ('merged', True), ('pushed', True),
-    ('up_to_date', False), ('push_failed', False), ('conflict_aborted', False), ('dirty', False),
-    ('fetch_failed', False), ('smoke_failed', False), ('error', False),
-])
-def test_run_update_restarts_instances_only_after_a_successful_push(monkeypatch, status, restarts):
-    use_updater(monkeypatch, outcome=result(status, 2, message='detail'))
+@pytest.mark.parametrize('status, flags, restarts', [
+    ('merged', {'merged_locally': True}, True),
+    ('pushed', {}, True),
+    ('push_failed', {'merged_locally': True}, True),           # 本地已经合并：磁盘上的代码变了，只是没推上去
+    ('push_failed', {}, False),                                # 补推失败：这次什么都没变
+    ('needs_install', {'merged_locally': True, 'missing_module': 'brandnew'}, False),
+    ('push_failed', {'merged_locally': True, 'missing_module': 'brandnew'}, False),
+    ('up_to_date', {}, False), ('conflict_aborted', {}, False), ('dirty', {}, False), ('fetch_failed', {}, False),
+    ('smoke_failed', {}, False), ('fork_ahead', {}, False), ('diverged', {}, False), ('error', {}, False),
+], ids=['merged', 'pushed', 'push-failed-after-merge', 'push-failed-retry', 'needs-install',
+        'needs-install-push-failed', 'up-to-date', 'conflict', 'dirty', 'fetch-failed', 'smoke-failed', 'fork-ahead',
+        'diverged', 'error'])
+def test_run_update_restarts_instances_only_when_the_code_on_disk_changed(monkeypatch, status, flags, restarts):
+    use_updater(monkeypatch, outcome=result(status, 2, message='detail', **flags))
     calls = use_restart(monkeypatch)
     message = asyncio.run(run_update())
     assert calls == (['restart'] if restarts else [])
@@ -411,9 +484,48 @@ def test_run_update_restarts_instances_only_after_a_successful_push(monkeypatch,
 
 
 def test_run_update_reports_the_names_that_were_restarted(monkeypatch):
-    use_updater(monkeypatch, outcome=result('merged', 3))
+    use_updater(monkeypatch, outcome=result('merged', 3, merged_locally=True))
     use_restart(monkeypatch, names=())
     assert asyncio.run(run_update()) == '已合并上游 3 个提交并推送到 fork；已重启实例：无'
+
+
+def test_run_update_result_returns_the_merge_result_with_its_text(monkeypatch, log):
+    outcome = result('fetch_failed', message='fatal: unable to access x', fetch_remote='upstream')
+    use_updater(monkeypatch, outcome=outcome)
+    calls = use_restart(monkeypatch)
+    returned, text = asyncio.run(run_update_result())
+    assert returned is outcome and calls == []
+    assert text == '拉取上游失败，未改动任何文件：fatal: unable to access x'
+
+
+def test_run_update_result_has_no_result_when_the_merge_never_returned(monkeypatch, log):
+    use_updater(monkeypatch, constructor_error=RuntimeError('no deploy config'))
+    calls = use_restart(monkeypatch)
+    returned, text = asyncio.run(run_update_result())
+    assert returned is None and calls == []
+    assert text == '合并上游时出现意外错误，请查看服务日志：RuntimeError: no deploy config'
+    assert 'exception' in log.levels
+
+
+def test_the_text_is_logged_once_by_run_update_and_not_by_run_update_result(monkeypatch, log):
+    use_updater(monkeypatch, outcome=result('up_to_date'))
+    use_restart(monkeypatch)
+    _, text = asyncio.run(run_update_result())
+    assert not any(text in message for _, message in log.records)          # 每日定时合并自己记一次，这里不记
+    assert asyncio.run(run_update()) == text
+    assert [message for _, message in log.records if text in message] == [text]     # 按钮这条路径记一次
+
+
+def test_the_raw_git_output_goes_to_the_log_in_full(monkeypatch, log):
+    stderr = ('To https://github.com/example/fork.git\n ! [rejected]        HEAD -> custom (fetch first)\n'
+              "error: failed to push some refs to 'https://github.com/example/fork.git'\n"
+              'hint: Updates were rejected because the remote contains work that you do not')
+    use_updater(monkeypatch, outcome=result('push_failed', 1, message=stderr, merged_locally=True))
+    use_restart(monkeypatch, names=['oas1'])
+    text = asyncio.run(run_update())
+    assert text == ('已在本地合并上游 1 个提交，但推送失败：fork 上有更新的提交，推送被拒。启动器守卫会保护本地提交，'
+                    '请检查网络或令牌后重试；已重启实例：oas1')                # 界面上只有归类后的一句
+    assert any(stderr in message for _, message in log.records)            # 原文整段进日志
 
 
 def test_run_update_runs_the_merge_off_the_event_loop(monkeypatch):
@@ -442,10 +554,18 @@ def test_run_update_never_raises(monkeypatch, log):
     assert calls == [] and 'exception' in log.levels
 
 
-def test_run_update_keeps_the_merge_message_when_the_restart_fails(monkeypatch, log):
-    use_updater(monkeypatch, outcome=result('merged', 3))
+@pytest.mark.parametrize('outcome, expected', [
+    (result('merged', 3, merged_locally=True), '已合并上游 3 个提交并推送到 fork' + RESTART_FAILED),
+    (result('pushed', 2), '已把之前未推送的 2 个提交推送到 fork' + RESTART_FAILED),
+    (result('push_failed', 1, message='fatal: x', merged_locally=True),
+     '已在本地合并上游 1 个提交，但推送失败：fatal: x。启动器守卫会保护本地提交，请检查网络或令牌后重试' + RESTART_FAILED),
+], ids=['merged', 'pushed', 'push-failed-after-merge'])
+def test_a_failed_restart_is_reported_not_hidden_behind_none(monkeypatch, log, outcome, expected):
+    use_updater(monkeypatch, outcome=outcome)
     use_restart(monkeypatch, error=RuntimeError('no manager'))
-    assert asyncio.run(run_update()) == '已合并上游 3 个提交并推送到 fork；已重启实例：无'   # 合并和推送已经成功，不能报成失败
+    message = asyncio.run(run_update())
+    assert message == expected                           # 合并和推送的结果照报，重启失败另说，不写成"已重启实例：无"
+    assert '已重启实例' not in message
     assert 'exception' in log.levels
 
 
@@ -487,19 +607,46 @@ def test_message_texts():
     assert message_of(result('merged', 3), []) == '已合并上游 3 个提交并推送到 fork；已重启实例：无'
     assert message_of(result('conflict_aborted', conflicts=['module/a.py', 'b.py']), []) == \
         '合并上游遇到代码冲突，已中止，分支未改动：module/a.py、b.py'
-    assert message_of(result('push_failed', 2, message='fatal: denied'), []) == \
-        '已在本地合并上游 2 个提交，但推送失败：fatal: denied。启动器守卫会保护本地提交，请检查网络或令牌后重试'
+    # 计划的推送失败文案用在"这次合并了、没推上去"；推送失败也重启了实例，末尾说明重启了谁
+    assert message_of(result('push_failed', 2, message='fatal: denied', merged_locally=True), ['oas1']) == \
+        '已在本地合并上游 2 个提交，但推送失败：fatal: denied。启动器守卫会保护本地提交，请检查网络或令牌后重试；已重启实例：oas1'
     assert message_of(result('merged', 1, requirements=True), ['oas1']) == \
         '已合并上游 1 个提交并推送到 fork；已重启实例：oas1' + DEPENDENCY_NOTE
 
 
-@pytest.mark.parametrize('status', ['up_to_date', 'merged', 'pushed', 'conflict_aborted', 'push_failed', 'dirty',
-                                    'fetch_failed', 'smoke_failed', 'error'])
-def test_the_dependency_note_follows_requirements_changed_for_every_status(status):
-    plain = message_of(result(status, 1, message='x\ny'), ['oas1'])
-    flagged = message_of(result(status, 1, message='x\ny', requirements=True), ['oas1'])
+ALL_STATUSES = [
+    result('up_to_date'), result('merged', 1, merged_locally=True), result('pushed', 1),
+    result('needs_install', 1, merged_locally=True, missing_module='brandnew'),
+    result('conflict_aborted', message='x\ny'), result('conflict_aborted', conflicts=['a.py']),
+    result('push_failed', 1, message='x\ny', merged_locally=True), result('push_failed', 1, message='x\ny'),
+    result('push_failed', 1, message='x', merged_locally=True, missing_module='brandnew'),
+    result('dirty', message='x\ny'), result('fetch_failed', message='x\ny', fetch_remote='upstream'),
+    result('fetch_failed', message='x', fetch_remote='origin'), result('smoke_failed', message='x\ny'),
+    result('fork_ahead', 2), result('diverged'), result('error', message='x'),
+]
+STATUS_IDS = ['up-to-date', 'merged', 'pushed', 'needs-install', 'not-started', 'conflict', 'push-failed-after-merge',
+              'push-failed-retry', 'push-failed-needs-install', 'dirty', 'fetch-upstream', 'fetch-fork', 'smoke',
+              'fork-ahead', 'diverged', 'error']
+
+
+@pytest.mark.parametrize('outcome', ALL_STATUSES, ids=STATUS_IDS)
+def test_the_dependency_note_follows_requirements_changed_for_every_status(outcome):
+    plain = message_of(outcome, ['oas1'])
+    flagged = message_of(replace(outcome, requirements_changed=True), ['oas1'])
     assert not plain.endswith(DEPENDENCY_NOTE)
     assert flagged == plain + DEPENDENCY_NOTE
+
+
+CHANGED_THE_CHECKOUT = {'merged', 'pushed', 'needs-install', 'push-failed-after-merge', 'push-failed-needs-install'}
+
+
+@pytest.mark.parametrize('outcome', ALL_STATUSES, ids=STATUS_IDS)
+def test_the_server_code_note_only_follows_statuses_that_changed_the_checkout(outcome, request):
+    plain = message_of(outcome, ['oas1'])
+    flagged = message_of(replace(outcome, server_code_changed=True, requirements_changed=True), ['oas1'])
+    changed = request.node.callspec.id in CHANGED_THE_CHECKOUT
+    # 服务端代码的提示在依赖提示之前，两个都有时依赖提示仍在最末尾
+    assert flagged == plain + (SERVER_CODE_NOTE if changed else '') + DEPENDENCY_NOTE
 
 
 def test_message_texts_for_pushed():
@@ -507,27 +654,111 @@ def test_message_texts_for_pushed():
     assert message_of(result('pushed', 0), []) == '已把本地提交推送到 fork；已重启实例：无'
 
 
+def test_message_texts_for_a_retry_whose_push_fails_again():
+    # 这次没有新的合并，只是补推失败：不说"已在本地合并上游"，也不重启实例
+    stderr = "fatal: 'D:/x/missing.git' does not appear to be a git repository\nfatal: Could not read from remote"
+    assert message_of(result('push_failed', 2, message=stderr), ['oas1']) == \
+        ("仍有 2 个本地提交没推送到 fork：fatal: 'D:/x/missing.git' does not appear to be a git repository。"
+         '启动器守卫会保护本地提交，请检查后重试')
+    assert message_of(result('push_failed', 0, message='git push timed out after 300s'), []) == \
+        '仍有本地提交没推送到 fork：网络不通或超时。启动器守卫会保护本地提交，请检查后重试'      # 数不出提交数时不写 0 个
+
+
+def test_message_texts_for_needs_install():
+    assert message_of(result('needs_install', 3, merged_locally=True, missing_module='brandnew'), ['oas1']) == \
+        '已合并上游 3 个提交并推送到 fork；上游新增依赖 brandnew，请在 OASX 重启服务（启动器会先安装依赖），实例暂未重启'
+    failed = result('push_failed', 3, message='git push timed out after 300s', merged_locally=True,
+                    missing_module='brandnew')
+    assert message_of(failed, []) == ('已在本地合并上游 3 个提交，但推送失败：网络不通或超时。启动器守卫会保护本地提交，'
+                                      '请检查网络或令牌后重试；上游新增依赖 brandnew，请在 OASX 重启服务（启动器会先安装依赖），'
+                                      '实例暂未重启')
+
+
+def test_message_texts_for_fork_ahead_and_diverged():
+    assert message_of(result('fork_ahead', 2), []) == \
+        'fork 上有运行目录还没有的 2 个新提交，已暂停合并：请先在 OASX 重启服务（启动器会更新到 fork 最新），再合并上游'
+    assert message_of(result('diverged', message='HEAD and origin/custom have diverged'), []) == \
+        '运行目录和 fork 各有对方没有的提交，已停止，需要人工处理：先把 fork 的 custom 合并进运行目录再推送'
+
+
 def test_message_texts_for_dirty():
-    assert message_of(result('dirty', message=' M a.py\nA  b.py'), []) == '运行目录有未提交的改动，已跳过合并：M a.py\nA  b.py'
+    assert message_of(result('dirty', message=' M a.py\nA  b.py'), []) == \
+        f'运行目录有未提交的改动，已跳过合并：M a.py\nA  b.py\n{DIRTY_HINT}'
     lines = [f' M tasks/file{number}.py' for number in range(12)]
     shown = '\n'.join(f'M tasks/file{number}.py' for number in range(10))
     assert message_of(result('dirty', message='\n'.join(lines)), []) == \
-        f'运行目录有未提交的改动，已跳过合并：{shown}\n等 2 项'                      # 只留前 10 行，多出来的行数记在末尾
+        f'运行目录有未提交的改动，已跳过合并：{shown}\n等 2 项\n{DIRTY_HINT}'          # 只留前 10 行，多出来的行数记在末尾
     exactly_ten = message_of(result('dirty', message='\n'.join(lines[:10])), [])
-    assert exactly_ten == f'运行目录有未提交的改动，已跳过合并：{shown}'
+    assert exactly_ten == f'运行目录有未提交的改动，已跳过合并：{shown}\n{DIRTY_HINT}'
 
 
 def test_message_texts_for_fetch_and_smoke_failures():
-    assert message_of(result('fetch_failed', message='fatal: first\n\nfatal: unable to access x\n'), []) == \
+    assert message_of(result('fetch_failed', message='fatal: first\n\nfatal: unable to access x\n',
+                             fetch_remote='upstream'), []) == \
         '拉取上游失败，未改动任何文件：fatal: unable to access x'                      # 只留最后一个非空行
+    assert message_of(result('fetch_failed', message='fatal: unable to access y', fetch_remote='origin'), []) == \
+        '拉取 fork 失败，未改动任何文件：fatal: unable to access y'                    # 合并前要先拉取 fork，失败时说清是哪个
     assert message_of(result('smoke_failed', message='ModuleNotFoundError: No module named x'), []) == \
         '合并上游后自检失败，已中止，分支未改动：ModuleNotFoundError: No module named x'
 
 
-def test_conflict_text_falls_back_to_the_git_message_without_conflict_files():
-    # 合并没能开始（比如有未跟踪文件会被覆盖）时 conflicts 为空，{files} 处改放 git 的说明，免得句子在冒号处断掉
-    text = message_of(result('conflict_aborted', message='error: untracked working tree files would be overwritten'), [])
-    assert text == '合并上游遇到代码冲突，已中止，分支未改动：error: untracked working tree files would be overwritten'
+def test_conflict_list_is_capped_at_ten_files():
+    files = [f'module/file{number}.py' for number in range(12)]
+    shown = '、'.join(files[:10])
+    assert message_of(result('conflict_aborted', conflicts=files), []) == \
+        f'合并上游遇到代码冲突，已中止，分支未改动：{shown} 等 2 项'
+    assert message_of(result('conflict_aborted', conflicts=files[:10]), []) == \
+        f'合并上游遇到代码冲突，已中止，分支未改动：{shown}'
+
+
+@pytest.mark.parametrize('stderr, detail', [
+    ('error: The following untracked working tree files would be overwritten by merge:\n\tnew.txt\n\tdocs/斗町.md\n'
+     'Please move or remove them before you merge.\nAborting',
+     'error: The following untracked working tree files would be overwritten by merge: '
+     'new.txt、docs/斗町.md'),
+    ("fatal: Unable to create 'D:/x/.git/index.lock': File exists.\n\nAnother git process seems to be running in this "
+     "repository, e.g.\nan editor opened by 'git commit'. Please make sure all processes\n"
+     'are terminated then try again.',
+     "fatal: Unable to create 'D:/x/.git/index.lock': File exists."),
+], ids=['untracked-in-the-way', 'index-lock'])
+def test_a_merge_that_never_started_is_not_called_a_code_conflict(stderr, detail):
+    assert message_of(result('conflict_aborted', message=stderr), []) == f'合并未能开始，分支未改动：{detail}'
+
+
+@pytest.mark.parametrize('stderr, reason', [
+    ('To https://github.com/example/fork.git\n ! [rejected]        HEAD -> custom (fetch first)\n'
+     "error: failed to push some refs to 'https://github.com/example/fork.git'\n"
+     'hint: Updates were rejected because the remote contains work that you do not', REJECTED),
+    ('To https://github.com/example/fork.git\n ! [rejected]        HEAD -> custom (non-fast-forward)\n'
+     "error: failed to push some refs to 'https://github.com/example/fork.git'", REJECTED),
+    ("fatal: could not read Username for 'https://github.com': terminal prompts disabled", CREDENTIALS),
+    ('fatal: Cannot prompt because user interactivity has been disabled.\n'
+     "fatal: could not read Username for 'https://github.com': terminal prompts disabled", CREDENTIALS),
+    ('remote: Support for password authentication was removed on August 13, 2021.\n'
+     "fatal: Authentication failed for 'https://github.com/example/fork.git/'", CREDENTIALS),
+    ('remote: Permission to example/fork.git denied to someone.\n'
+     "fatal: unable to access 'https://github.com/example/fork.git/': The requested URL returned error: 403",
+     CREDENTIALS),
+    ('git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.', CREDENTIALS),
+    ('git push timed out after 300s', NETWORK),
+    ("fatal: unable to access 'https://github.com/example/fork.git/': Failed to connect to github.com port 443 "
+     'after 21045 ms: Timed out', NETWORK),
+    ("fatal: unable to access 'https://github.com/example/fork.git/': Could not resolve host: github.com", NETWORK),
+    ("fatal: unable to access 'https://github.com/example/fork.git/': Recv failure: Connection was reset", NETWORK),
+    ('error: RPC failed; curl 56 OpenSSL SSL_read: SSL_ERROR_SYSCALL, errno 10054\n'
+     'send-pack: unexpected disconnect while reading sideband packet\nfatal: the remote end hung up unexpectedly',
+     NETWORK),
+    ("fatal: 'D:/x/missing.git' does not appear to be a git repository\nfatal: Could not read from remote repository."
+     '\n\nPlease make sure you have the correct access rights\nand the repository exists.',
+     "fatal: 'D:/x/missing.git' does not appear to be a git repository"),
+    ('To https://github.com/example/fork.git\n ! [remote rejected] HEAD -> custom (protected branch hook declined)\n'
+     "error: failed to push some refs to 'https://github.com/example/fork.git'",
+     '! [remote rejected] HEAD -> custom (protected branch hook declined)'),
+], ids=['fetch-first', 'non-fast-forward', 'no-username', 'gcm-non-interactive', 'password-removed', 'http-403',
+        'ssh-publickey', 'our-timeout', 'connect-timeout', 'dns', 'reset', 'rpc-failed', 'other-first-line',
+        'remote-rejected-first-line'])
+def test_push_failures_are_shown_as_one_classified_line(stderr, reason):
+    assert push_reason(stderr) == reason
 
 
 def test_message_for_an_unexpected_error():
@@ -626,9 +857,10 @@ def test_runner_resolves_a_relative_git_path_against_the_server_directory(tmp_pa
 # ---- 默认自检 --------------------------------------------------------------------------------------------------
 
 def smoke_repo(root: Path, files: dict[str, str] | None = None) -> Path:
-    """三个被自检导入的模块的最小替身；files 里给出的文件换成那份内容。"""
+    """被自检导入的四个模块的最小替身；files 里给出的文件换成那份内容。"""
     base = {'script.py': '', 'module/__init__.py': '', 'module/server/__init__.py': '',
-            'module/server/custom_routes.py': '', 'module/orchestra/__init__.py': '', 'module/orchestra/runtime.py': ''}
+            'module/server/custom_routes.py': '', 'module/orchestra/__init__.py': '', 'module/orchestra/runtime.py': '',
+            'module/server/app.py': ''}
     write(root, {**base, **(files or {})})
     return root
 
@@ -637,11 +869,19 @@ def test_default_verify_passes_when_the_modules_import(tmp_path):
     assert default_verify(smoke_repo(tmp_path)) == (True, '')
 
 
-@pytest.mark.parametrize('broken', ['script.py', 'module/server/custom_routes.py', 'module/orchestra/runtime.py'])
-def test_default_verify_fails_when_any_of_the_three_imports_raises(tmp_path, broken):
+@pytest.mark.parametrize('broken', ['script.py', 'module/server/custom_routes.py', 'module/orchestra/runtime.py',
+                                    'module/server/app.py'])
+def test_default_verify_fails_when_any_of_the_imports_raises(tmp_path, broken):
     ok, reason = default_verify(smoke_repo(tmp_path, {broken: 'raise RuntimeError("boom")\n'}))
     assert ok is False
     assert 'RuntimeError: boom' in reason
+
+
+def test_the_smoke_gate_also_imports_the_server_app():
+    # 合并之后服务一重启就起不来的情况（app.py 导入的路由、MainManager 等）也要在推送前拦住，原有的三个导入照留
+    statements = [part.strip() for part in fork_updater.SMOKE_CODE.split(';')]
+    assert statements == ['import script', 'import module.server.custom_routes', 'import module.orchestra.runtime',
+                          'import module.server.app']
 
 
 def test_default_verify_keeps_chinese_error_text_readable(tmp_path):
@@ -673,7 +913,7 @@ def test_default_verify_runs_in_the_repository_with_a_bounded_wait(tmp_path, mon
     assert seen['command'][1] == '-c'
     code = seen['command'][2]
     assert 'import script' in code and 'import module.server.custom_routes' in code
-    assert 'import module.orchestra.runtime' in code
+    assert 'import module.orchestra.runtime' in code and 'import module.server.app' in code
 
 
 def test_default_verify_prefers_python_exe_over_pythonw_exe(tmp_path, monkeypatch):
