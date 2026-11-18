@@ -61,6 +61,16 @@ class GitRunner:
     git: str
     repo: Path
 
+    def _env(self) -> dict[str, str]:
+        """子进程的环境变量：_git_env 加上 git 所在的目录。工具链里的 git 把 git-remote-https 这些帮手放在自己旁边
+        （toolkit/Git/mingw64/bin），PATH 里没有这个目录时 fetch、push 报 "'remote-https' is not a git command"。
+        git 是不带目录的命令名时交给 PATH，不动它。相对路径按服务进程的当前目录算成绝对路径，不依赖子进程的工作目录。"""
+        env = _git_env()
+        directory = os.path.dirname(self.git)
+        if directory:
+            env['PATH'] = os.pathsep.join(filter(None, [os.path.abspath(directory), env.get('PATH')]))
+        return env
+
     def run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         """在仓库目录里执行 git，输出按 UTF-8 解码。check 为真时非零退出码抛 CalledProcessError，stderr 在异常上。
 
@@ -71,7 +81,7 @@ class GitRunner:
         if args[:1] and args[0] in NETWORK_COMMANDS:
             return self._run_with_timeout(command, check)
         return subprocess.run(command, cwd=self.repo, capture_output=True, encoding='utf-8', errors='replace',
-                              stdin=subprocess.DEVNULL, check=check, env=_git_env())
+                              stdin=subprocess.DEVNULL, check=check, env=self._env())
 
     def _run_with_timeout(self, command: list[str], check: bool) -> subprocess.CompletedProcess:
         """输出写临时文件而不是管道：git-remote-https 这类帮手进程会继承管道，卡住时即使杀了 git，
@@ -80,7 +90,7 @@ class GitRunner:
         with tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as out, \
                 tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as err:
             process = subprocess.Popen(command, cwd=self.repo, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                       env=_git_env())
+                                       env=self._env())
             try:
                 process.wait(timeout=NETWORK_TIMEOUT)
             except BaseException:       # 超时，或者被 Ctrl+C 打断

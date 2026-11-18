@@ -54,29 +54,14 @@ async def kill_server():
 
 @home_app.get('/update_info')
 async def update_info():
-    try:
-        updater = Updater()
-        result = {'is_update': updater.check_update(),
-                  'branch': updater.current_branch(),
-                  'current_commit': updater.current_commit(),
-                  'latest_commit': updater.latest_commit(),
-                  'commit': updater.get_commit(n=15),
-                  }
-        return result
-    except Exception as e:
-        logger.error(e)
-        return None
+    from module.server.fork_updater import check_update
+    return await check_update()
 
 
 @home_app.get('/execute_update')
 async def execute_update():
-    # 下拉仓库 -> 关闭所有脚本进程 -> 最后重启oasx
-    try:
-        updater = Updater()
-        updater.execute_pull()
-    except Exception as e:
-        logger.error(e)
-    return '手动更新将会立即结束运行中的脚本服务, 最后你还需重启oasx'
+    from module.server.fork_updater import run_update
+    return await run_update()
 
 
 @home_app.put('/chinese_translate')
