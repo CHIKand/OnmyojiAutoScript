@@ -123,6 +123,33 @@ class Regen:
         write(self.repo, {f'tasks/{task}/assets.py': f'# regenerated {task}\n'})
 
 
+class Killed(BaseException):
+    """模拟进程在这一步被杀。BaseException 不会被 merge_upstream 里的 except Exception 接住，合并状态原样留在仓库里。"""
+
+
+def abort_fails(repo):
+    """裸 git merge --abort 此刻会失败，并且失败后合并状态原封不动：残留状态的前提。"""
+    aborted = subprocess.run(['git', 'merge', '--abort'], cwd=repo, capture_output=True, encoding='utf-8')
+    return aborted.returncode != 0 and merging(repo)
+
+
+def leave_half_regenerated_merge(trio):
+    """评审重现的状态：fork 和上游都改了 image.json（素材冲突），上游还改了 assets.py 和一张中文名的图（都干净地
+    并进了索引）。素材冲突取上游之后 regenerate 写完 assets.py，进程在 git add 之前被杀：assets.py 在索引里是
+    上游的版本，工作区里是写出来的版本，merge --abort 因此拒绝。"""
+    trio.fork_commit({'tasks/Foo/as/image.json': '[{"v": 2}]\n'})
+    trio.upstream_commit({'tasks/Foo/as/image.json': '[{"v": 1}]\n', 'tasks/Foo/assets.py': '# upstream assets\n',
+                          'tasks/Foo/as/斗町.png': b'\x89PNG\x00up-cn'})
+
+    def killed(task):
+        write(trio.work, {'tasks/Foo/assets.py': '# half written'})
+        raise Killed
+
+    with pytest.raises(Killed):
+        trio.merge(killed)
+    assert abort_fails(trio.work)
+
+
 class StalledGit:
     """假的卡死的 git 进程：wait 一调用就按超时处理，不真等。"""
     pid = 0           # 测试里 _kill_tree 被换成了记录器，不会真去杀进程
@@ -157,6 +184,40 @@ def stall(monkeypatch):
         monkeypatch.setattr(subprocess, 'Popen', popen)
         monkeypatch.setattr(fork_git, '_kill_tree', killed.append)
         return SimpleNamespace(processes=processes, killed=killed)
+
+    return install
+
+
+@pytest.fixture
+def git_calls(monkeypatch):
+    """GitRunner.run 之后每次调用的参数（元组），调用照常真跑。"""
+    calls, real = [], GitRunner.run
+
+    def spy(self, *args, check=True):
+        calls.append(args)
+        return real(self, *args, check=check)
+
+    monkeypatch.setattr(GitRunner, 'run', spy)
+    return calls
+
+
+@pytest.fixture
+def broken_git(monkeypatch):
+    """broken_git('merge', '--abort')：以这串参数开头的 git 命令一律失败（退出码 128），其余照常真跑。
+    返回被拦下的调用。"""
+    def install(*prefix, stderr='fatal: simulated failure'):
+        blocked, real = [], GitRunner.run
+
+        def run(self, *args, check=True):
+            if args[:len(prefix)] != prefix:
+                return real(self, *args, check=check)
+            blocked.append(args)
+            if check:
+                raise subprocess.CalledProcessError(128, [self.git, *args], '', stderr)
+            return subprocess.CompletedProcess([self.git, *args], 128, '', stderr)
+
+        monkeypatch.setattr(GitRunner, 'run', run)
+        return blocked
 
     return install
 
@@ -318,6 +379,103 @@ def test_leftover_merge_state_is_aborted_first(trio, conflicting):
     assert is_clean(trio.work)
     assert len(sh(trio.work, 'rev-list', '--parents', '-n', '1', 'HEAD').split()) == 3
     assert before in sh(trio.work, 'rev-list', '--parents', '-n', '1', 'HEAD').split()
+
+
+def test_leftover_merge_with_half_written_assets_heals_then_merges(trio, git_calls):
+    leave_half_regenerated_merge(trio)
+    before = trio.head
+    git_calls.clear()
+    result = trio.merge()
+    assert (result.status, result.commits) == ('merged', 1)
+    assert not merging(trio.work) and is_clean(trio.work)
+    assert before in sh(trio.work, 'rev-list', '--parents', '-n', '1', 'HEAD').split()
+    assert sh(trio.work, 'show', 'HEAD:tasks/Foo/assets.py') == '# regenerated Foo'       # 半截的文件没混进合并提交
+    assert trio.fork_tip == trio.head
+    # 只动了该动的：恰好登记那一个文件，abort 只重试了一次
+    healing = git_calls[:git_calls.index(('status', '--porcelain', '--untracked-files=no'))]
+    assert [call for call in healing if call[0] == 'add'] == [('add', '--', 'tasks/Foo/assets.py')]
+    assert healing.count(('merge', '--abort')) == 2
+
+
+def test_leftover_merge_heals_a_generated_assets_file_outside_the_merge_diff(trio):
+    # 上游和 fork 都只改了 image.json，assets.py 不在 HEAD 与 MERGE_HEAD 的差异里：它是 regenerate 生成后登记进索引的，
+    # 自检又动了它，进程在这时被杀。所属任务目录被合并碰过，所以它的 assets.py 也算合并自己留下的
+    trio.fork_commit({'tasks/Foo/as/image.json': '[{"v": 2}]\n'})
+    trio.upstream_commit({'tasks/Foo/as/image.json': '[{"v": 1}]\n'})
+
+    def killed(repo):
+        write(repo, {'tasks/Foo/assets.py': '# touched by verify'})
+        raise Killed
+
+    with pytest.raises(Killed):
+        trio.merge(verify=killed)
+    assert 'tasks/Foo/assets.py' not in sh(trio.work, 'diff', '--name-only', 'HEAD', 'MERGE_HEAD').split()
+    assert abort_fails(trio.work)
+
+    result = trio.merge()
+    assert (result.status, result.commits) == ('merged', 1)
+    assert not merging(trio.work) and is_clean(trio.work)
+    assert sh(trio.work, 'show', 'HEAD:tasks/Foo/assets.py') == '# regenerated Foo'
+
+
+@pytest.mark.parametrize('foreign', ['script.py', 'tasks/Component/Buy/assets.py'],
+                         ids=['code-file', 'assets-of-an-untouched-task'])
+def test_leftover_merge_with_a_foreign_edit_is_dirty_and_nothing_is_discarded(trio, git_calls, foreign):
+    leave_half_regenerated_merge(trio)
+    write(trio.work, {foreign: '# edited by hand\n'})
+    head = trio.head
+    git_calls.clear()
+    result = trio.merge()                                  # 不抛异常
+    assert result.status == 'dirty'
+    assert 'leftover merge' in result.message and foreign in result.message
+    assert sh(trio.work, 'rev-parse', '--short=7', 'MERGE_HEAD') in result.message
+    assert merging(trio.work) and trio.head == head       # 合并状态原样留着
+    assert (trio.work / foreign).read_bytes() == b'# edited by hand\n'
+    assert (trio.work / 'tasks/Foo/assets.py').read_bytes() == b'# half written'
+    # 除了试一次 abort 和看清单，什么都没做
+    assert {call[0] for call in git_calls} <= {'rev-parse', 'merge', 'diff'}
+    assert git_calls.count(('merge', '--abort')) == 1
+
+    # 人把自己的改动处理掉以后，下一次调用自愈并正常合并
+    sh(trio.work, 'checkout', '--', foreign)
+    assert trio.merge().status == 'merged'
+
+
+def test_leftover_merge_keeps_a_staged_edit_that_an_abort_would_revert(trio):
+    leave_half_regenerated_merge(trio)
+    write(trio.work, {'script.py': 'staged by hand\n'})
+    sh(trio.work, 'add', 'script.py')          # 只暂存、工作区没再改：重试 abort 会把它悄悄还原成 HEAD 的内容
+    result = trio.merge()
+    assert result.status == 'dirty' and 'script.py' in result.message
+    assert merging(trio.work)
+    assert (trio.work / 'script.py').read_bytes() == b'staged by hand\n'
+    assert 'script.py' in sh(trio.work, 'diff', '--cached', '--name-only').split()
+
+
+def test_leftover_merge_that_still_cannot_be_aborted_after_staging_is_dirty(trio, broken_git):
+    leave_half_regenerated_merge(trio)
+    blocked = broken_git('merge', '--abort', stderr='fatal: abort exploded')
+    result = trio.merge()
+    assert result.status == 'dirty'
+    assert 'leftover merge' in result.message and 'abort exploded' in result.message
+    assert 'tasks/Foo/assets.py' in result.message         # 点名登记过的文件
+    assert len(blocked) == 2                                # 第一次加一次重试，不再多
+    assert merging(trio.work)
+    assert (trio.work / 'tasks/Foo/assets.py').read_bytes() == b'# half written'    # 内容还在（登记进了索引，没丢）
+
+
+@pytest.mark.parametrize('command, expected', [('diff', 'could not list the modified files'),
+                                               ('add', 'git add failed: fatal: simulated failure')])
+def test_leftover_merge_heal_failing_midway_is_dirty_not_an_exception(trio, git_calls, broken_git, command, expected):
+    leave_half_regenerated_merge(trio)
+    broken_git(command)
+    git_calls.clear()
+    result = trio.merge()
+    assert result.status == 'dirty'
+    assert 'leftover merge' in result.message and expected in result.message
+    assert git_calls.count(('merge', '--abort')) == 1       # 没走到重试
+    assert merging(trio.work)
+    assert (trio.work / 'tasks/Foo/assets.py').read_bytes() == b'# half written'
 
 
 def test_is_asset_path_table():
@@ -509,6 +667,89 @@ def test_push_is_never_forced(trio, tmp_path):
     result = trio.merge()
     assert result.status == 'push_failed'
     assert trio.fork_tip == rival_tip                    # 被拒绝的推送没有改动 fork
+
+
+def rival_pushes(trio, tmp_path):
+    """别处往 fork 的 custom 推了一个提交，返回推完之后 custom 的提交号。work 里的 origin/custom 还是旧的。"""
+    rival = tmp_path / 'rival'
+    sh(tmp_path, 'clone', '-q', '-c', 'core.autocrlf=false', str(trio.fork), str(rival))
+    configure(rival)
+    commit(rival, {'rival.txt': 'someone else\n'}, 'rival')
+    sh(rival, 'push', '-q', 'origin', 'HEAD:custom')
+    return trio.fork_tip
+
+
+@pytest.mark.parametrize('requirements', [True, False], ids=['requirements-changed', 'requirements-same'])
+def test_retry_after_push_failure_pushes_the_kept_merge(trio, tmp_path, requirements):
+    trio.upstream_commit({'new.txt': 'hello\n', **({'requirements.txt': 'pkg==3\n'} if requirements else {})})
+    before = trio.head
+    sh(trio.work, 'remote', 'set-url', 'origin', str(tmp_path / 'missing.git'))
+    failed = trio.merge()
+    assert (failed.status, failed.commits, failed.requirements_changed) == ('push_failed', 1, requirements)
+    merged_head = trio.head
+    assert trio.fork_tip == before                         # 合并只在本地
+
+    sh(trio.work, 'remote', 'set-url', 'origin', str(trio.fork))          # 网络恢复
+    retried = trio.merge()
+    assert (retried.status, retried.commits, retried.message) == ('pushed', 2, '')      # 合并提交加上游的那 1 个
+    assert retried.requirements_changed is requirements   # 推送前拿 origin/custom 比的，推完它就挪到 HEAD 了
+    assert (retried.resolved, retried.conflicts) == ([], [])
+    assert trio.fork_tip == trio.head == merged_head       # 补推的就是原来那个合并，没有再造提交
+    assert not merging(trio.work) and is_clean(trio.work)
+
+    again = trio.merge()
+    assert (again.status, again.commits, again.requirements_changed) == ('up_to_date', 0, False)
+
+
+def test_retry_that_fails_again_stays_retryable(trio, tmp_path):
+    trio.upstream_commit({'new.txt': 'hello\n', 'requirements.txt': 'pkg==3\n'})
+    before = trio.head
+    sh(trio.work, 'remote', 'set-url', 'origin', str(tmp_path / 'missing.git'))
+    assert trio.merge().status == 'push_failed'
+    again = trio.merge()
+    assert (again.status, again.commits, again.requirements_changed) == ('push_failed', 2, True)    # 这次数的是待推送的提交
+    assert 'missing.git' in again.message
+    assert trio.fork_tip == before
+    assert not merging(trio.work) and is_clean(trio.work)
+
+    sh(trio.work, 'remote', 'set-url', 'origin', str(trio.fork))
+    assert trio.merge().status == 'pushed'
+    assert trio.fork_tip == trio.head
+
+
+def test_retry_is_never_forced(trio, tmp_path):
+    rival_tip = rival_pushes(trio, tmp_path)
+    trio.upstream_commit({'new.txt': 'hello\n'})
+    assert trio.merge().status == 'push_failed'            # 非快进，被拒绝
+    retried = trio.merge()
+    assert (retried.status, retried.commits) == ('push_failed', 2)
+    assert trio.fork_tip == rival_tip                      # 重试也没有强推
+
+
+def test_local_commits_that_never_reached_the_fork_are_pushed(trio):
+    trio.fork_commit({'tasks/Foo/as/a.png': b'\x89PNG\x00fork'}, 'asset page save')        # 比如素材页保存后推送失败留下的
+    result = trio.merge()
+    assert (result.status, result.commits, result.requirements_changed) == ('pushed', 1, False)
+    assert trio.fork_tip == trio.head
+
+
+@pytest.mark.parametrize('fork_moved_on', [False, True], ids=['equal', 'behind-the-fork'])
+def test_nothing_ahead_is_up_to_date_and_does_not_push(trio, tmp_path, fork_moved_on):
+    if fork_moved_on:                      # 别处推了新提交，这边取回来：HEAD 落后于 origin/custom，没有要推的
+        rival_pushes(trio, tmp_path)
+        sh(trio.work, 'fetch', '-q', 'origin', 'custom')
+    sh(trio.work, 'remote', 'set-url', 'origin', str(tmp_path / 'missing.git'))    # 真去推的话会失败，就不是 up_to_date
+    result = trio.merge()
+    assert (result.status, result.commits, result.message) == ('up_to_date', 0, '')
+
+
+def test_missing_tracking_ref_pushes_and_reports_zero(trio):
+    trio.fork_commit({'requirements.txt': 'pkg==2\n'}, 'local change')
+    sh(trio.work, 'update-ref', '-d', 'refs/remotes/origin/custom')      # 这个克隆没取过 origin/custom
+    result = trio.merge()
+    assert (result.status, result.commits, result.requirements_changed) == ('pushed', 0, False)    # 没有参照，数不出也比不了
+    assert trio.fork_tip == trio.head                      # 但推上去了
+    assert trio.merge().status == 'up_to_date'             # 推送把跟踪引用建了回来
 
 
 def test_runner_check_semantics(trio):

@@ -10,6 +10,9 @@ M3b 的素材页复用 commit_paths 和 push。只用标准库。
 GIT_EDITOR=true、GCM_INTERACTIVE=Never、stdin 接空设备），也从不加 --force。
 联网的命令（fetch、push、ls-remote）另有 NETWORK_TIMEOUT 秒的超时，超时就杀掉 git 并按该步骤失败处理，
 免得网络卡死时整个更新流程（以及等着它的服务接口和后台线程）一直挂着。
+上游没有新提交时，merge_upstream 还会把留在本地、没推到 fork 的提交补推上去（比如上次推送失败留下的合并提交），
+结果是 pushed。进程在合并途中被杀留下的合并状态，下次调用开头会放弃；放弃不了时只自愈本工具自己留下的改动，
+否则返回 dirty，把现场原样留给人处理，什么都不丢弃，也不抛异常。
 """
 import os
 import subprocess
@@ -94,10 +97,15 @@ class GitRunner:
 class MergeResult:
     """merge_upstream 的结果。
 
-    status：up_to_date / merged / conflict_aborted / push_failed / fetch_failed / dirty / smoke_failed。
-    commits 是已并入 HEAD 的上游提交数，只有 merged 和 push_failed 非零。resolved 是素材冲突里取了上游版本的路径，
-    conflicts 是让合并中止的代码冲突路径。message 是 git 或自检给出的原文，可能为空，面向用户的固定文案由上层生成。
-    requirements_changed 表示合并让 requirements.txt 相对合并前的 HEAD 有了变化。
+    status：up_to_date / merged / pushed / conflict_aborted / push_failed / fetch_failed / dirty / smoke_failed。
+    merged 是并入了上游的新提交并且推送成功；pushed 是上游没有新提交，只是把之前没推上去的本地提交补推成功了；
+    dirty 是已跟踪文件有未提交的改动，或者上次留下的合并放弃不了（message 里写明合并和有改动的文件）。
+    commits：merged 和紧跟在合并之后推送失败的 push_failed 里，是已并入 HEAD 的上游提交数；pushed 和补推失败的
+    push_failed 里，是 HEAD 领先 origin/<分支> 的本地提交数（origin/<分支> 不存在时记 0）；其余状态为 0。
+    resolved 是素材冲突里取了上游版本的路径，conflicts 是让合并中止的代码冲突路径。
+    message 是 git 或自检给出的原文，可能为空，面向用户的固定文案由上层生成。
+    requirements_changed 表示 requirements.txt 有了变化：merged 比的是合并前的 HEAD；pushed 比的是推送前的
+    origin/<分支>，该引用不存在时记 False。
     """
     status: str
     commits: int
@@ -169,11 +177,16 @@ def merge_upstream(r: GitRunner, upstream: str, upstream_branch: str, push_branc
     抛异常，或者处理合并结果时 git 命令失败，都 merge --abort 并返回 smoke_failed，message 里是原因。
     fetch 或 push 超过 NETWORK_TIMEOUT 秒没完成：fetch 返回 fetch_failed（仓库没动过），
     push 返回 push_failed（本地合并保留），message 都是 "git <命令> timed out after <秒数>s"。
+    上游没有新提交时看 origin/<push_branch>：HEAD 领先它（或者它不存在）就补推，成功返回 pushed，失败返回
+    push_failed，所以合并成功、推送失败之后再调用一次就能把本地合并推上去；不领先返回 up_to_date，不联网推送。
+    开头放弃上次留下的合并，放不了就返回 dirty，见 _abort_leftover_merge。
 
     不可重入：开头会放弃仓库里已有的合并，同一个仓库同时有两次调用时，后一次会把前一次进行中的合并放弃掉，
     调用方要自己保证同一时刻只有一次。
     """
-    _abort_merge(r)                                       # 上次合并途中进程被杀留下的状态
+    stuck = _abort_leftover_merge(r)                      # 上次合并途中进程被杀留下的状态
+    if stuck:
+        return MergeResult('dirty', 0, [], [], stuck)
     dirty = r.run('status', '--porcelain', '--untracked-files=no').stdout.rstrip()
     if dirty:                                             # 运行目录里总有未跟踪的文件，只看已跟踪文件的改动
         return MergeResult('dirty', 0, [], [], dirty)
@@ -187,12 +200,34 @@ def merge_upstream(r: GitRunner, upstream: str, upstream_branch: str, push_branc
     ref = f'{UPSTREAM_REMOTE}/{upstream_branch}'
     behind = count_behind(r, ref)
     if behind == 0:
-        return MergeResult('up_to_date', 0, [], [], '')
+        return _push_unpushed_commits(r, push_branch)
     result = _merge_and_commit(r, ref, upstream_branch, behind, regenerate, verify)
     if result.status != 'merged':
         return result
     ok, error = push(r, push_branch)
     return result if ok else replace(result, status='push_failed', message=error)
+
+
+def _push_unpushed_commits(r: GitRunner, push_branch: str) -> MergeResult:
+    """上游没有新提交时的收尾：把还没推到 fork 的本地提交推上去，比如上次合并成功、推送失败，合并提交一直留在本地。
+
+    HEAD 领先 origin/<push_branch>，或者这个引用不存在（本地没取过）就推送：成功是 pushed，失败是 push_failed
+    （commits 都是领先的提交数），不领先是 up_to_date，这时不碰网络。引用不存在时数不出提交、也比不了
+    requirements.txt，commits 记 0、requirements_changed 记 False。
+    领先数和 requirements.txt 的比较都要在推送之前做：推送成功后 git 会把 origin/<push_branch> 挪到 HEAD，
+    之后什么差别都比不出来。
+    """
+    tracked = f'origin/{push_branch}'
+    known = r.run('rev-parse', '-q', '--verify', tracked, check=False).returncode == 0
+    ahead = int(r.run('rev-list', '--count', f'{tracked}..HEAD').stdout.strip()) if known else 0
+    if known and ahead == 0:
+        return MergeResult('up_to_date', 0, [], [], '')
+    requirements_changed = known and r.run('diff', '--quiet', tracked, 'HEAD', '--', 'requirements.txt',
+                                           check=False).returncode == 1
+    ok, error = push(r, push_branch)
+    if not ok:
+        return MergeResult('push_failed', ahead, [], [], error, requirements_changed)
+    return MergeResult('pushed', ahead, [], [], '', requirements_changed)
 
 
 def _abort_merge(r: GitRunner, *, stage_edits: bool = False) -> None:
@@ -207,6 +242,61 @@ def _abort_merge(r: GitRunner, *, stage_edits: bool = False) -> None:
     if stage_edits:
         r.run('add', '-u')
     r.run('merge', '--abort')
+
+
+def _abort_leftover_merge(r: GitRunner) -> str | None:
+    """放弃上次进程被杀时留下的合并。放弃成功（或者本来就没有合并）返回 None；放弃不了返回一段说明，
+    调用方据此返回 dirty。不抛异常，也不丢弃任何改动：能丢的只有本工具自己留下的。
+
+    典型的放不了：regenerate 写完 assets.py、还没 git add 进程就被杀，merge --abort 遇到"合并涉及、又有
+    未暂存改动"的文件会拒绝（Entry ... not uptodate），合并状态留着，之后每次调用都卡在这里。这是本工具自己留下的，
+    能自愈：先确认所有有改动的已跟踪文件（暂存的和未暂存的都算，abort 会把暂存的改动悄悄还原成 HEAD 的内容）都在
+    "合并涉及的文件"里——HEAD 和 MERGE_HEAD 之间有差异的路径，加上这些路径所属任务目录的 assets.py（重新生成的那份）——
+    再把其中有未暂存改动的文件逐个 git add，重试一次 abort。范围之外只要有一个文件有改动（可能是人手改的），
+    或者重试还不行，就一个字不动，把现场原样留着。
+    """
+    merge_head = r.run('rev-parse', '-q', '--verify', 'MERGE_HEAD', check=False)
+    if merge_head.returncode != 0:
+        return None
+    aborted = r.run('merge', '--abort', check=False)
+    if aborted.returncode == 0:
+        return None
+
+    def stuck(error: str, detail: str) -> str:
+        return f'leftover merge {merge_head.stdout.strip()[:7]} could not be aborted: {_one_line(error)} ({detail})'
+
+    unstaged = _changed_paths(r)
+    staged = _changed_paths(r, '--cached')
+    touched = _changed_paths(r, 'HEAD', 'MERGE_HEAD')
+    if unstaged is None or staged is None or touched is None:
+        return stuck(aborted.stderr, 'could not list the modified files')
+    units = {_task_dir(path) for path in touched if is_asset_path(path)} - {None}
+    allowed = set(touched) | {f'tasks/{unit}/assets.py' for unit in units}
+    outside = sorted((set(unstaged) | set(staged)) - allowed)
+    if outside:
+        return stuck(aborted.stderr, f'modified files outside the merge: {", ".join(outside)}')
+    if unstaged:
+        added = r.run('add', '--', *sorted(unstaged), check=False)
+        if added.returncode != 0:
+            return stuck(aborted.stderr, f'git add failed: {_one_line(added.stderr)}')
+    retried = r.run('merge', '--abort', check=False)
+    if retried.returncode != 0:
+        return stuck(retried.stderr, f'retried after staging: {", ".join(sorted(unstaged)) or "nothing to stage"}')
+    return None
+
+
+def _changed_paths(r: GitRunner, *diff_args: str) -> list[str] | None:
+    """git diff 列出的有差异的路径，命令失败返回 None。-z 让中文路径不被转义，--no-renames 让改名的两端都列出来，
+    这样几份清单之间才能直接按路径比较。"""
+    listed = r.run('diff', '--no-renames', '--name-only', '-z', *diff_args, check=False)
+    if listed.returncode != 0:
+        return None
+    return [path for path in listed.stdout.split('\0') if path]
+
+
+def _one_line(text: str) -> str:
+    """多行的 git 报错压成一行，好放进 message。"""
+    return '; '.join(line.strip() for line in text.splitlines() if line.strip())
 
 
 def _merge_and_commit(r: GitRunner, ref: str, branch: str, behind: int, regenerate: Callable[[str], None],
