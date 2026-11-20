@@ -541,11 +541,17 @@
       if (!window.confirm("用 " + upload.name + " 替换 " + relativeImagePath(file, imageName) + "？")) {
         return;
       }
-      const content = await readAsDataUrl(upload);
-      const result = await api(taskUrl(task, "replace-image"), {
-        method: "POST",
-        json: { json_relpath: file, image_name: imageName, content_base64: content },
-      });
+      let result;
+      try {
+        const content = await readAsDataUrl(upload);
+        result = await api(taskUrl(task, "replace-image"), {
+          method: "POST",
+          json: { json_relpath: file, image_name: imageName, content_base64: content },
+        });
+      } catch (error) {
+        // 接口报错时图没有换：校验不过什么都不写，重新生成 assets.py 出错时后端会把图还原
+        throw new Error("没有替换：" + ((error && error.message) || String(error)));
+      }
       if (result.commit) {
         state.lastCommits[task] = result.commit;
       }

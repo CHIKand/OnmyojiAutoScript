@@ -742,15 +742,65 @@ def test_replace_refuses_while_a_merge_is_in_progress(root):
     assert tree(root) == before and regen.calls == []
 
 
-def test_replace_releases_the_lock_when_regenerate_fails(root):
-    def broken(task):
-        raise RuntimeError('boom')
+def broken_regenerate(task):
+    raise RuntimeError('boom')
 
+
+def test_replace_releases_the_lock_when_regenerate_fails(root):
     with pytest.raises(RuntimeError, match='boom'):
-        replace(root, regenerate=broken)
+        replace(root, regenerate=broken_regenerate)
     assert fork_updater.MERGE_LOCK.acquire(blocking=False)
     fork_updater.MERGE_LOCK.release()
-    assert pixels(root / 'tasks/Foo/as/a.png').shape == (3, 4, 3)       # 图已经换上了，重新生成的失败不回滚它
+
+
+def test_replace_restores_the_image_when_regenerate_fails(root, log):
+    """重新生成出错：换下的图按原来的字节写回，异常照常往外抛，磁盘上什么都没变（也没留下临时文件）。"""
+    before = tree(root)
+    with pytest.raises(RuntimeError, match='boom'):
+        replace(root, regenerate=broken_regenerate)
+    assert (root / 'tasks/Foo/as/a.png').read_bytes() == OLD_PNG
+    assert tree(root) == before
+    assert any('已还原 tasks/Foo/as/a.png' in message for message in log.messages('warning'))
+
+
+@pytest.mark.parametrize('json_relpath, image_name, created', [
+    ('as/image.json', 'gone.png', 'tasks/Foo/as/gone.png'),
+    ('deep/image.json', 'sub/more/d.png', 'tasks/Foo/deep/sub'),         # 为新图建的目录也一起删掉
+], ids=['new-image', 'new-directories'])
+def test_replace_removes_a_new_image_when_regenerate_fails(root, json_relpath, image_name, created):
+    put_json(root, 'tasks/Foo/deep/image.json', [image_rule('d', 'sub/more/d.png')])
+    before = tree(root)
+    with pytest.raises(RuntimeError, match='boom'):
+        replace(root, image_name, json_relpath=json_relpath, regenerate=broken_regenerate)
+    assert not (root / created).exists()
+    assert tree(root) == before
+
+
+def test_replace_restores_the_image_when_another_json_is_broken(root, monkeypatch):
+    """F1 遗留的真实触发：同一个任务里另一个 json 写坏了，默认的重新生成（AssetsExtractor）解析它时抛 JSONDecodeError。"""
+    monkeypatch.chdir(root)
+    write_files(root, {'tasks/Foo/as/broken.json': '{'})
+    before = tree(root)
+    with pytest.raises(json.JSONDecodeError):
+        assets_check.replace_image('Foo', 'as/image.json', 'a.png', b64(png_bytes()), root=root)
+    assert tree(root) == before
+
+
+def test_replace_reraises_the_regenerate_error_when_the_restore_fails(root, monkeypatch, log):
+    """还原本身也失败：记一条错误日志，抛出的仍是重新生成的异常，不是还原的。"""
+    writes, real = [], assets_check._write_atomically
+
+    def write_once(path, data):
+        writes.append(path)
+        if len(writes) > 1:
+            raise OSError('disk gone')
+        real(path, data)
+
+    monkeypatch.setattr(assets_check, '_write_atomically', write_once)
+    with pytest.raises(RuntimeError, match='boom'):
+        replace(root, regenerate=broken_regenerate)
+    assert len(writes) == 2                                             # 写新图一次，还原一次（失败了）
+    assert any('tasks/Foo/as/a.png' in message and 'disk gone' in message for message in log.messages('error'))
 
 
 def test_replace_default_regenerate_rebuilds_assets_py(root, monkeypatch):
@@ -1069,6 +1119,26 @@ def test_replace_and_commit_reports_a_git_failure_after_the_write(repo, monkeypa
     assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': True, 'commit': None, 'pushed': False,
                       'error': 'git 命令失败：Author identity unknown', 'uncommitted': True}
     assert regen.calls == ['Foo'] and repo.status() == ['M  tasks/Foo/as/a.png']      # 已暂存、没提交成
+
+
+@pytest.mark.parametrize('image_name', ['a.png', 'gone.png'], ids=['existing-image', 'new-image'])
+def test_replace_and_commit_leaves_nothing_when_regenerate_fails(repo, image_name):
+    """重新生成出错（同 replace_image）：图按原来的字节写回、新图删掉，异常照常往外抛，什么都没提交、没推送。"""
+    before, head, fork = worktree(repo.work), repo.head, repo.fork_tip
+    with pytest.raises(RuntimeError, match='boom'):
+        replace_commit(repo, image_name, regenerate=broken_regenerate)
+    assert worktree(repo.work) == before and (repo.work / 'tasks/Foo/as/a.png').read_bytes() == OLD_PNG
+    assert (repo.head, repo.fork_tip) == (head, fork) and repo.status() == []
+
+
+def test_replace_and_commit_leaves_nothing_when_another_json_is_broken(repo, monkeypatch):
+    monkeypatch.chdir(repo.work)                    # 默认的重新生成按当前目录算图片路径
+    repo.write({'tasks/Foo/as/broken.json': '{'})
+    before, head = worktree(repo.work), repo.head
+    with pytest.raises(json.JSONDecodeError):
+        assets_check.replace_and_commit('Foo', 'as/image.json', 'a.png', b64(png_bytes()), repo.runner, 'custom')
+    assert worktree(repo.work) == before and repo.head == head
+    assert repo.status() == ['?? tasks/Foo/as/broken.json']
 
 
 def test_replace_and_commit_same_image_after_a_failed_push(repo, tmp_path):

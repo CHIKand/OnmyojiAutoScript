@@ -677,10 +677,48 @@ def _prepare_replacement(task: str, json_relpath: str, image_name: str, content_
 
 
 def _apply_replacement(replacement: _Replacement) -> None:
-    """写图（原子写入，见 _write_atomically），再重新生成 assets.py。调用方持有写入守卫。"""
-    _write_atomically(replacement.target, replacement.data)
-    replacement.regenerate(replacement.extract_dir)
+    """写图（原子写入，见 _write_atomically），再重新生成 assets.py。调用方持有写入守卫。
+
+    重新生成出错（比如同一个 assets.py 的另一个 json 写坏了）时先撤销写图再把异常往外抛，失败的替换在磁盘上什么都不留：
+    原来有图就把原来的字节原样写回（同样原子写入），原来没有就删掉新写的图，连同为它新建的目录。
+    撤销本身也失败时记一条错误日志，抛出的仍是重新生成的异常。
+    """
+    target = replacement.target
+    try:
+        previous = target.read_bytes()
+    except FileNotFoundError:
+        previous = None
+    new_dirs = []                               # 写图时要新建的目录，由近到远
+    for parent in target.parents:
+        if parent.exists():
+            break
+        new_dirs.append(parent)
+    _write_atomically(target, replacement.data)
+    try:
+        replacement.regenerate(replacement.extract_dir)
+    except BaseException as exc:
+        _undo_write(replacement, previous, new_dirs, exc)
+        raise
     logger.info(f'素材替换：{replacement.shown}')
+
+
+def _undo_write(replacement: _Replacement, previous: bytes | None, new_dirs: list[Path], cause: BaseException) -> None:
+    """撤销 _apply_replacement 写下的图（cause 是重新生成的异常，只用于日志），自己不抛异常：撤销失败只记日志。"""
+    try:
+        if previous is not None:
+            _write_atomically(replacement.target, previous)
+        else:
+            replacement.target.unlink(missing_ok=True)
+            for directory in new_dirs:
+                try:
+                    directory.rmdir()           # 只删空目录：别处往里放了东西就留着
+                except OSError:
+                    break
+    except Exception as exc:
+        logger.error(f'素材替换：重新生成 assets.py 失败（{cause!r}），撤销 {replacement.shown} 也失败了：{exc!r}')
+        return
+    done = '已还原' if previous is not None else '已删掉新写的'
+    logger.warning(f'素材替换：重新生成 assets.py 失败（{cause!r}），{done} {replacement.shown}')
 
 
 def replace_image(task: str, json_relpath: str, image_name: str, content_base64: str, root: Path | None = None,
@@ -696,7 +734,8 @@ def replace_image(task: str, json_relpath: str, image_name: str, content_base64:
     写入先把解码后的图片按目标后缀重新编码（不是原样落盘），写进同目录的临时文件再 os.replace，原图要么整张换掉要么不动；
     目标文件原来不存在（json 里有、磁盘上缺的图）就是新建。
     regenerate 不传就用默认的（见 _default_regenerate，当前目录不是仓库根时在写盘之前抛 RuntimeError）。regenerate 自己出错时
-    图已经换上了，异常照常往外抛，不回滚。
+    先把图还原（原来的字节原样写回，原来没有就删掉，连同为它新建的目录），再把异常照常往外抛，失败的替换在磁盘上什么都不留；
+    还原也失败时记一条错误日志，抛出的仍是 regenerate 的异常（见 _apply_replacement）。
     持有 MERGE_LOCK 做完整个替换；别处正在合并或保存、或仓库里有没做完的合并时抛 WriteRefused，什么都不改。
     """
     repo = _repo_root(root)
@@ -816,7 +855,8 @@ def replace_and_commit(task: str, json_relpath: str, image_name: str, content_ba
     落盘之前的检查同 replace_image（仓库是 runner.repo），全部在碰 git 和磁盘之前做完，不通过照样抛异常（ValueError，默认重新生成
     对当前目录的检查是 RuntimeError）。之后走 commit_and_push 的流程（见 _commit_and_push）：拉取 fork → fork 领先或分叉就拒绝，
     图不写 → 写图并重新生成 assets.py → 提交 → 推送。replaced 只在写图和重新生成都做完时为真：正在合并或保存、仓库里有没做完的
-    合并、fork 领先或分叉时 replaced 为假，什么都没写，原因在 error 里。提交说明是"素材维护：替换 <target>"，历史里能看出换的是哪张图。
+    合并、fork 领先或分叉时 replaced 为假，什么都没写，原因在 error 里。重新生成出错时同 replace_image：图还原，什么都不提交，
+    异常照常往外抛（没有返回值）。提交说明是"素材维护：替换 <target>"，历史里能看出换的是哪张图。
     uncommitted 是提交推送之后、放锁之前 git status 对这张图的看法（不看 error 的文字），replaced 为假时一律为假。写下之后提交失败时
     它为真，图留在工作区没提交，"提交并推送"可以重试。传上来的图和已提交的一样时没有新的提交：commit 为 None、uncommitted 为假，
     这时的 error（推送、拉取失败）和 pushed 说的是之前没推上去的提交。推送失败时提交留在本地，同样可以重试。
