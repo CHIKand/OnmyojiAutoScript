@@ -301,24 +301,30 @@ def repo(seed_repo, tmp_path, monkeypatch) -> Repo:
 # ASGI：不起服务器，直接调一次 app
 # ------------------------------------------------------------------------------------------------------------------
 
-def http_get(app, path: str, query: str = '') -> tuple[int, dict[str, str], bytes]:
-    """按 ASGI 直接调一次 GET，返回 (状态码, 响应头（键小写）, 响应体)。"""
+def http_request(app, method: str, path: str, query: str = '', body: bytes = b'',
+                 headers: dict[str, str] | None = None) -> tuple[int, dict[str, str], bytes]:
+    """按 ASGI 直接调一次 app，返回 (状态码, 响应头（键小写）, 响应体)。"""
     messages = []
 
     async def receive():
-        return {'type': 'http.request', 'body': b'', 'more_body': False}
+        return {'type': 'http.request', 'body': body, 'more_body': False}
 
     async def send(message):
         messages.append(message)
 
-    scope = {'type': 'http', 'asgi': {'version': '3.0'}, 'http_version': '1.1', 'method': 'GET', 'scheme': 'http',
+    raw_headers = [(key.lower().encode('latin-1'), value.encode('latin-1')) for key, value in (headers or {}).items()]
+    scope = {'type': 'http', 'asgi': {'version': '3.0'}, 'http_version': '1.1', 'method': method, 'scheme': 'http',
              'path': path, 'raw_path': path.encode('utf-8'), 'root_path': '', 'query_string': query.encode('ascii'),
-             'headers': [], 'client': ('127.0.0.1', 50000), 'server': ('127.0.0.1', 80)}
+             'headers': raw_headers, 'client': ('127.0.0.1', 50000), 'server': ('127.0.0.1', 80)}
     asyncio.run(app(scope, receive, send))
     start = next(message for message in messages if message['type'] == 'http.response.start')
-    body = b''.join(message.get('body', b'') for message in messages if message['type'] == 'http.response.body')
-    headers = {key.decode('latin-1').lower(): value.decode('latin-1') for key, value in start['headers']}
-    return start['status'], headers, body
+    payload = b''.join(message.get('body', b'') for message in messages if message['type'] == 'http.response.body')
+    response_headers = {key.decode('latin-1').lower(): value.decode('latin-1') for key, value in start['headers']}
+    return start['status'], response_headers, payload
+
+
+def http_get(app, path: str, query: str = '') -> tuple[int, dict[str, str], bytes]:
+    return http_request(app, 'GET', path, query)
 
 
 @pytest.fixture
@@ -695,6 +701,76 @@ def test_failed_export_is_400_and_leaves_nothing_behind(repo, monkeypatch, tmp_p
     assert (error.status_code, error.detail['code']) == (400, 'invalid_request')
     assert '仓库里没有这个提交' in error.detail['message']
     assert len(made) <= 1 and not any(path.exists() for path in made)
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# 保存类接口只接受同源请求
+# ------------------------------------------------------------------------------------------------------------------
+
+HOST = '127.0.0.1:22267'
+CROSS_ORIGIN = {'detail': {'code': 'cross_origin', 'message': '只接受素材维护页发出的保存请求'}}
+WRITE_ENDPOINTS = [
+    ('PUT', '/custom/assets/tags', {'Foo': {}}, 'commit_tags'),
+    ('POST', '/custom/assets/Foo/replace-image', {'json_relpath': 'as/image.json', 'image_name': 'a.png',
+                                                  'content_base64': 'x'}, 'replace_and_commit'),
+    ('POST', '/custom/assets/Foo/commit-push', {'message': ''}, 'commit_and_push'),
+]
+WRITE_IDS = ['tags', 'replace-image', 'commit-push']
+
+
+@pytest.fixture
+def recorded_writes(monkeypatch) -> list[str]:
+    """三个保存类接口背后的业务函数和 _runner_and_branch 都换成记录器：只记下被调了哪个，不碰 git 和磁盘。"""
+    calls = []
+
+    def runner_and_branch():
+        calls.append('_runner_and_branch')
+        return GitRunner('git', Path('.')), 'custom'
+
+    def recorder(name):
+        def record(*args, **kwargs):
+            calls.append(name)
+            return {'commit': None, 'pushed': False, 'error': ''}
+        return record
+
+    monkeypatch.setattr(assets_check_router, '_runner_and_branch', runner_and_branch)
+    for name in ('commit_tags', 'replace_and_commit', 'commit_and_push'):
+        monkeypatch.setattr(assets_check, name, recorder(name))
+    return calls
+
+
+def send_write(app, method: str, path: str, body: dict, origin: str | None) -> tuple[int, dict]:
+    headers = {'host': HOST, 'content-type': 'application/json'}
+    if origin is not None:
+        headers['origin'] = origin
+    status, _, payload = http_request(app, method, path, body=json.dumps(body).encode('utf-8'), headers=headers)
+    return status, json.loads(payload)
+
+
+@pytest.mark.parametrize('method, path, body, business', WRITE_ENDPOINTS, ids=WRITE_IDS)
+@pytest.mark.parametrize('origin', [None, f'http://{HOST}'], ids=['no-origin', 'same-origin'])
+def test_writes_from_the_page_or_without_origin_are_accepted(app, recorded_writes, method, path, body, business,
+                                                             origin):
+    """本页（同源）的请求带着 Origin，OASX、curl 不带：都放行。"""
+    status, payload = send_write(app, method, path, body, origin)
+    assert (status, payload) == (200, {'commit': None, 'pushed': False, 'error': ''})
+    assert recorded_writes == ['_runner_and_branch', business]
+
+
+@pytest.mark.parametrize('method, path, body, business', WRITE_ENDPOINTS, ids=WRITE_IDS)
+@pytest.mark.parametrize('origin', ['http://evil.example', 'http://127.0.0.1:8080', 'null'],
+                         ids=['other-host', 'other-port', 'opaque'])
+def test_cross_origin_writes_are_refused_before_anything_runs(app, recorded_writes, method, path, body, business,
+                                                              origin):
+    """别的网页借浏览器发来的保存请求（Origin 的 host[:port] 与 Host 不同）：403，一个业务函数都不调。"""
+    assert send_write(app, method, path, body, origin) == (403, CROSS_ORIGIN)
+    assert recorded_writes == []
+
+
+def test_reads_do_not_check_the_origin(app, root):
+    status, _, payload = http_request(app, 'GET', '/custom/assets/tags',
+                                      headers={'host': HOST, 'origin': 'http://evil.example'})
+    assert (status, json.loads(payload)) == (200, {})
 
 
 # ------------------------------------------------------------------------------------------------------------------

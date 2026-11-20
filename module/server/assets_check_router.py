@@ -10,6 +10,7 @@
 要 git 的接口（保存标签、上传替换、提交并推送、导出补丁）每次请求经 _runner_and_branch 现取运行目录的 git 和 fork 分支，
 做法同 M3a 的 ForkUpdater()（部署配置里的 GitExecutable、Branch，仓库是当前目录）；测试换掉这个函数，不构造 DeployConfig。
 上传替换换完图立刻提交并推送（assets_check.replace_and_commit），换下的图不留在运行目录里等启动器还原。
+保存类接口（保存标签、上传替换、提交并推送）只接受同源请求：带 Origin 头而 host[:port] 与 Host 头不同的回 403，见 _same_origin_only。
 
 错误一律回 {"detail": {"code", "message"}}，同标注工具：ValueError 回 400；WriteRefused（正在合并或保存、仓库里有没做完的合并）
 回 409，按类判断，别的 RuntimeError 不算"忙"；标注工具的 AnnotatorError 回它自己的状态码；其余异常回 500，消息是异常的说明，
@@ -25,8 +26,9 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
@@ -42,6 +44,7 @@ WEB_DIR = Path(__file__).resolve().parent / 'web' / 'assets_check'
 STATIC_PREFIX = '/custom/assets/static'
 EMPTY_SCREEN_HINT = '所选画面没有已标注的图片或 OCR 条目'
 COMMIT_FIRST_TEXT = '先提交，再导出补丁包'
+CROSS_ORIGIN_TEXT = '只接受素材维护页发出的保存请求'
 EXPORT_DIR_PREFIX = 'oas-assets-patch-'
 
 assets_api = APIRouter(prefix='/custom/assets')
@@ -82,6 +85,22 @@ def _runner_and_branch() -> tuple[GitRunner, str]:
 
 def _http_error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail={'code': code, 'message': message})
+
+
+def _same_origin_only(request: Request) -> None:
+    """保存类接口（保存标签、上传替换、提交并推送）的前置检查：请求带 Origin 头、它的 host[:port] 又和请求的 Host 头不一样时
+    回 403，接口本身不执行。上游 app.py 默认监听 0.0.0.0、CORS 对所有来源开放，用户打开的任何网页都能让浏览器向本机服务发
+    请求，这几个接口会用运行目录里的凭据往 fork 推送；浏览器给这类请求带上发起页面的 Origin，据此拦下。本页同源，Origin 与
+    Host 一致；OASX、curl 不带 Origin，放行。不透明来源（Origin: null）也拦。"""
+    origin = request.headers.get('origin')
+    if origin is None:
+        return
+    origin_host = urlsplit(origin).netloc.lower()
+    if not origin_host or origin_host != request.headers.get('host', '').lower():
+        raise _http_error(403, 'cross_origin', CROSS_ORIGIN_TEXT)
+
+
+SAME_ORIGIN_ONLY = [Depends(_same_origin_only)]
 
 
 @contextmanager
@@ -129,7 +148,7 @@ def get_tags() -> dict:
         return assets_check.load_tags()
 
 
-@assets_api.put('/tags')
+@assets_api.put('/tags', dependencies=SAME_ORIGIN_ONLY)
 def put_tags(tags: dict) -> dict:
     """整份写回标签文件，立刻提交并推送到 fork。返回 {'commit', 'pushed', 'error'}，失败原因在 error 里。"""
     with _mapped_errors('保存标签'):
@@ -151,7 +170,7 @@ def post_screen_check(task: str, body: ScreenCheckBody) -> dict:
     return {'results': results, 'hint': '' if results else EMPTY_SCREEN_HINT}
 
 
-@assets_api.post('/{task}/replace-image')
+@assets_api.post('/{task}/replace-image', dependencies=SAME_ORIGIN_ONLY)
 def post_replace_image(task: str, body: ReplaceImageBody) -> dict:
     """用上传的图片替换素材图、重新生成 assets.py，立刻提交并推送到 fork。返回
     {'target', 'replaced', 'commit', 'pushed', 'error'}，没替换成或没推上去的原因在 error 里；参数不对回 400。"""
@@ -161,7 +180,7 @@ def post_replace_image(task: str, body: ReplaceImageBody) -> dict:
                                                branch)
 
 
-@assets_api.post('/{task}/commit-push')
+@assets_api.post('/{task}/commit-push', dependencies=SAME_ORIGIN_ONLY)
 def post_commit_push(task: str, body: CommitPushBody) -> dict:
     """提交 tasks/<task> 下的改动并推送到 fork。返回 {'commit', 'pushed', 'error'}，失败原因在 error 里。"""
     with _mapped_errors('提交并推送'):
