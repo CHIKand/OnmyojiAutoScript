@@ -31,7 +31,8 @@
 - credentials：取 token 的接口回了其余非 0 code，或回了没有 code 的 4xx。
 - rejected：其他接口回了其余非 0 code，或回了没有 code 的 4xx。
 带 token 的请求遇到 token 错误码时，作废缓存的 token，重新取一个，原请求重发一次。每个请求都带超时 (5, 10) 秒。
-异常消息只含接口名、HTTP 状态码、code、msg 和网络异常的说明，不含 app secret 和 token。
+异常消息只含接口名、HTTP 状态码、code、msg 和网络异常的说明，不含 app secret 和 token。网络异常不串联 requests 的
+原异常；本模块各帧的局部变量里也不留 app secret 和 token。项目日志会渲染 traceback 里的局部变量，记日志的规矩见 FeishuError。
 """
 import json
 import os
@@ -68,6 +69,10 @@ class FeishuError(Exception):
 
     kind 是失败的类别：'network'、'transient'、'credentials'、'rejected'，含义见模块文档。
     code、msg 是飞书响应里的原值，响应里没有就是 None、''。
+
+    记日志只记 str(e)，不带 traceback（不用 logger.exception，也不传 exc_info）：项目日志的 handler 开着
+    tracebacks_show_locals，会把 traceback 里每一帧的局部变量写进日志。本模块的帧已保证不含 app secret 和 token，
+    调用方的帧未必（比如读进局部变量的 FEISHU_APP_SECRET）。本模块抛出的其他意外异常也照此处理。
     """
 
     def __init__(self, kind: str, message: str, code: int | None = None, msg: str = ''):
@@ -131,10 +136,18 @@ class FeishuClient:
         self._token_deadline = 0.0
 
     def tenant_token(self) -> str:
-        """返回 tenant_access_token。缓存到过期前 TOKEN_MARGIN 秒（expire 是取到时的剩余秒数），之后重新取。"""
-        token = self._token            # 只读一次：别的线程可能正把它作废成 None
-        if token is not None and self._clock() < self._token_deadline:
-            return token
+        """返回 tenant_access_token。缓存到过期前 TOKEN_MARGIN 秒（expire 是取到时的剩余秒数），之后重新取。
+
+        本帧不留 token 局部变量：重新取的时候抛异常，这一帧也在 traceback 里。
+        """
+        return self._cached_token() or self._fetch_token()
+
+    def _cached_token(self) -> str | None:
+        """缓存里还没到期的 token，没有就是 None。self._token 只读一次：别的线程可能正把它作废成 None。"""
+        token = self._token
+        return token if token is not None and self._clock() < self._token_deadline else None
+
+    def _fetch_token(self) -> str:
         self._token = None
         resp = self._send('取 token', 'post', TOKEN_PATH,
                           json={'app_id': self.app_id, 'app_secret': self._app_secret}, headers=JSON_HEADERS)
@@ -144,6 +157,7 @@ class FeishuClient:
             raise FeishuError(kind, _describe('取 token', kind, resp.status_code, code, msg), code, msg)
         token, expire = body.get('tenant_access_token'), body.get('expire')
         if not isinstance(token, str) or not token or not _is_int(expire):
+            body = token = None        # 响应里可能有 token：清掉再抛，不留在 traceback 的局部变量里
             raise FeishuError('transient', '飞书取 token 失败（transient）：响应缺少 tenant_access_token 或 expire',
                               code, msg)
         self._token_deadline = self._clock() + expire - TOKEN_MARGIN
@@ -215,16 +229,24 @@ class FeishuClient:
         raise FeishuError(kind, _describe(action, kind, resp.status_code, code, msg), code, msg)
 
     def _send_with_token(self, action: str, method: str, path: str, headers: dict | None, kwargs: dict):
-        headers = {**(headers or {}), 'Authorization': f'Bearer {self.tenant_token()}'}
-        resp = self._send(action, method, path, headers=headers, **kwargs)
+        """带上 token 发一次请求，返回 (响应, 响应体, code, msg)。带 token 的请求头直接写在参数里，不绑定到局部变量：
+        _send 抛异常时，这一帧也在 traceback 里。"""
+        resp = self._send(action, method, path,
+                          headers={**(headers or {}), 'Authorization': f'Bearer {self.tenant_token()}'}, **kwargs)
         return (resp, *_parse(resp))
 
     def _send(self, action: str, method: str, path: str, **kwargs):
-        """发一个请求（带超时），返回响应；requests 抛的异常转成 kind 为 network 的 FeishuError。"""
+        """发一个请求（带超时），返回响应。requests 抛的异常（连接失败、超时等）换成 kind 为 network 的 FeishuError。
+
+        kwargs 里有取 token 请求体里的 app secret，或请求头里的 token。所以先清空 kwargs，在 except 外面抛出，
+        不串联原异常：requests、urllib3 那几帧的局部变量里同样带着请求体和请求头。原异常的类型和说明写进消息。
+        """
         try:
             return getattr(self.session, method)(self.base + path, timeout=TIMEOUT, **kwargs)
         except requests.RequestException as exc:
-            raise FeishuError('network', f'飞书{action}失败（network）：{type(exc).__name__}: {exc}') from exc
+            failure = f'飞书{action}失败（network）：{type(exc).__name__}: {exc}'
+        kwargs.clear()
+        raise FeishuError('network', failure)
 
 
 _stamp_lock = threading.Lock()

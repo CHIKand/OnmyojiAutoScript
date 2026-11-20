@@ -4,6 +4,7 @@
 文件只写 tmp_path。logger 换成 LogSpy（自动夹具），不往真日志里写。token 缓存用假时钟，合并器直接传 now。
 """
 import copy
+import io
 import json
 import threading
 from datetime import datetime
@@ -12,6 +13,8 @@ from urllib.parse import urlsplit
 
 import pytest
 import requests
+from rich.console import Console
+from rich.traceback import Traceback
 
 from module.notify import feishu_app
 from module.notify.feishu_app import Aggregator, FeishuClient, FeishuError, Outbox
@@ -63,7 +66,7 @@ class FakeSession:
         queue = self.replies[path]
         reply = queue.pop(0) if len(queue) > 1 else queue[0]
         if isinstance(reply, BaseException):
-            raise reply
+            raise reply.with_traceback(None)            # 同一个异常对象会被多个用例抛出：每次从头记 traceback
         return reply if isinstance(reply, FakeResponse) else FakeResponse(200, reply)
 
     def post(self, url, **kwargs):
@@ -346,7 +349,8 @@ def test_connection_errors_and_timeouts_are_network_errors(exc, where):
     else:
         err, session = send_error(exc)
     assert (err.kind, err.code, err.msg) == ('network', None, '')
-    assert err.__cause__ is exc
+    assert err.__cause__ is None and err.__context__ is None        # 不串联：requests 那几帧的局部变量里有请求体和请求头
+    assert f'{type(exc).__name__}: {exc}' in str(err)               # 原异常的类型和说明照样在消息里
 
 
 @pytest.mark.parametrize('reply', [
@@ -436,6 +440,66 @@ def test_the_app_secret_never_shows_in_an_error_a_log_or_a_repr(reply, log):
     texts = [str(info.value), repr(info.value), repr(client)] + [message for _, message in log.records]
     assert not any(SECRET in text for text in texts)
     assert session.calls[0]['json']['app_secret'] == SECRET        # 只进取 token 的请求体
+
+
+# ---- 客户端：带局部变量的 traceback ----------------------------------------------------------------------------
+# 项目日志的两个 handler 都是 RichHandler(rich_tracebacks=True, tracebacks_show_locals=True)（module/logger.py），
+# logger.exception 会把 traceback 里每一帧的局部变量写进日志。这里照那样渲染 FeishuClient 抛出的异常，四个调用、
+# 每种失败都查一遍：渲染结果里不能有 app secret，也不能有 token（包括刚作废或已过期的旧 token）。
+
+TOKEN_VALUE = 't-g1047cFAKEtoken0001'                               # 足够独特，在渲染结果里搜不会误中
+NEW_TOKEN_VALUE = 't-g1047cFAKEtoken0002'
+REFUSED = requests.ConnectionError('connection refused')
+STALE = FakeResponse(400, {'code': 99991663, 'msg': 'Invalid access token'})
+CALLS = {
+    'tenant_token': lambda client: client.tenant_token(),
+    'upload_image': lambda client: client.upload_image(PNG),
+    'send_post': send,
+    'list_chats': lambda client: client.list_chats(),
+}
+API_OF = {'upload_image': IMAGES, 'send_post': MESSAGES, 'list_chats': CHATS}
+TOKEN_STEP_FAILS = {                                                # 取 token 这一步失败：四个调用都会走到
+    'token-network': [REFUSED],
+    'token-credentials': [{'code': 10014, 'msg': 'app id not exists'}],
+    'token-without-expire': [{'code': 0, 'msg': 'ok', 'tenant_access_token': TOKEN_VALUE}],
+    'expired-token-then-network': [token_reply(TOKEN_VALUE), REFUSED],    # 先取到一个，过期后重取时断网
+}
+API_STEP_FAILS = {                                                  # 业务接口这一步失败：(取 token 的回复, 业务接口的回复)
+    'api-network': ([token_reply(TOKEN_VALUE)], [REFUSED]),
+    'api-rejected': ([token_reply(TOKEN_VALUE)], [FakeResponse(400, {'code': 230002, 'msg': 'Bot is not in the chat'})]),
+    'api-token-error-twice': ([token_reply(TOKEN_VALUE), token_reply(NEW_TOKEN_VALUE)], [STALE]),
+    'api-token-error-then-network': ([token_reply(TOKEN_VALUE), REFUSED], [STALE]),
+}
+
+
+def rendered(err: BaseException) -> str:
+    """按项目日志的方式渲染异常：rich traceback，带每一帧的局部变量。控制台足够宽，长行不折断，搜字符串不会漏。"""
+    console = Console(file=io.StringIO(), width=500, no_color=True, highlight=False)
+    console.print(Traceback.from_exception(type(err), err, err.__traceback__, width=500, show_locals=True))
+    return console.file.getvalue()
+
+
+@pytest.mark.parametrize('scenario, call', [(s, c) for s in TOKEN_STEP_FAILS for c in CALLS]
+                         + [(s, c) for s in API_STEP_FAILS for c in API_OF])
+def test_a_traceback_logged_with_locals_shows_neither_the_secret_nor_a_token(scenario, call):
+    # 本帧是 traceback 的最外层，它的局部变量也会被渲染：回复表放在模块级，这里不绑定任何含密钥或 token 的值
+    clock = FakeClock()
+    session = FakeSession()
+    if scenario in TOKEN_STEP_FAILS:
+        session.on(TOKEN, *TOKEN_STEP_FAILS[scenario])
+    else:
+        session.on(TOKEN, *API_STEP_FAILS[scenario][0]).on(API_OF[call], *API_STEP_FAILS[scenario][1])
+    client = make_client(session, clock=clock)
+    if scenario == 'expired-token-then-network':
+        client.tenant_token()
+        clock.now += 7200
+    with pytest.raises(FeishuError) as info:
+        CALLS[call](client)
+    text = rendered(info.value)
+    assert 'locals' in text                                         # 确实带着局部变量渲染了
+    assert SECRET not in text
+    assert TOKEN_VALUE not in text
+    assert NEW_TOKEN_VALUE not in text
 
 
 # ---- 客户端：群列表 ------------------------------------------------------------------------------------------
