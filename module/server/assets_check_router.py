@@ -173,7 +173,7 @@ def post_screen_check(task: str, body: ScreenCheckBody) -> dict:
 @assets_api.post('/{task}/replace-image', dependencies=SAME_ORIGIN_ONLY)
 def post_replace_image(task: str, body: ReplaceImageBody) -> dict:
     """用上传的图片替换素材图、重新生成 assets.py，立刻提交并推送到 fork。返回
-    {'target', 'replaced', 'commit', 'pushed', 'error'}，没替换成或没推上去的原因在 error 里；参数不对回 400。"""
+    {'target', 'replaced', 'uncommitted', 'commit', 'pushed', 'error'}，没替换成或没推上去的原因在 error 里；参数不对回 400。"""
     with _mapped_errors('替换图片'):
         runner, branch = _runner_and_branch()
         return assets_check.replace_and_commit(task, body.json_relpath, body.image_name, body.content_base64, runner,
