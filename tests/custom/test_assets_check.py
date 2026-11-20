@@ -129,7 +129,7 @@ def test_issue_is_frozen_dataclass():
         issue.kind = 'json_error'
 
 
-@pytest.mark.parametrize('name', ['../etc', 'Component', 'a/b', 'a\\b', '', '.', '..', 'Missing', 'foo', '__pycache__',
+@pytest.mark.parametrize('name', ['../etc', 'Component/Sub', 'a/b', 'a\\b', '', '.', '..', 'Missing', 'foo', '__pycache__',
                                   '.hidden', 'Foo/..', None])
 def test_unknown_task_rejected(root, name):
     (root / 'tasks' / 'Foo').mkdir(parents=True)
@@ -157,10 +157,18 @@ def test_list_tasks_default_pair_and_all(root):
     for name in ('Foo', 'ActivityShikigami', 'Component', '__pycache__'):
         (root / 'tasks' / name).mkdir(parents=True)
     (root / 'tasks' / 'base_task.py').write_text('', encoding='utf-8')       # 文件不是任务
-    assert list_tasks(all_tasks=True, root=root) == ['ActivityShikigami', 'Foo']
+    assert list_tasks(all_tasks=True, root=root) == ['ActivityShikigami', 'Component', 'Foo']
     assert list_tasks(root=root) == ['ActivityShikigami']        # 默认只列还存在的默认任务（MetaDemon 目录不在）
     (root / 'tasks' / 'MetaDemon').mkdir()
     assert list_tasks(root=root) == ['ActivityShikigami', 'MetaDemon']
+
+
+def test_component_is_one_task(root):
+    """同标注工具：组件的容器目录 tasks/Component 整个算一个任务，json 的相对路径是 <组件>/x.json。"""
+    (root / 'tasks' / 'Component' / 'Sub').mkdir(parents=True)
+    assert task_root('Component', root=root) == (root / 'tasks' / 'Component').resolve()
+    assert 'Component' in list_tasks(all_tasks=True, root=root)
+    assert 'Component' not in list_tasks(root=root)
 
 
 def test_list_tasks_without_tasks_directory(root):
@@ -511,6 +519,88 @@ def test_empty_task_is_compared_with_the_pass_placeholder(root, monkeypatch):
 
 
 # ------------------------------------------------------------------------------------------------------------------
+# 组件（tasks/Component）：一个任务，每个组件各编各的 assets.py
+# ------------------------------------------------------------------------------------------------------------------
+
+def test_component_rules_are_listed_relative_to_the_container(root):
+    put_json(root, 'tasks/Component/A/image.json', [image_rule('x')])
+    put_json(root, 'tasks/Component/B/sub/ocr.json', [ocr_rule('o')])
+    rules = list_rules('Component', root=root)
+    assert [(rule['file'], rule['rule_type']) for rule in rules] == [('A/image.json', 'image'), ('B/sub/ocr.json', 'ocr')]
+
+
+def test_component_duplicates_are_scoped_per_component(root):
+    """同名属性在不同组件里不冲突（各编进自己的 assets.py）；同一个组件里的两个文件才冲突。"""
+    put_json(root, 'tasks/Component/A/image.json', [image_rule('x'), image_rule('y')])
+    put_json(root, 'tasks/Component/A/sub/image.json', [image_rule('y')])
+    put_json(root, 'tasks/Component/B/image.json', [image_rule('x')])
+    for relpath in ('A/x.png', 'A/y.png', 'A/sub/y.png', 'B/x.png'):
+        put_image(root, f'tasks/Component/{relpath}')
+    duplicates = [issue for issue in static_check('Component', root=root) if issue.kind == 'duplicate_item']
+    assert sorted((issue.file, issue.item) for issue in duplicates) == [('A/image.json', 'y'), ('A/sub/image.json', 'y')]
+
+
+@pytest.fixture
+def components(root, monkeypatch):
+    """四个组件，当前目录已切到 root：A、B 有 json、图和刚生成的 assets.py；C 是空目录（没有 json，也没有 assets.py）；
+    E 只有 assets.py（没有 json 时的 pass 占位，同真实的 BaseActivity）。"""
+    monkeypatch.chdir(root)
+    for name in ('A', 'B'):
+        put_json(root, f'tasks/Component/{name}/image.json', [image_rule(f'{name.lower()}1')])
+        put_image(root, f'tasks/Component/{name}/{name.lower()}1.png')
+    (root / 'tasks/Component/C').mkdir()
+    (root / 'tasks/Component/E').mkdir()
+    for name in ('A', 'B', 'E'):
+        generate_assets(root, f'Component/{name}')
+    return root
+
+
+def test_component_assets_are_checked_per_component(components):
+    root = components
+    assert static_check('Component', root=root) == []                  # 各组件的 assets.py 都对得上，空目录 C 也不报
+    assert not (root / 'tasks/Component/assets.py').exists()           # 容器目录自己没有、也不该有 assets.py
+
+    put_json(root, 'tasks/Component/B/image.json', [image_rule('b1'), image_rule('b2')])
+    put_image(root, 'tasks/Component/B/b2.png')
+    put_json(root, 'tasks/Component/D/image.json', [image_rule('d1')])     # 新组件，还没生成 assets.py
+    put_image(root, 'tasks/Component/D/d1.png')
+
+    issues = static_check('Component', root=root)
+
+    assert [(issue.kind, issue.file) for issue in issues] == [('assets_outdated', 'B/assets.py'),
+                                                              ('assets_outdated', 'D/assets.py')]
+    assert 'I_B2' in issues[0].detail and '不存在' in issues[1].detail
+
+
+def test_component_json_error_skips_only_that_component(components):
+    root = components
+    put_text(root, 'tasks/Component/A/broken.json', '{')
+    (root / 'tasks/Component/B/assets.py').write_bytes(b'# stale\n')
+    issues = static_check('Component', root=root)
+    assert [(issue.kind, issue.file) for issue in issues] == [('json_error', 'A/broken.json'),
+                                                              ('assets_outdated', 'B/assets.py')]
+
+
+def test_component_trial_generation_failure_names_the_component(components):
+    root = components
+    broken = image_rule('a2')
+    del broken['roiBack']                                            # AssetsExtractor 取 item["roiBack"] 会抛 KeyError
+    put_json(root, 'tasks/Component/A/more.json', [broken])
+    put_image(root, 'tasks/Component/A/a2.png')
+    issues = static_check('Component', root=root)
+    assert [(issue.kind, issue.file) for issue in issues] == [('json_error', 'A')]
+    assert '试生成' in issues[0].detail and 'roiBack' in issues[0].detail
+
+
+def test_component_json_directly_under_the_container_is_left_out(components):
+    """直接放在 tasks/Component 下的 json 不属于任何组件，不会编进哪个 assets.py（标注工具也拒绝保存它）：清单、检查都不收。"""
+    root = components
+    put_json(root, 'tasks/Component/loose.json', [image_rule('loose')])        # 图也不存在
+    assert 'loose.json' not in [rule['file'] for rule in list_rules('Component', root=root)]
+    assert static_check('Component', root=root) == []
+
+
+# ------------------------------------------------------------------------------------------------------------------
 # 真实仓库
 # ------------------------------------------------------------------------------------------------------------------
 
@@ -521,6 +611,13 @@ def test_real_activity_missing_images(monkeypatch):
     assert {issue.item for issue in missing} == {'pass_8', 'pass_10', 'pass_11'}
     assert {issue.file for issue in missing} == {'fire/image.json'}
 
+
+def test_real_component_assets_match_their_json(monkeypatch):
+    """真实的 tasks/Component：json 都能解析，每个组件的 assets.py 都与试生成的结果一致（各组件分开比对）。"""
+    monkeypatch.chdir(REPO_ROOT)
+    issues = static_check('Component')
+    assert [issue for issue in issues if issue.kind in ('json_error', 'assets_outdated')] == []
+    assert all('/' in issue.file for issue in issues)              # 文件都写成 <组件>/...，同标注工具
 
 # 计划（M3b Task 1 Step 3）里的爬塔标签表：(json 文件, 画面, periodic, 条目；None 表示该文件全部条目)
 TOWER_TAGS = [

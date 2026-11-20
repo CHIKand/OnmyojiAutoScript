@@ -5,6 +5,8 @@
 
 清单和检查看到的 json，与 dev_tools/assets_extract.py 编进 assets.py 的完全一致：直接用 AssetsExtractor.all_json_file，
 连它对路径里 temp 的过滤也照搬。所以清单里有的条目，assets.py 里就该有对应的属性。
+tasks/Component 同标注工具整个算一个任务（json 相对路径是 <组件>/x.json），但每个组件各编各的 assets.py：重名、assets.py 比对、
+换图后的重新生成都按组件目录分开做（见 _extract_root）。
 assets.py 与 json 是否一致靠"试生成"判断：继承 AssetsExtractor，只把写盘的 write_file 换成空操作，其余全走 extract 自己的流程，
 再和磁盘上的 assets.py 比对。AssetsExtractor 按当前目录算图片的相对路径，所以当前目录不是 root 时不比对，只记一条警告。
 不在服务进程里 os.chdir：进程是各线程共用的。
@@ -38,7 +40,7 @@ from module.server.fork_git import (FORK_REMOTE, GitRunner, _count, _fetch, _for
                                     push)
 
 DEFAULT_TASKS = ('ActivityShikigami', 'MetaDemon')      # 页面默认只列这两个限时活动，可以切换成全部任务
-CONTAINER_TASK = 'Component'                            # 组件的容器目录，素材在 Component/<组件>/ 里，它自己不是任务
+CONTAINER_TASK = 'Component'                            # 组件的容器目录：整个算一个任务，每个组件 Component/<组件> 各编各的 assets.py
 UNCLASSIFIED = '未分类'
 SCREENS = ('活动主页', '普通挑战页', 'Boss挑战页', '战斗中', '退出时', UNCLASSIFIED)
 EXTRA_SCREENS = {'MetaDemon': ('超鬼王主页', '超鬼王战斗', '合成页')}     # 个别任务多出来的画面
@@ -66,7 +68,8 @@ class Issue:
     """静态检查发现的一个问题。
 
     kind：missing_image / json_error / duplicate_item / roi_out_of_bounds / assets_outdated。
-    file：json 相对任务目录的路径（正斜杠）；assets_outdated 是 assets.py；不针对某个文件时为空（试生成失败的 json_error）。
+    file：json 相对任务目录的路径（正斜杠），Component 的是 <组件>/...；assets_outdated 是 assets.py（组件是 <组件>/assets.py）；
+    试生成失败的 json_error 不针对某个文件，普通任务为空，组件是组件目录名。
     item：条目名；不针对某个条目时为空，列表文件整体的问题用它顶层的 name。
     detail：给人看的说明。
     """
@@ -85,23 +88,24 @@ def _repo_root(root: Path | None) -> Path:
 
 
 def list_tasks(all_tasks: bool = False, root: Path | None = None) -> list[str]:
-    """可以做素材维护的任务名：tasks/ 下的一层子目录，不含 Component（容器目录）和以 . 或 _ 开头的（__pycache__ 之类）。
+    """可以做素材维护的任务名：tasks/ 下的一层子目录，不含以 . 或 _ 开头的（__pycache__ 之类）。
 
+    Component 同标注工具，整个算一个任务（json 的相对路径是 <组件>/x.json），见 _extract_root。
     all_tasks 为假时只留 DEFAULT_TASKS 里目录还在的，顺序同 DEFAULT_TASKS；为真时是全部，按名字排序。
     """
     tasks_dir = _repo_root(root) / 'tasks'
     if not tasks_dir.is_dir():
         return []
     names = sorted(entry.name for entry in tasks_dir.iterdir()
-                   if entry.is_dir() and entry.name != CONTAINER_TASK and not entry.name.startswith(('.', '_')))
+                   if entry.is_dir() and not entry.name.startswith(('.', '_')))
     return names if all_tasks else [name for name in DEFAULT_TASKS if name in names]
 
 
 def task_root(task: str, root: Path | None = None) -> Path:
     """任务目录 root/tasks/<task>。
 
-    task 必须是 list_tasks 列得出来的名字：路径穿越（../etc）、Component、带路径分隔符的名字、不存在的目录都抛 ValueError，
-    HTTP 接口据此回 4xx。拿目录清单当白名单比对，而不是拼路径再检查，名字里的任何花样都进不来。
+    task 必须是 list_tasks 列得出来的名字：路径穿越（../etc）、带路径分隔符的名字（Component/<组件> 也不行）、不存在的目录
+    都抛 ValueError，HTTP 接口据此回 4xx。拿目录清单当白名单比对，而不是拼路径再检查，名字里的任何花样都进不来。
     """
     if task not in list_tasks(all_tasks=True, root=root):
         raise ValueError(f'未知任务：{task!r}')
@@ -186,10 +190,24 @@ def _relpath(path: Path, task_dir: Path) -> str:
     return path.relative_to(task_dir).as_posix()
 
 
+def _extract_root(task_dir: Path, json_file: Path) -> Path | None:
+    """json_file 编进哪个目录的 assets.py（AssetsExtractor 的 task_path）。
+
+    普通任务是任务目录本身。Component 是 json 所在的组件目录 tasks/Component/<组件>（同标注工具的
+    _resolve_assets_extract_target，上游的 AllAssetsExtractor 也是一个组件一个 assets.py）；直接放在 tasks/Component 下的 json
+    不属于任何组件，不会编进哪个 assets.py，标注工具也拒绝保存它，返回 None。
+    """
+    if task_dir.name != CONTAINER_TASK:
+        return task_dir
+    parts = json_file.relative_to(task_dir).parts
+    return task_dir / parts[0] if len(parts) > 1 else None
+
+
 def _json_files(task_dir: Path) -> list[Path]:
-    """AssetsExtractor 会编进 assets.py 的 json 文件，按相对路径排序。"""
+    """AssetsExtractor 会编进 assets.py 的 json 文件，按相对路径排序。不属于任何组件的 json（见 _extract_root）不收。"""
     files = [Path(file) for file in _extractor().AssetsExtractor(str(task_dir)).all_json_file()]
-    return sorted(files, key=lambda path: _relpath(path, task_dir))
+    return sorted((file for file in files if _extract_root(task_dir, file) is not None),
+                  key=lambda path: _relpath(path, task_dir))
 
 
 def _read_rules(path: Path) -> tuple[list | dict | None, str]:
@@ -324,10 +342,11 @@ def _attributes(data) -> list[tuple[str, str]]:
     return [(f'{prefix}_{extract.name_transform(name)}', name) for name in map(_name_of, _entries(data)) if name]
 
 
-def _duplicate_issues(places: dict[str, list[tuple[str, str]]]) -> list[Issue]:
-    """同一个属性名出现在两处以上（同一个文件里的两条也算）：编进同一个 assets.py 后互相覆盖。每一处各报一条，说明里列出全部位置。"""
+def _duplicate_issues(places: dict[tuple[Path, str], list[tuple[str, str]]]) -> list[Issue]:
+    """同一个 assets.py 里同一个属性名出现在两处以上（同一个文件里的两条也算）：互相覆盖。places 的键是
+    (编进哪个目录的 assets.py, 属性名)，所以不同组件里的同名属性不算。每一处各报一条，说明里列出全部位置。"""
     issues = []
-    for attribute, found in places.items():
+    for (_, attribute), found in places.items():
         if len(found) < 2:
             continue
         where = '、'.join(f'{file} 的 {name}' for file, name in found)
@@ -357,17 +376,35 @@ def _trial_assets(task_dir: Path) -> tuple[str, Path]:
     return extractor._result, extractor.assets_file
 
 
-def _outdated_issues(task_dir: Path, root: Path | None) -> list[Issue]:
-    """assets.py 与 json 试生成的结果不一致：属性名对不上的列出缺哪些、多哪些，属性名都对得上就说内容有差异；assets.py 不存在也算。"""
+def _extract_dirs(task_dir: Path, json_files: list[Path]) -> list[Path]:
+    """要比对 assets.py 的目录，按相对路径排序：普通任务是任务目录本身；Component 是有 json 或有 assets.py 的组件目录，
+    两样都没有的目录（比如 __pycache__）没有可比的，视为一致。"""
+    if task_dir.name != CONTAINER_TASK:
+        return [task_dir]
+    dirs = {_extract_root(task_dir, path) for path in json_files}
+    dirs |= {entry for entry in task_dir.iterdir() if entry.is_dir() and (entry / _extractor().ASSETS_FILE).is_file()}
+    return sorted(dirs, key=lambda path: _relpath(path, task_dir))
+
+
+def _outdated_issues(task_dir: Path, extract_dirs: list[Path], root: Path | None) -> list[Issue]:
+    """extract_dirs 里每个目录的 assets.py 与 json 试生成的结果是否一致（见 _outdated_issue）。当前目录不是 root 时一个都不比，
+    记一条警告。"""
     repo = _repo_root(root)
     if repo != Path.cwd().resolve():
         logger.warning(f'素材检查：当前目录不是 {repo}，AssetsExtractor 按当前目录算图片路径，跳过 assets.py 与 json 的比对')
         return []
+    return [issue for extract_dir in extract_dirs for issue in _outdated_issue(task_dir, extract_dir)]
+
+
+def _outdated_issue(task_dir: Path, extract_dir: Path) -> list[Issue]:
+    """extract_dir 的 assets.py 与 json 试生成的结果不一致：属性名对不上的列出缺哪些、多哪些，属性名都对得上就说内容有差异；
+    assets.py 不存在也算。试生成失败报 json_error，file 是组件目录名（普通任务为空）。"""
     try:
-        generated, assets_file = _trial_assets(task_dir)
+        generated, assets_file = _trial_assets(extract_dir)
     except Exception as exc:        # json 缺字段、结构不对时，AssetsExtractor 会抛各种异常，让页面把它当成问题列出来
-        logger.warning(f'素材检查：试生成 {task_dir.name} 的 assets.py 失败：{exc!r}')
-        return [Issue('json_error', '', '', f'试生成 assets.py 失败，某个 json 的字段不全或结构不对：{exc!r}')]
+        logger.warning(f'素材检查：试生成 {extract_dir.name} 的 assets.py 失败：{exc!r}')
+        where = '' if extract_dir == task_dir else _relpath(extract_dir, task_dir)
+        return [Issue('json_error', where, '', f'试生成 assets.py 失败，某个 json 的字段不全或结构不对：{exc!r}')]
     file = _relpath(assets_file, task_dir)
     if not assets_file.is_file():
         return [Issue('assets_outdated', file, '', 'assets.py 不存在，需要重新生成')]
@@ -389,25 +426,30 @@ def static_check(task: str, root: Path | None = None) -> list[Issue]:
     """对一个任务做不需要截图的检查，返回问题列表，空表示没发现问题。
 
     顺序固定：先按文件逐个查（json_error、missing_image、roi_out_of_bounds），再报 duplicate_item，最后是 assets_outdated。
-    任务里有 json 解析不了时不做 assets.py 比对（试生成会因此失败）；当前目录不是 root 时也不做，见模块说明。
+    重名和 assets.py 比对都按"编进哪个 assets.py"分开算（见 _extract_root）：普通任务就是整个任务，Component 是每个组件各自一份。
+    某个 assets.py 的 json 里有解析不了的，就不比对这一份（试生成会因此失败）；当前目录不是 root 时一份都不比，见模块说明。
     """
     task_dir = task_root(task, root)
+    json_files = _json_files(task_dir)
     issues: list[Issue] = []
-    places: dict[str, list[tuple[str, str]]] = {}       # 属性名 -> [(json 相对路径, 条目名)]
-    for path in _json_files(task_dir):
-        file = _relpath(path, task_dir)
+    places: dict[tuple[Path, str], list[tuple[str, str]]] = {}      # (编进哪个目录的 assets.py, 属性名) -> [(json, 条目名)]
+    broken: set[Path] = set()                                        # json 解析不了的目录，不比对它的 assets.py
+    for path in json_files:
+        file, extract_dir = _relpath(path, task_dir), _extract_root(task_dir, path)
         data, error = _read_rules(path)
         if error:
             issues.append(Issue('json_error', file, '', error))
+            broken.add(extract_dir)
             continue
         entries = _entries(data)
         issues += _missing_images(file, path, entries)
         issues += _roi_issues(file, data, entries)
         for attribute, name in _attributes(data):
-            places.setdefault(attribute, []).append((file, name))
+            places.setdefault((extract_dir, attribute), []).append((file, name))
     issues += _duplicate_issues(places)
-    if not any(issue.kind == 'json_error' for issue in issues):
-        issues += _outdated_issues(task_dir, root)
+    extract_dirs = [extract_dir for extract_dir in _extract_dirs(task_dir, json_files) if extract_dir not in broken]
+    if extract_dirs:
+        issues += _outdated_issues(task_dir, extract_dirs, root)
     return issues
 
 
@@ -495,8 +537,9 @@ def _write_guard(merging: Callable[[], bool]):
 # 替换图片
 # ------------------------------------------------------------------------------------------------------------------
 
-def _replace_target(task_dir: Path, json_relpath: str, image_name: str) -> Path:
+def _replace_target(task_dir: Path, json_relpath: str, image_name: str) -> tuple[Path, Path]:
     """替换的目标：json_relpath 这个素材文件里某个条目的 imageName 指向的图片（按 json 所在目录算，同 assets.py 里的路径）。
+    返回 (json 文件, 图片)，都是绝对路径。
 
     先过名单：json 必须是 AssetsExtractor 编进 assets.py 的那些文件之一，image_name 必须是其中某个条目的 imageName，
     所以 ../x.png、a.exe 这类名字根本进不来；再核对路径落在任务目录内、后缀是图片，json 被改坏时这两条是第二道防线。
@@ -519,7 +562,7 @@ def _replace_target(task_dir: Path, json_relpath: str, image_name: str) -> Path:
         raise ValueError(f'不支持的图片后缀 {target.suffix!r}，只收 {"、".join(IMAGE_SUFFIXES)}')
     if target.is_dir():
         raise ValueError(f'目标是目录，不是图片：{image_name}')
-    return target
+    return path, target
 
 
 def _decode_base64(content) -> bytes:
@@ -586,8 +629,8 @@ def _default_regenerate(repo: Path) -> Callable[[str], None]:
     if cwd != repo:
         raise RuntimeError(f'重新生成 assets.py 需要在仓库根目录下进行：当前目录 {cwd}，仓库 {repo}')
 
-    def regenerate(task: str) -> None:
-        _extractor().AssetsExtractor(str(repo / 'tasks' / task)).extract()
+    def regenerate(extract_dir: str) -> None:
+        _extractor().AssetsExtractor(str(repo / 'tasks' / extract_dir)).extract()
 
     return regenerate
 
@@ -598,7 +641,7 @@ class _Replacement:
     target: Path                            # 要写的图片，绝对路径
     shown: str                              # 仓库相对路径，如 tasks/ActivityShikigami/fire/fire_pass_8.png
     data: bytes                             # 按目标后缀重新编码好的图片
-    unit: str                               # 交给 regenerate 的目录（相对 tasks/）
+    extract_dir: str                        # 交给 regenerate 的目录（相对 tasks/）：任务名，组件是 Component/<组件>
     regenerate: Callable[[str], None]
 
 
@@ -607,25 +650,27 @@ def _prepare_replacement(task: str, json_relpath: str, image_name: str, content_
     """换图在落盘之前的全部检查，不碰 git 和磁盘，不通过就抛异常（规则见 replace_image）：任务、素材文件、图片名、路径、
     后缀、base64、图片内容（解码再按目标后缀重新编码），regenerate 不传时还有默认重新生成对当前目录的检查（RuntimeError）。"""
     task_dir = task_root(task, root).resolve()
-    target = _replace_target(task_dir, json_relpath, image_name)
+    json_file, target = _replace_target(task_dir, json_relpath, image_name)
     data = _reencode(_decode_base64(content_base64), target.suffix.lower())
     if regenerate is None:
         regenerate = _default_regenerate(_repo_root(root))
     shown = f'tasks/{task}/{target.relative_to(task_dir).as_posix()}'
-    return _Replacement(target, shown, data, task, regenerate)
+    extract_dir = _extract_root(task_dir, json_file).relative_to(task_dir.parent).as_posix()
+    return _Replacement(target, shown, data, extract_dir, regenerate)
 
 
 def _apply_replacement(replacement: _Replacement) -> None:
     """写图（同目录临时文件再 os.replace），再重新生成 assets.py。调用方持有写入守卫。"""
     replacement.target.parent.mkdir(parents=True, exist_ok=True)
     _write_atomically(replacement.target, replacement.data)
-    replacement.regenerate(replacement.unit)
+    replacement.regenerate(replacement.extract_dir)
     logger.info(f'素材替换：{replacement.shown}')
 
 
 def replace_image(task: str, json_relpath: str, image_name: str, content_base64: str, root: Path | None = None,
                   regenerate: Callable[[str], None] | None = None) -> dict:
-    """用上传的图片替换 json_relpath 里 imageName 为 image_name 的素材图，再调 regenerate(task) 重新生成 assets.py。
+    """用上传的图片替换 json_relpath 里 imageName 为 image_name 的素材图，再重新生成 assets.py：regenerate 收到相对 tasks/
+    的目录，普通任务是任务名，组件是 Component/<组件>（同 ForkUpdater.regenerate）。
     返回 {'target': 仓库相对路径}，比如 tasks/ActivityShikigami/fire/fire_pass_8.png。不提交：页面上的上传替换走
     replace_and_commit，换完立刻提交推送。
 

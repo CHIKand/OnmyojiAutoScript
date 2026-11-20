@@ -37,6 +37,7 @@ from module.server.assets_check_router import (WEB_DIR, CommitPushBody, NoCacheS
 from module.server.custom_routes import register_custom
 from module.server.fork_git import GitRunner
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 TAGS_FILE = 'assets/custom/assets_tags.json'
 SCREENS = ['活动主页', '普通挑战页', 'Boss挑战页', '战斗中', '退出时', '未分类']
 EMPTY_SCREEN_HINT = '所选画面没有已标注的图片或 OCR 条目'
@@ -335,7 +336,25 @@ def test_tasks_default_pair_or_all(root):
     for name in ('Foo', 'MetaDemon', 'ActivityShikigami', 'Component', '__pycache__'):
         (root / 'tasks' / name).mkdir(parents=True)
     assert get_tasks(all_tasks=False) == {'tasks': ['ActivityShikigami', 'MetaDemon']}
-    assert get_tasks(all_tasks=True) == {'tasks': ['ActivityShikigami', 'Foo', 'MetaDemon']}
+    assert get_tasks(all_tasks=True) == {'tasks': ['ActivityShikigami', 'Component', 'Foo', 'MetaDemon']}
+
+
+def test_component_paths_match_the_annotator():
+    """页面的缩略图（标注工具的 image-preview）和体检（test_rule）都把 task_name=Component、json_relpath=<组件>/x.json 交给
+    标注工具。拿真实仓库核对：标注工具按这两个参数找到的 json 就是清单里的那个文件，它认定的 assets.py 目录与这里的一致，
+    缩略图找得到图。"""
+    manager = annotator_tool.AnnotatorManager
+    task_dir = (REPO_ROOT / 'tasks' / 'Component').resolve()
+    rules = assets_check.list_rules('Component', root=REPO_ROOT)
+    assert len(rules) > 50
+    for rule in rules:
+        root_dir, json_file = manager._resolve_json_path('Component', rule['file'])
+        assert (root_dir, json_file) == (task_dir, task_dir / rule['file'])
+        assert manager._resolve_assets_extract_target(root_dir, json_file)[0] == assets_check._extract_root(task_dir,
+                                                                                                           json_file)
+    reward = annotator_tool.annotator_manager.get_rule_image_file('Component', 'GeneralBattle/gb/image.json',
+                                                                  'gb_reward.png')
+    assert reward == task_dir / 'GeneralBattle' / 'gb' / 'gb_reward.png'
 
 
 def test_rules_include_tags(foo):

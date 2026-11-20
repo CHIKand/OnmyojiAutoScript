@@ -151,7 +151,8 @@ def put_json(root: Path, relpath: str, data) -> Path:
 
 
 def base_files() -> dict:
-    """运行目录里已提交的内容：Foo 任务（a、b 两张图在，gone 没有）、别的任务、标签文件、仓库根的杂项。"""
+    """运行目录里已提交的内容：Foo 任务（a、b 两张图在，gone 没有）、别的任务、组件 A（Component/A，图 x 在）、标签文件、
+    仓库根的杂项。"""
     return {
         'tasks/Foo/as/image.json': json_text([image_rule('a'), image_rule('b'), image_rule('gone')]),
         'tasks/Foo/as/a.png': OLD_PNG,
@@ -159,6 +160,9 @@ def base_files() -> dict:
         'tasks/Foo/as/老图.png': OLD_PNG,
         'tasks/Foo/assets.py': '# generated\n',
         'tasks/Bar/x.png': OLD_PNG,
+        'tasks/Component/A/image.json': json_text([image_rule('x')]),
+        'tasks/Component/A/x.png': OLD_PNG,
+        'tasks/Component/A/assets.py': '# generated\n',
         TAGS_FILE: '{}\n',
         'other.txt': 'base\n',
     }
@@ -476,6 +480,18 @@ def test_screen_check_rejects_an_unknown_task(screen_root):
         assets_check.screen_check('../etc', '活动主页', 's', 'i', tester=FakeTester(), tags={}, root=screen_root)
 
 
+def test_screen_check_passes_component_paths_the_annotator_way(screen_root):
+    """组件同标注工具：任务名 Component，json 相对路径 <组件>/x.json（标注工具的 test_rule、缩略图都按这个找文件）。"""
+    put_json(screen_root, 'tasks/Component/A/image.json', [image_rule('x')])
+    put_json(screen_root, 'tasks/Component/B/ocr.json', [ocr_rule('o')])
+    tags = {'Component': {'A/image.json': {'x': {'periodic': False, 'screen': '战斗中'}}}}
+    tester = FakeTester()
+    results = assets_check.screen_check('Component', '战斗中', 's', 'i', tester=tester, tags=tags, root=screen_root)
+    assert [(item['file'], item['expected']) for item in results] == [('A/image.json', True), ('B/ocr.json', False)]
+    assert tester.calls == [('s', 'i', 'Component', 'A/image.json', 'image', 'x'),
+                            ('s', 'i', 'Component', 'B/ocr.json', 'ocr', 'o')]
+
+
 # ------------------------------------------------------------------------------------------------------------------
 # 替换图片
 # ------------------------------------------------------------------------------------------------------------------
@@ -600,7 +616,7 @@ def test_replace_rejects_a_json_that_is_not_one_of_the_task(root, json_relpath):
     assert tree(root) == before
 
 
-@pytest.mark.parametrize('task', ['Missing', '../Foo', 'Foo/..', 'Component', '', None])
+@pytest.mark.parametrize('task', ['Missing', '../Foo', 'Foo/..', 'Component/A', '', None])
 def test_replace_rejects_an_unknown_task(root, task):
     before = tree(root)
     with pytest.raises(ValueError):
@@ -708,6 +724,32 @@ def test_replace_default_regenerate_rebuilds_assets_py(root, monkeypatch):
     assert 'file="./tasks/Foo/as/a.png"' in assets             # 图片路径按仓库根算，所以当前目录必须是 root
 
 
+def test_replace_a_component_image_regenerates_only_that_component(root):
+    """组件的图换完，重新生成的是那个组件自己的 assets.py：regenerate 收到 Component/<组件>（同 ForkUpdater.regenerate）。"""
+    result, regen = replace(root, 'x.png', json_relpath='A/image.json', task='Component')
+    assert result == {'target': 'tasks/Component/A/x.png'}
+    assert regen.calls == ['Component/A']
+    assert pixels(root / 'tasks/Component/A/x.png').shape == (3, 4, 3)
+
+
+def test_replace_a_component_image_with_the_default_regenerate(root, monkeypatch):
+    monkeypatch.chdir(root)
+    assets_check.replace_image('Component', 'A/image.json', 'x.png', b64(png_bytes()), root=root)
+    assets = (root / 'tasks/Component/A/assets.py').read_text(encoding='utf-8')
+    assert 'class AAssets' in assets and 'file="./tasks/Component/A/x.png"' in assets
+    assert not (root / 'tasks/Component/assets.py').exists()          # 容器目录不生成 assets.py
+
+
+def test_replace_refuses_a_json_directly_under_the_component_container(root):
+    """直接放在 tasks/Component 下的 json 不属于任何组件（标注工具也拒绝保存它）：不在清单里，不能替换。"""
+    put_json(root, 'tasks/Component/loose.json', [image_rule('loose')])
+    before = tree(root)
+    regen = Regen()
+    with pytest.raises(ValueError):
+        replace(root, 'loose.png', json_relpath='loose.json', task='Component', regenerate=regen)
+    assert tree(root) == before and regen.calls == []
+
+
 def test_replace_default_regenerate_refuses_outside_the_repo_before_writing(root):
     """默认的重新生成按当前目录算图片路径：当前目录不是 root 就在写盘之前拒绝，不能图换了、assets.py 没生成。"""
     assert Path.cwd().resolve() != root.resolve()
@@ -749,7 +791,7 @@ def test_blank_message_gets_the_default(repo, message):
     assert repo.message(result['commit']) == '素材维护：替换 Foo 素材'
 
 
-@pytest.mark.parametrize('task', ['../..', '..', 'Missing', 'Foo/..', 'Component', '', None])
+@pytest.mark.parametrize('task', ['../..', '..', 'Missing', 'Foo/..', 'Component/A', '', None])
 def test_commit_and_push_rejects_an_unknown_task(repo, task):
     repo.write({'tasks/Foo/as/a.png': b'changed', 'other.txt': 'dirty\n'})
     before = repo.head
@@ -1002,6 +1044,28 @@ def test_replace_and_commit_validates_before_touching_git(repo, git_calls, task,
     with pytest.raises(ValueError):
         assets_check.replace_and_commit(task, json_relpath, image_name, content, repo.runner, 'custom', regenerate=regen)
     assert git_calls == [] and regen.calls == [] and tree(repo.work) == before
+
+
+def test_replace_and_commit_a_component_image(repo):
+    """组件的提交路径是 tasks/Component（整个容器算一个任务）：别的组件留下的改动一起提交，别的任务的不带。"""
+    repo.write({'tasks/Component/B/new.png': b'from the annotator', 'tasks/Foo/as/a.png': b'elsewhere'})
+
+    result, regen = replace_commit(repo, 'x.png', json_relpath='A/image.json', task='Component')
+
+    assert result == {'target': 'tasks/Component/A/x.png', 'replaced': True, 'commit': repo.head, 'pushed': True,
+                      'error': ''}
+    assert regen.calls == ['Component/A']
+    assert repo.files_of(result['commit']) == {'tasks/Component/A/x.png', 'tasks/Component/B/new.png'}
+    assert repo.message(result['commit']) == '素材维护：替换 tasks/Component/A/x.png'
+    assert repo.fork_tip == repo.head and repo.status() == [' M tasks/Foo/as/a.png']
+
+
+def test_commit_and_push_a_component_change(repo):
+    repo.write({'tasks/Component/A/x.png': b'changed'})
+    result = assets_check.commit_and_push('Component', '', repo.runner, 'custom')
+    assert result == {'commit': repo.head, 'pushed': True, 'error': ''}
+    assert repo.files_of(result['commit']) == {'tasks/Component/A/x.png'}
+    assert repo.message(result['commit']) == '素材维护：替换 Component 素材'
 
 
 def test_replace_and_commit_default_regenerate_refuses_outside_the_repo_before_git(repo, git_calls):
