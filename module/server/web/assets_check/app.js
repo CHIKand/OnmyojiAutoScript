@@ -4,7 +4,8 @@
  * 接口在 /custom/assets 下。截屏借用标注工具的会话（/tool/annotator/api）：标注工具同一时间只有一个会话，
  * 谁新建会话谁就把对方的关掉，所以本页只在用户点"开始截屏"时才建会话。去标注工具框选之后，本页的会话视为已被接管，
  * 回到本页时丢掉它，下次"开始截屏"再建一个新的；关闭本页时尽力关掉自己的会话。
- * 标签的改动先留在页面上，点"保存标签"时整份 PUT 一次（后端立刻提交并推送）。
+ * 标签的改动先留在页面上，点"保存标签"时整份 PUT 一次（后端立刻提交并推送）。上传替换的图同样由后端换完立刻提交并推送：
+ * 不提交的图会在下次启动服务时被启动器还原。"提交并推送"留给重试，以及标注工具等别处留下的改动。
  */
 (function () {
   "use strict";
@@ -43,7 +44,7 @@
     captureConfig: "",
     pollTimer: 0,
     annotatorOpened: false,
-    lastCommits: {},            // 任务 -> 本页最近一次"提交并推送"得到的提交，导出补丁包用
+    lastCommits: {},            // 任务 -> 本页最近一次上传替换或"提交并推送"得到的提交，导出补丁包用
   };
 
   // ---------------------------------------------------------------------------------------------------------------
@@ -195,16 +196,37 @@
     return sha ? sha.slice(0, 7) : "";
   }
 
+  function commitNote(result) {
+    return result.commit ? "（提交 " + shortSha(result.commit) + "）" : "";
+  }
+
   // 提交类接口的结果：推上 fork 才说"已保存到 fork"，否则显示后端给的原因
   function describeCommit(result, subject, actionName) {
-    const sha = result.commit ? "（提交 " + shortSha(result.commit) + "）" : "";
     if (result.pushed) {
-      return [subject + "已保存到 fork" + sha, "ok"];
+      return [subject + "已保存到 fork" + commitNote(result), "ok"];
     }
     if (result.error) {
       return [actionName + "：" + result.error, "error"];
     }
     return [subject + "没有改动，不需要提交", "ok"];
+  }
+
+  // 上传替换的结果：后端换完图立刻提交并推送，replaced 说明图写下了没有
+  function describeReplace(result) {
+    if (!result.replaced) {
+      return ["没有替换：" + (result.error || "原因不明"), "error"];
+    }
+    if (result.pushed) {
+      return ["已替换并保存到 fork" + commitNote(result) + "，重启实例后生效", "ok"];
+    }
+    if (result.commit) {
+      return ["图已替换并在本地提交，但没有推送到 fork：" + result.error, "error"];
+    }
+    if (result.error) {
+      return ["图已替换，但没有提交成功：" + result.error
+        + "。点\"提交并推送\"重试；不提交的话下次启动服务会还原这张图", "error"];
+    }
+    return ["图已替换，内容和 fork 上的一样，不需要提交", "ok"];
   }
 
   // ---------------------------------------------------------------------------------------------------------------
@@ -508,8 +530,15 @@
         method: "POST",
         json: { json_relpath: file, image_name: imageName, content_base64: content },
       });
+      if (result.commit) {
+        state.lastCommits[task] = result.commit;
+      }
+      const [text, kind] = describeReplace(result);
+      showMessage(text, kind);
+      if (!result.replaced) {
+        return;
+      }
       thumbCell.replaceChildren(thumbnail(task, file, imageName, Date.now()));
-      showMessage("已替换 " + result.target + "。点“提交并推送”保存到 fork；重启实例后生效。", "ok");
       if (task === state.task) {
         await refreshStatic();
       }

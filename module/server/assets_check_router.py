@@ -5,14 +5,15 @@
 理由同 app.py 的 NoCacheStaticFiles；不从 app.py 导入它，因为 app.py 导入了 custom_routes，会循环导入。
 
 业务接口都是普通 def，FastAPI 把它们放进线程池跑：git、联网、cv2、读写素材都不卡事件循环。
-清单、静态检查、体检、换图一律用 root=None，即服务进程的当前目录（仓库根），同标注工具的 PROJECT_ROOT；
+清单、静态检查、体检一律用 root=None，即服务进程的当前目录（仓库根），同标注工具的 PROJECT_ROOT；
 静态检查里 assets.py 的比对也只在当前目录就是仓库根时才做。
-要 git 的接口（保存标签、提交并推送、导出补丁）每次请求经 _runner_and_branch 现取运行目录的 git 和 fork 分支，
+要 git 的接口（保存标签、上传替换、提交并推送、导出补丁）每次请求经 _runner_and_branch 现取运行目录的 git 和 fork 分支，
 做法同 M3a 的 ForkUpdater()（部署配置里的 GitExecutable、Branch，仓库是当前目录）；测试换掉这个函数，不构造 DeployConfig。
+上传替换换完图立刻提交并推送（assets_check.replace_and_commit），换下的图不留在运行目录里等启动器还原。
 
 错误一律回 {"detail": {"code", "message"}}，同标注工具：ValueError 回 400；WriteRefused（正在合并或保存、仓库里有没做完的合并）
 回 409，按类判断，别的 RuntimeError 不算"忙"；标注工具的 AnnotatorError 回它自己的状态码；其余异常回 500，消息是异常的说明，
-调用栈记进日志。保存标签、提交并推送的结果（含失败原因 error）照常以 200 返回，由页面显示。
+调用栈记进日志。保存标签、上传替换、提交并推送的结果（含失败原因 error）照常以 200 返回，由页面显示。
 
 module.server.tool 只在体检接口里用到时才导入：它一导入就起标注工具的会话清理线程，还会带进设备、配置等一串模块，
 而 custom_routes 导入本模块时要保持轻量（见 test_importing_the_modules_does_not_load_the_manager）。服务启动时 app.py 早已
@@ -152,9 +153,12 @@ def post_screen_check(task: str, body: ScreenCheckBody) -> dict:
 
 @assets_api.post('/{task}/replace-image')
 def post_replace_image(task: str, body: ReplaceImageBody) -> dict:
-    """用上传的图片替换素材图，再重新生成 assets.py。返回 {'target': 仓库相对路径}。"""
+    """用上传的图片替换素材图、重新生成 assets.py，立刻提交并推送到 fork。返回
+    {'target', 'replaced', 'commit', 'pushed', 'error'}，没替换成或没推上去的原因在 error 里；参数不对回 400。"""
     with _mapped_errors('替换图片'):
-        return assets_check.replace_image(task, body.json_relpath, body.image_name, body.content_base64)
+        runner, branch = _runner_and_branch()
+        return assets_check.replace_and_commit(task, body.json_relpath, body.image_name, body.content_base64, runner,
+                                               branch)
 
 
 @assets_api.post('/{task}/commit-push')

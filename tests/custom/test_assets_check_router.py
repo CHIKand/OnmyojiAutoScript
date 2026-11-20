@@ -220,8 +220,8 @@ def configure(repo: Path) -> None:
 
 @pytest.fixture(scope='module')
 def seed_repo(tmp_path_factory) -> Path:
-    """origin.git（裸仓库，分支 custom）和从它克隆出来的 work：Foo 任务（a.png 在、b.png 缺，assets.py 已生成）和空标签文件。
-    每个用例拷一份，比重建快。种子仓库放在另一个目录里，免得被一起拷走。"""
+    """origin.git（裸仓库，分支 custom）和从它克隆出来的 work：Foo 任务（as/image.json 里 a.png 在、b.png 缺，as/ocr.json 里
+    一个 OCR 条目 c，assets.py 已生成）和空标签文件。每个用例拷一份，比重建快。种子仓库放在另一个目录里，免得被一起拷走。"""
     source, base = tmp_path_factory.mktemp('router-seed-source'), tmp_path_factory.mktemp('router-seed-repo')
     seed, origin, work = source / 'seed', base / 'origin.git', base / 'work'
     sh(base, 'init', '-q', '--bare', '--template=', str(origin))
@@ -230,6 +230,7 @@ def seed_repo(tmp_path_factory) -> Path:
     configure(seed)
     sh(seed, 'checkout', '-q', '-b', 'custom')
     put_json(seed, 'tasks/Foo/as/image.json', [image_rule('a'), image_rule('b')])
+    put_json(seed, 'tasks/Foo/as/ocr.json', [ocr_rule('c')])
     put_bytes(seed, 'tasks/Foo/as/a.png', OLD_PNG)
     put_bytes(seed, TAGS_FILE, b'{}\n')
     previous = os.getcwd()
@@ -267,6 +268,9 @@ class Repo:
     def files_of(self, sha: str) -> set[str]:
         return set(filter(None, sh(self.work, 'diff-tree', '-r', '--root', '--no-commit-id', '--name-only', '-z',
                                    sha).split('\0')))
+
+    def status(self) -> list[str]:
+        return sorted(sh(self.work, 'status', '--porcelain', '--untracked-files=all').splitlines())
 
     def rival_commit(self) -> None:
         """另一份克隆往 fork 推一个提交：fork 上多出运行目录没有的提交。"""
@@ -505,37 +509,66 @@ def test_expired_session_is_one_error_not_one_per_row(tagged_foo, annotator):
     replace_body(content='不是 base64'),
     replace_body(content=b64(b'not an image')),
 ], ids=['traversal', 'unknown-json', 'no-image-entry', 'bad-base64', 'not-an-image'])
-def test_replace_endpoint_validates(foo, body):
-    before = files_under(foo)
+def test_replace_endpoint_validates(repo, body):
+    before = files_under(repo.work)
 
     error = http_error(lambda: post_replace_image('Foo', body))
 
     assert error.status_code == 400
     assert error.detail['code'] == 'invalid_request' and error.detail['message']
-    assert files_under(foo) == before
+    assert files_under(repo.work) == before                         # .git 也没动：校验在碰 git 之前
 
 
-def test_replace_endpoint_writes_the_image_and_regenerates(foo):
-    assets_py = foo / 'tasks/Foo/assets.py'
-    assets_py.unlink()
+def test_replace_image_commits_with_the_resolved_runner_and_branch(repo, monkeypatch):
+    """上传替换一步做完：换图、重新生成 assets.py、提交并推送，用的是现取的运行目录 git 和 fork 分支。"""
+    calls, real = [], assets_check.replace_and_commit
 
-    result = post_replace_image('Foo', replace_body(content='data:image/png;base64,' + b64(NEW_PNG)))
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)
 
-    assert result == {'target': 'tasks/Foo/as/a.png'}
-    assert np.array_equal(pixels(foo / 'tasks/Foo/as/a.png'), cv2.imdecode(np.frombuffer(NEW_PNG, np.uint8),
-                                                                         cv2.IMREAD_UNCHANGED))
-    assert assets_py.is_file()                                       # 默认的重新生成按当前目录（仓库根）跑了
+    monkeypatch.setattr(assets_check, 'replace_and_commit', spy)
+    content = 'data:image/png;base64,' + b64(NEW_PNG)
+
+    result = post_replace_image('Foo', replace_body(content=content))
+
+    assert calls == [(('Foo', 'as/image.json', 'a.png', content, repo.runner, 'custom'), {})]
+    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': True, 'commit': repo.head, 'pushed': True, 'error': ''}
+    assert repo.fork_tip == repo.head and repo.files_of(repo.head) == {'tasks/Foo/as/a.png'}
+    assert repo.message(repo.head) == '素材维护：替换 tasks/Foo/as/a.png'
+    assert np.array_equal(pixels(repo.work / 'tasks/Foo/as/a.png'), cv2.imdecode(np.frombuffer(NEW_PNG, np.uint8),
+                                                                               cv2.IMREAD_UNCHANGED))
+    assert repo.status() == []
 
 
-def test_busy_write_is_409(foo):
-    before = files_under(foo)
+def test_replace_endpoint_regenerates_assets_py(repo):
+    """默认的重新生成按当前目录（仓库根）跑：删掉的 assets.py 重新生成出来，和提交里的一字不差，所以工作区是干净的。"""
+    (repo.work / 'tasks/Foo/assets.py').unlink()
+
+    result = post_replace_image('Foo', replace_body())
+
+    assert result['pushed'] is True and repo.files_of(result['commit']) == {'tasks/Foo/as/a.png'}
+    assert (repo.work / 'tasks/Foo/assets.py').is_file() and repo.status() == []
+
+
+def test_busy_replace_comes_back_in_the_result(repo):
+    """正在合并或保存时不替换：和提交类接口一样以 200 返回，原因在 error 里，什么都没写。"""
+    before = files_under(repo.work)
 
     with lock_held():
-        error = http_error(lambda: post_replace_image('Foo', replace_body()))
+        result = post_replace_image('Foo', replace_body())
 
-    assert (error.status_code, error.detail) == (409, {'code': 'write_refused',
-                                                       'message': '正在合并上游或保存素材，请稍后再试'})
-    assert files_under(foo) == before
+    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': False, 'commit': None, 'pushed': False,
+                      'error': '正在合并上游或保存素材，请稍后再试'}
+    assert files_under(repo.work) == before
+
+
+def test_write_refused_maps_to_409():
+    with pytest.raises(HTTPException) as caught:
+        with assets_check_router._mapped_errors('测试'):
+            raise assets_check.WriteRefused('正在合并上游或保存素材，请稍后再试')
+    assert (caught.value.status_code, caught.value.detail) == (409, {'code': 'write_refused',
+                                                                     'message': '正在合并上游或保存素材，请稍后再试'})
 
 
 def test_other_errors_are_500_with_the_reason(foo, monkeypatch, log):
@@ -543,7 +576,8 @@ def test_other_errors_are_500_with_the_reason(foo, monkeypatch, log):
     def boom(*args, **kwargs):
         raise RuntimeError('重新生成 assets.py 需要在仓库根目录下进行')
 
-    monkeypatch.setattr(assets_check, 'replace_image', boom)
+    monkeypatch.setattr(assets_check_router, '_runner_and_branch', lambda: (GitRunner('git', foo), 'custom'))
+    monkeypatch.setattr(assets_check, 'replace_and_commit', boom)
 
     error = http_error(lambda: post_replace_image('Foo', replace_body()))
 
@@ -559,7 +593,8 @@ def test_other_errors_are_500_with_the_reason(foo, monkeypatch, log):
     lambda: post_replace_image('NoSuch', replace_body()),
     lambda: get_export('NoSuch', commit='HEAD'),
 ], ids=['rules', 'static-check', 'screen-check', 'replace-image', 'export'])
-def test_unknown_task_is_400(foo, annotator, call):
+def test_unknown_task_is_400(foo, annotator, monkeypatch, call):
+    monkeypatch.setattr(assets_check_router, '_runner_and_branch', lambda: (GitRunner('git', foo), 'custom'))
     error = http_error(call)
     assert (error.status_code, error.detail) == (400, {'code': 'invalid_request', 'message': "未知任务：'NoSuch'"})
 
@@ -581,19 +616,20 @@ def test_corrupt_tags_file_is_400(foo):
 # ------------------------------------------------------------------------------------------------------------------
 
 def test_commit_push_endpoint_commits_and_pushes(repo):
-    post_replace_image('Foo', replace_body())
+    """提交并推送收的是别处留下的改动（比如标注工具改的图）：上传替换自己已经提交过了。"""
+    put_bytes(repo.work, 'tasks/Foo/as/b.png', NEW_PNG)
 
-    result = post_commit_push('Foo', CommitPushBody(message='换 a 的图'))
+    result = post_commit_push('Foo', CommitPushBody(message='补上 b 的图'))
 
     assert result == {'commit': repo.head, 'pushed': True, 'error': ''}
     assert repo.fork_tip == repo.head
-    assert repo.message(repo.head) == '换 a 的图'
-    assert repo.files_of(repo.head) == {'tasks/Foo/as/a.png'}
+    assert repo.message(repo.head) == '补上 b 的图'
+    assert repo.files_of(repo.head) == {'tasks/Foo/as/b.png'}
 
 
 def test_commit_push_refusal_comes_back_in_the_result(repo):
     repo.rival_commit()
-    post_replace_image('Foo', replace_body())
+    put_bytes(repo.work, 'tasks/Foo/as/b.png', NEW_PNG)
 
     result = post_commit_push('Foo', CommitPushBody())
 
@@ -608,8 +644,7 @@ def test_export_needs_a_commit(foo, commit):
 
 
 def test_export_sends_the_zip_and_removes_it_afterwards(repo):
-    post_replace_image('Foo', replace_body())
-    commit = post_commit_push('Foo', CommitPushBody())['commit']
+    commit = post_replace_image('Foo', replace_body())['commit']
 
     response = get_export('Foo', commit=commit)
 

@@ -892,6 +892,127 @@ def test_replace_then_commit_and_push(repo):
 
 
 # ------------------------------------------------------------------------------------------------------------------
+# 替换并提交（页面上的"上传替换"：换图、重新生成 assets.py、提交、推送一步做完）
+# ------------------------------------------------------------------------------------------------------------------
+
+def worktree(root: Path) -> dict[str, bytes]:
+    """tree 去掉 .git 里的文件：拉取会更新 .git，只看工作区有没有被改。"""
+    return {name: data for name, data in tree(root).items() if not name.startswith('.git/')}
+
+
+def replace_commit(repo: Repo, image_name='a.png', content=None, *, json_relpath='as/image.json', task='Foo',
+                   regenerate=None):
+    """调 replace_and_commit，默认换 as/image.json 里的 a.png；regenerate 不传就用记录器。返回 (结果, 记录器)。"""
+    regen = regenerate if regenerate is not None else Regen()
+    content = b64(png_bytes()) if content is None else content
+    result = assets_check.replace_and_commit(task, json_relpath, image_name, content, repo.runner, 'custom',
+                                             regenerate=regen)
+    return result, regen
+
+
+def test_replace_and_commit_roundtrip(repo, monkeypatch):
+    """换图和重新生成的 assets.py 在同一个提交里推到 fork，提交说明写明换的是哪张图；工作区不留未提交的改动。"""
+    monkeypatch.chdir(repo.work)                    # 默认的重新生成按当前目录算图片路径
+    new = png_bytes((9, 8, 7), (3, 2))
+
+    result = assets_check.replace_and_commit('Foo', 'as/image.json', 'a.png', b64(new), repo.runner, 'custom')
+
+    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': True, 'commit': repo.head, 'pushed': True, 'error': ''}
+    assert repo.fork_tip == result['commit']                                    # fork 上能看到该提交
+    assert repo.files_of(result['commit']) == {'tasks/Foo/as/a.png', 'tasks/Foo/assets.py'}
+    assert repo.message(result['commit']) == '素材维护：替换 tasks/Foo/as/a.png'
+    on_fork = subprocess.run(['git', 'show', 'custom:tasks/Foo/as/a.png'], cwd=repo.origin, capture_output=True).stdout
+    assert on_fork == (repo.work / 'tasks/Foo/as/a.png').read_bytes()
+    assert pixels(repo.work / 'tasks/Foo/as/a.png').shape == (2, 3, 3)
+    assert 'I_A = RuleImage(' in (repo.work / 'tasks/Foo/assets.py').read_text(encoding='utf-8')
+    assert repo.status() == []
+
+
+def test_replace_and_commit_creates_a_missing_image(repo):
+    """规格 F18：json 里有、磁盘上没有的图，补上之后同样立刻提交推送。"""
+    result, regen = replace_commit(repo, 'gone.png')
+    assert (result['target'], result['replaced'], result['pushed']) == ('tasks/Foo/as/gone.png', True, True)
+    assert repo.files_of(result['commit']) == {'tasks/Foo/as/gone.png'}
+    assert regen.calls == ['Foo'] and repo.fork_tip == repo.head
+
+
+def test_replace_and_commit_refuses_before_writing_when_the_fork_is_ahead(repo):
+    repo.rival_commit({'other.txt': 'rival\n'})
+    before, files = repo.head, worktree(repo.work)
+
+    result, regen = replace_commit(repo)
+
+    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': False, 'commit': None, 'pushed': False,
+                      'error': fork_ahead(1)}
+    assert worktree(repo.work) == files and regen.calls == []                 # 图没写，assets.py 也没重新生成
+    assert repo.head == before and repo.status() == []
+
+
+def test_replace_and_commit_refuses_when_busy(repo, git_calls):
+    before = tree(repo.work)
+    with lock_held():
+        result, regen = replace_commit(repo)
+    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': False, 'commit': None, 'pushed': False, 'error': BUSY}
+    assert git_calls == [] and regen.calls == []
+    assert tree(repo.work) == before
+
+
+def test_replace_and_commit_refuses_while_a_merge_is_in_progress(repo, git_calls):
+    write_files(repo.work, {'.git/MERGE_HEAD': repo.head + '\n'})
+    before = tree(repo.work)
+    result, regen = replace_commit(repo)
+    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': False, 'commit': None, 'pushed': False, 'error': MERGING}
+    assert tree(repo.work) == before and regen.calls == []
+    assert not {call[0] for call in git_calls} & {'fetch', 'add', 'commit', 'push'}
+
+
+def test_replace_and_commit_keeps_the_local_commit_when_the_push_fails(repo, tmp_path):
+    repo.break_push(tmp_path / 'missing.git')
+
+    result, _ = replace_commit(repo)
+
+    assert (result['replaced'], result['commit'], result['pushed']) == (True, repo.head, False)
+    assert result['error'].startswith('推送失败：') and result['error'].endswith(PUSH_TAIL)
+    assert repo.fork_tip != repo.head and repo.files_of(repo.head) == {'tasks/Foo/as/a.png'}
+    repo.fix_push()
+    assert assets_check.commit_and_push('Foo', '', repo.runner, 'custom') == {'commit': None, 'pushed': True, 'error': ''}
+    assert repo.fork_tip == repo.head                                           # 补推上去了
+
+
+def test_replace_and_commit_reports_a_git_failure_after_the_write(repo, monkeypatch):
+    """图已经写下、提交失败：replaced 为真、commit 为空，error 是原因（页面据此提示点"提交并推送"重试）。"""
+    break_git(monkeypatch, 'commit', stderr='Author identity unknown\n\nfatal: unable to auto-detect email address')
+    result, regen = replace_commit(repo)
+    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': True, 'commit': None, 'pushed': False,
+                      'error': 'git 命令失败：Author identity unknown'}
+    assert regen.calls == ['Foo'] and repo.status() == ['M  tasks/Foo/as/a.png']      # 已暂存、没提交成
+
+
+@pytest.mark.parametrize('task, json_relpath, image_name, content', [
+    ('Missing', 'as/image.json', 'a.png', b64(png_bytes())),
+    ('Foo', 'as/nope.json', 'a.png', b64(png_bytes())),
+    ('Foo', 'as/image.json', '../x.png', b64(png_bytes())),
+    ('Foo', 'as/image.json', 'a.png', 'not base64 !!!'),
+    ('Foo', 'as/image.json', 'a.png', b64(b'this is not an image at all')),
+], ids=['task', 'json', 'image-name', 'base64', 'not-an-image'])
+def test_replace_and_commit_validates_before_touching_git(repo, git_calls, task, json_relpath, image_name, content):
+    """校验同 replace_image，一律在动 git 和磁盘之前做完：不通过就抛 ValueError，一条 git 命令都不跑。"""
+    before = tree(repo.work)
+    regen = Regen()
+    with pytest.raises(ValueError):
+        assets_check.replace_and_commit(task, json_relpath, image_name, content, repo.runner, 'custom', regenerate=regen)
+    assert git_calls == [] and regen.calls == [] and tree(repo.work) == before
+
+
+def test_replace_and_commit_default_regenerate_refuses_outside_the_repo_before_git(repo, git_calls):
+    assert Path.cwd().resolve() != repo.work.resolve()
+    before = tree(repo.work)
+    with pytest.raises(RuntimeError, match='当前目录'):
+        assets_check.replace_and_commit('Foo', 'as/image.json', 'a.png', b64(png_bytes()), repo.runner, 'custom')
+    assert git_calls == [] and tree(repo.work) == before
+
+
+# ------------------------------------------------------------------------------------------------------------------
 # 保存标签（提交并推送标签文件）
 # ------------------------------------------------------------------------------------------------------------------
 

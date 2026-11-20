@@ -13,9 +13,10 @@ dev_tools.assets_extract 依赖 numpy 和 tqdm，用到时才导入。文件类�
 服务启动时早已导入过，别在换过当前目录之后第一次导入它。
 标签文件随 fork 提交，结构是 {任务: {json 相对路径: {条目名: {"periodic": 布尔, "screen": 画面名}}}}。
 没有标签的条目取默认值（periodic 为假，画面为"未分类"）；标签文件里已经不存在的条目、文件、任务，清单一概忽略。
-写入这一半（replace_image、commit_and_push、commit_tags）与合并上游共用 fork_updater.MERGE_LOCK：merge_upstream 不可重入，
-它的中止流程还会把合并窗口里的改动登记进索引再丢掉，所以写入要等合并让出锁。拿锁不阻塞，拿不到立刻拒绝，免得占住线程池里的
-工作线程等上几分钟；仓库里留着没做完的合并（MERGE_HEAD）时同样拒绝。换图不碰 git，只写文件、重新生成 assets.py。
+写入这一半（replace_image、replace_and_commit、commit_and_push、commit_tags）与合并上游共用 fork_updater.MERGE_LOCK：
+merge_upstream 不可重入，它的中止流程还会把合并窗口里的改动登记进索引再丢掉，所以写入要等合并让出锁。拿锁不阻塞，拿不到立刻
+拒绝，免得占住线程池里的工作线程等上几分钟；仓库里留着没做完的合并（MERGE_HEAD）时同样拒绝。replace_image 不碰 git，只写文件、
+重新生成 assets.py；页面上的上传替换走 replace_and_commit，换完立刻提交并推送：没提交的图会被启动器的 git reset --hard 还原。
 提交推送只 add 任务目录（保存标签只 add 标签文件），先拉取 fork：fork 上有运行目录没有的提交就一个提交都不做，免得造出
 推不上去、又被启动器守卫钉死在运行目录里的提交。导出补丁用 git archive，二进制内容不经过 GitRunner.run 的 UTF-8 解码。
 """
@@ -471,8 +472,8 @@ def screen_check(task: str, screen: str, session_id: str, image_id: str, tester:
 class WriteRefused(RuntimeError):
     """素材写入被拒绝：MERGE_LOCK 被占着（别处正在合并或保存），或者仓库里留着没做完的合并（MERGE_HEAD）。
 
-    str(异常) 就是给用户看的原因，HTTP 接口据此回 409。replace_image 直接抛它，什么都没改；commit_and_push 和 commit_tags
-    把它放进返回值的 error。
+    str(异常) 就是给用户看的原因，HTTP 接口据此回 409。replace_image 直接抛它，什么都没改；replace_and_commit、commit_and_push
+    和 commit_tags 把它放进返回值的 error。
     """
 
 
@@ -591,10 +592,42 @@ def _default_regenerate(repo: Path) -> Callable[[str], None]:
     return regenerate
 
 
+@dataclass(frozen=True)
+class _Replacement:
+    """一次换图要写的东西，落盘之前的检查都已通过（见 _prepare_replacement）。"""
+    target: Path                            # 要写的图片，绝对路径
+    shown: str                              # 仓库相对路径，如 tasks/ActivityShikigami/fire/fire_pass_8.png
+    data: bytes                             # 按目标后缀重新编码好的图片
+    unit: str                               # 交给 regenerate 的目录（相对 tasks/）
+    regenerate: Callable[[str], None]
+
+
+def _prepare_replacement(task: str, json_relpath: str, image_name: str, content_base64: str, root: Path | None,
+                         regenerate: Callable[[str], None] | None) -> _Replacement:
+    """换图在落盘之前的全部检查，不碰 git 和磁盘，不通过就抛异常（规则见 replace_image）：任务、素材文件、图片名、路径、
+    后缀、base64、图片内容（解码再按目标后缀重新编码），regenerate 不传时还有默认重新生成对当前目录的检查（RuntimeError）。"""
+    task_dir = task_root(task, root).resolve()
+    target = _replace_target(task_dir, json_relpath, image_name)
+    data = _reencode(_decode_base64(content_base64), target.suffix.lower())
+    if regenerate is None:
+        regenerate = _default_regenerate(_repo_root(root))
+    shown = f'tasks/{task}/{target.relative_to(task_dir).as_posix()}'
+    return _Replacement(target, shown, data, task, regenerate)
+
+
+def _apply_replacement(replacement: _Replacement) -> None:
+    """写图（同目录临时文件再 os.replace），再重新生成 assets.py。调用方持有写入守卫。"""
+    replacement.target.parent.mkdir(parents=True, exist_ok=True)
+    _write_atomically(replacement.target, replacement.data)
+    replacement.regenerate(replacement.unit)
+    logger.info(f'素材替换：{replacement.shown}')
+
+
 def replace_image(task: str, json_relpath: str, image_name: str, content_base64: str, root: Path | None = None,
                   regenerate: Callable[[str], None] | None = None) -> dict:
     """用上传的图片替换 json_relpath 里 imageName 为 image_name 的素材图，再调 regenerate(task) 重新生成 assets.py。
-    返回 {'target': 仓库相对路径}，比如 tasks/ActivityShikigami/fire/fire_pass_8.png。
+    返回 {'target': 仓库相对路径}，比如 tasks/ActivityShikigami/fire/fire_pass_8.png。不提交：页面上的上传替换走
+    replace_and_commit，换完立刻提交推送。
 
     content_base64 是裸 base64 或 data URL。落盘之前的检查都抛 ValueError、什么都不改：任务和素材文件得在清单里，image_name 得是
     那个文件里某个条目的 imageName，路径落在任务目录内、后缀是 .png .jpg .jpeg .bmp，内容得是 cv2 读得出的图片。
@@ -606,17 +639,9 @@ def replace_image(task: str, json_relpath: str, image_name: str, content_base64:
     """
     repo = _repo_root(root)
     with _write_guard(lambda: (repo / '.git' / 'MERGE_HEAD').exists()):
-        task_dir = task_root(task, root).resolve()
-        target = _replace_target(task_dir, json_relpath, image_name)
-        encoded = _reencode(_decode_base64(content_base64), target.suffix.lower())
-        if regenerate is None:
-            regenerate = _default_regenerate(repo)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _write_atomically(target, encoded)
-        regenerate(task)
-    shown = f'tasks/{task}/{target.relative_to(task_dir).as_posix()}'
-    logger.info(f'素材替换：{shown}')
-    return {'target': shown}
+        replacement = _prepare_replacement(task, json_relpath, image_name, content_base64, root, regenerate)
+        _apply_replacement(replacement)
+    return {'target': replacement.shown}
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -695,6 +720,29 @@ def commit_and_push(task: str, message: str, runner: GitRunner, branch: str) -> 
     """
     task_root(task, runner.repo)
     return _commit_and_push(runner, branch, [f'tasks/{task}'], (message or '').strip() or f'素材维护：替换 {task} 素材')
+
+
+def replace_and_commit(task: str, json_relpath: str, image_name: str, content_base64: str, runner: GitRunner,
+                       branch: str, regenerate: Callable[[str], None] | None = None) -> dict:
+    """页面上的"上传替换"：换图、重新生成 assets.py、提交 tasks/<task>、推送到 fork，一步做完。返回
+    {'target': 仓库相对路径, 'replaced': 图写下了没有, 'commit': sha | None, 'pushed': 推上去了没有, 'error': 原因}。
+
+    换下的图不能留在运行目录里不提交：OASX 下次启动服务时启动器 git reset --hard 会把它还原，没提交的改动还会挡住每一次合并上游。
+    落盘之前的检查同 replace_image（仓库是 runner.repo），全部在碰 git 和磁盘之前做完，不通过照样抛异常（ValueError，默认重新生成
+    对当前目录的检查是 RuntimeError）。之后走 commit_and_push 的流程（见 _commit_and_push）：拉取 fork → fork 领先或分叉就拒绝，
+    图不写 → 写图并重新生成 assets.py → 提交 → 推送。replaced 只在写图和重新生成都做完时为真：正在合并或保存、仓库里有没做完的
+    合并、fork 领先或分叉时 replaced 为假，什么都没写，原因在 error 里。提交说明是"素材维护：替换 <target>"，历史里能看出换的是哪张图。
+    写下之后 git 失败（commit 为 None、error 非空）时图留在工作区没提交，"提交并推送"可以重试；推送失败时提交留在本地，同样可以重试。
+    """
+    replacement = _prepare_replacement(task, json_relpath, image_name, content_base64, runner.repo, regenerate)
+    written = []
+
+    def write() -> None:
+        _apply_replacement(replacement)
+        written.append(replacement.shown)
+
+    outcome = _commit_and_push(runner, branch, [f'tasks/{task}'], f'素材维护：替换 {replacement.shown}', write=write)
+    return {'target': replacement.shown, 'replaced': bool(written), **outcome}
 
 
 def commit_tags(tags: dict, runner: GitRunner, branch: str, path: Path | None = None) -> dict:
