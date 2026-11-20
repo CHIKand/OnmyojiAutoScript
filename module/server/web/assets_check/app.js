@@ -17,6 +17,7 @@
   const FRAME_RATE = 2;
   const STATUS_POLL_MS = 1000;
   const STATUS_POLL_LIMIT = 60;
+  const RULE_COLUMNS = 11;          // 清单表的列数，同 index.html 的表头
   const TYPE_LABELS = {
     image: "图片", ocr: "文字识别", click: "点击", long_click: "长按", swipe: "滑动", list: "列表", unknown: "无法解析",
   };
@@ -380,7 +381,7 @@
   function renderRulesPlaceholder(text) {
     const tr = document.createElement("tr");
     const td = cell(tr, text);
-    td.colSpan = 9;
+    td.colSpan = RULE_COLUMNS;
     td.className = "muted";
     el.rulesBody.replaceChildren(tr);
   }
@@ -409,10 +410,15 @@
     cell(tr).appendChild(muted(rule.rule_type === "unknown" ? "解析不了这个文件，见静态检查" : "这个文件里没有条目"));
     cell(tr, TYPE_LABELS[rule.rule_type] || rule.rule_type);
     cell(tr, rule.file);
-    for (let i = 0; i < 5; i += 1) {
+    while (tr.childNodes.length < RULE_COLUMNS) {
       cell(tr);
     }
     return tr;
+  }
+
+  // json 条目里的字符串字段，没有或为空时显示 "—"
+  function textOf(value) {
+    return typeof value === "string" && value.trim() ? value.trim() : "—";
   }
 
   function ruleRow(task, rule, item) {
@@ -425,10 +431,7 @@
     const thumbCell = cell(tr);
     thumbCell.appendChild(imageName ? thumbnail(task, rule.file, imageName, state.thumbVersion) : muted("—"));
 
-    const nameCell = cell(tr, name || "（没有 itemName）");
-    if (typeof item.description === "string" && item.description) {
-      nameCell.title = item.description;
-    }
+    cell(tr, name || "（没有 itemName）");
     cell(tr, TYPE_LABELS[rule.rule_type] || rule.rule_type);
     cell(tr, rule.file);
 
@@ -462,6 +465,12 @@
     }
 
     cell(tr, typeof item.threshold === "number" ? String(item.threshold) : "—");
+    cell(tr, textOf(item.method));
+    const description = document.createElement("span");      // 描述可能很长：截断显示，悬停看全文
+    description.className = "clip";
+    description.textContent = textOf(item.description);
+    description.title = description.textContent;
+    cell(tr).appendChild(description);
     cell(tr).appendChild(imageName ? replaceControl(task, rule.file, imageName, thumbCell) : muted("—"));
     return tr;
   }

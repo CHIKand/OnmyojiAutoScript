@@ -156,6 +156,15 @@
   display: block;
 }
 
+/* 清单的描述列：超出宽度的部分省略，悬停看全文（title） */
+.clip {
+  display: inline-block;
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+
 .roi-text {
   line-height: 1.5;
 }

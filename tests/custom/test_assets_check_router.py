@@ -760,6 +760,16 @@ def test_query_flag_and_error_body_over_http(app, foo):
     assert (status, json.loads(body)) == (400, {'detail': {'code': 'invalid_request', 'message': "未知任务：'NoSuch'"}})
 
 
+def test_rules_table_shows_method_and_description():
+    """清单按规格 §9 列出方法和描述；app.js 里的列数（占位行、空文件行要铺满整行）与表头一致。"""
+    html = (WEB_DIR / 'index.html').read_text(encoding='utf-8')
+    head = re.search(r'<thead>\s*<tr>(.*?)</tr>\s*</thead>\s*<tbody id="rulesBody">', html, re.S).group(1)
+    headers = re.findall(r'<th>([^<]*)</th>', head)
+    assert headers == ['缩略图', '条目', '类型', '文件', '每期必换', '画面', 'ROI', '阈值', '方法', '描述', '替换']
+    columns = re.search(r'const RULE_COLUMNS = (\d+);', (WEB_DIR / 'app.js').read_text(encoding='utf-8'))
+    assert columns and int(columns.group(1)) == len(headers)
+
+
 def test_page_references_resolve_to_local_files():
     """页面只引用本服务上的文件（标注工具的 base.css 和本页的静态目录），不用外部 CDN，也不需要构建。"""
     html = (WEB_DIR / 'index.html').read_text(encoding='utf-8')
