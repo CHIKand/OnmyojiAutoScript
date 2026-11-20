@@ -984,7 +984,8 @@ def test_replace_and_commit_roundtrip(repo, monkeypatch):
 
     result = assets_check.replace_and_commit('Foo', 'as/image.json', 'a.png', b64(new), repo.runner, 'custom')
 
-    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': True, 'commit': repo.head, 'pushed': True, 'error': ''}
+    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': True, 'commit': repo.head, 'pushed': True, 'error': '',
+                      'uncommitted': False}
     assert repo.fork_tip == result['commit']                                    # fork 上能看到该提交
     assert repo.files_of(result['commit']) == {'tasks/Foo/as/a.png', 'tasks/Foo/assets.py'}
     assert repo.message(result['commit']) == '素材维护：替换 tasks/Foo/as/a.png'
@@ -1010,7 +1011,7 @@ def test_replace_and_commit_refuses_before_writing_when_the_fork_is_ahead(repo):
     result, regen = replace_commit(repo)
 
     assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': False, 'commit': None, 'pushed': False,
-                      'error': fork_ahead(1)}
+                      'error': fork_ahead(1), 'uncommitted': False}
     assert worktree(repo.work) == files and regen.calls == []                 # 图没写，assets.py 也没重新生成
     assert repo.head == before and repo.status() == []
 
@@ -1019,7 +1020,8 @@ def test_replace_and_commit_refuses_when_busy(repo, git_calls):
     before = tree(repo.work)
     with lock_held():
         result, regen = replace_commit(repo)
-    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': False, 'commit': None, 'pushed': False, 'error': BUSY}
+    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': False, 'commit': None, 'pushed': False, 'error': BUSY,
+                      'uncommitted': False}
     assert git_calls == [] and regen.calls == []
     assert tree(repo.work) == before
 
@@ -1028,9 +1030,10 @@ def test_replace_and_commit_refuses_while_a_merge_is_in_progress(repo, git_calls
     write_files(repo.work, {'.git/MERGE_HEAD': repo.head + '\n'})
     before = tree(repo.work)
     result, regen = replace_commit(repo)
-    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': False, 'commit': None, 'pushed': False, 'error': MERGING}
+    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': False, 'commit': None, 'pushed': False, 'error': MERGING,
+                      'uncommitted': False}
     assert tree(repo.work) == before and regen.calls == []
-    assert not {call[0] for call in git_calls} & {'fetch', 'add', 'commit', 'push'}
+    assert not {call[0] for call in git_calls} & {'fetch', 'add', 'commit', 'push', 'status'}
 
 
 def test_replace_and_commit_keeps_the_local_commit_when_the_push_fails(repo, tmp_path):
@@ -1038,7 +1041,7 @@ def test_replace_and_commit_keeps_the_local_commit_when_the_push_fails(repo, tmp
 
     result, _ = replace_commit(repo)
 
-    assert (result['replaced'], result['commit'], result['pushed']) == (True, repo.head, False)
+    assert (result['replaced'], result['commit'], result['pushed'], result['uncommitted']) == (True, repo.head, False, False)
     assert result['error'].startswith('推送失败：') and result['error'].endswith(PUSH_TAIL)
     assert repo.fork_tip != repo.head and repo.files_of(repo.head) == {'tasks/Foo/as/a.png'}
     repo.fix_push()
@@ -1047,12 +1050,66 @@ def test_replace_and_commit_keeps_the_local_commit_when_the_push_fails(repo, tmp
 
 
 def test_replace_and_commit_reports_a_git_failure_after_the_write(repo, monkeypatch):
-    """图已经写下、提交失败：replaced 为真、commit 为空，error 是原因（页面据此提示点"提交并推送"重试）。"""
+    """图已经写下、提交失败：replaced 为真、commit 为空、uncommitted 为真，error 是原因（页面据此提示点"提交并推送"重试）。"""
     break_git(monkeypatch, 'commit', stderr='Author identity unknown\n\nfatal: unable to auto-detect email address')
     result, regen = replace_commit(repo)
     assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': True, 'commit': None, 'pushed': False,
-                      'error': 'git 命令失败：Author identity unknown'}
+                      'error': 'git 命令失败：Author identity unknown', 'uncommitted': True}
     assert regen.calls == ['Foo'] and repo.status() == ['M  tasks/Foo/as/a.png']      # 已暂存、没提交成
+
+
+def test_replace_and_commit_same_image_after_a_failed_push(repo, tmp_path):
+    """推送失败之后再传一张一样的图（cv2 重新编码是确定的，写下去的字节相同）：没有新的提交，uncommitted 为假，
+    error 是补推之前那个提交又失败的原因，不是"没有提交成功"；推送修好之后再传一次，补推上去，仍然没有新的提交。"""
+    repo.break_push(tmp_path / 'missing.git')
+    content = b64(png_bytes((9, 8, 7), (3, 2)))
+    first, _ = replace_commit(repo, content=content)
+    committed = repo.head
+    assert (first['commit'], first['pushed'], first['uncommitted']) == (committed, False, False)
+
+    again, regen = replace_commit(repo, content=content)
+
+    assert {key: again[key] for key in ('replaced', 'commit', 'pushed', 'uncommitted')} == {
+        'replaced': True, 'commit': None, 'pushed': False, 'uncommitted': False}
+    assert again['error'].startswith('推送失败：') and again['error'].endswith(PUSH_TAIL)
+    assert regen.calls == ['Foo'] and repo.head == committed and repo.status() == []
+
+    repo.fix_push()
+    pushed, _ = replace_commit(repo, content=content)
+    assert pushed == {'target': 'tasks/Foo/as/a.png', 'replaced': True, 'commit': None, 'pushed': True, 'error': '',
+                      'uncommitted': False}
+    assert repo.fork_tip == repo.head == committed
+
+
+def test_replace_and_commit_same_image_as_the_fork(repo):
+    """传上来的图和已提交、已推送的一样：图照样重写一遍，没有提交、不推送，也没有错误。"""
+    result, _ = replace_commit(repo, content=b64(OLD_PNG))
+    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': True, 'commit': None, 'pushed': False, 'error': '',
+                      'uncommitted': False}
+    assert repo.status() == [] and repo.fork_tip == repo.head
+
+
+def test_replace_and_commit_asks_git_about_the_image_under_the_lock(repo, monkeypatch):
+    """uncommitted 取自 git status 对这张图的看法，在提交推送之后、放锁之前查，只查这一个路径。"""
+    checks, real = [], GitRunner.run
+
+    def spy(self, *args, check=True):
+        if args[0] == 'status':
+            checks.append((args[-2:], fork_updater.MERGE_LOCK.locked()))
+        return real(self, *args, check=check)
+
+    monkeypatch.setattr(GitRunner, 'run', spy)
+    result, _ = replace_commit(repo, 'gone.png')
+    assert (result['pushed'], result['uncommitted']) == (True, False)
+    assert checks == [(('--', 'tasks/Foo/as/gone.png'), True)]
+
+
+def test_replace_and_commit_counts_an_unknown_git_status_as_uncommitted(repo, monkeypatch, log):
+    """git status 自己失败时看不出图提交了没有：按没提交算（页面会提示点"提交并推送"，真没有改动时只是一次空操作），记警告。"""
+    break_git(monkeypatch, 'status', stderr='fatal: index file corrupt')
+    result, _ = replace_commit(repo, content=b64(OLD_PNG))
+    assert (result['replaced'], result['commit'], result['error'], result['uncommitted']) == (True, None, '', True)
+    assert any('index file corrupt' in message for message in log.messages('warning'))
 
 
 @pytest.mark.parametrize('task, json_relpath, image_name, content', [
@@ -1091,7 +1148,7 @@ def test_replace_and_commit_a_component_image(repo):
     result, regen = replace_commit(repo, 'x.png', json_relpath='A/image.json', task='Component')
 
     assert result == {'target': 'tasks/Component/A/x.png', 'replaced': True, 'commit': repo.head, 'pushed': True,
-                      'error': ''}
+                      'error': '', 'uncommitted': False}
     assert regen.calls == ['Component/A']
     assert repo.files_of(result['commit']) == {'tasks/Component/A/x.png', 'tasks/Component/B/new.png'}
     assert repo.message(result['commit']) == '素材维护：替换 tasks/Component/A/x.png'

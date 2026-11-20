@@ -558,7 +558,8 @@ def test_replace_image_commits_with_the_resolved_runner_and_branch(repo, monkeyp
     result = post_replace_image('Foo', replace_body(content=content))
 
     assert calls == [(('Foo', 'as/image.json', 'a.png', content, repo.runner, 'custom'), {})]
-    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': True, 'commit': repo.head, 'pushed': True, 'error': ''}
+    assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': True, 'commit': repo.head, 'pushed': True, 'error': '',
+                      'uncommitted': False}
     assert repo.fork_tip == repo.head and repo.files_of(repo.head) == {'tasks/Foo/as/a.png'}
     assert repo.message(repo.head) == '素材维护：替换 tasks/Foo/as/a.png'
     assert np.array_equal(pixels(repo.work / 'tasks/Foo/as/a.png'), cv2.imdecode(np.frombuffer(NEW_PNG, np.uint8),
@@ -584,7 +585,7 @@ def test_busy_replace_comes_back_in_the_result(repo):
         result = post_replace_image('Foo', replace_body())
 
     assert result == {'target': 'tasks/Foo/as/a.png', 'replaced': False, 'commit': None, 'pushed': False,
-                      'error': '正在合并上游或保存素材，请稍后再试'}
+                      'error': '正在合并上游或保存素材，请稍后再试', 'uncommitted': False}
     assert files_under(repo.work) == before
 
 
@@ -844,6 +845,61 @@ def test_rules_table_shows_method_and_description():
     assert headers == ['缩略图', '条目', '类型', '文件', '每期必换', '画面', 'ROI', '阈值', '方法', '描述', '替换']
     columns = re.search(r'const RULE_COLUMNS = (\d+);', (WEB_DIR / 'app.js').read_text(encoding='utf-8'))
     assert columns and int(columns.group(1)) == len(headers)
+
+
+NODE = shutil.which('node')
+
+
+def page_functions(*names: str) -> str:
+    """app.js 里几个函数（IIFE 里缩进两格的 function 声明）的源码，按给的顺序拼起来。"""
+    text = (WEB_DIR / 'app.js').read_text(encoding='utf-8')
+    found = []
+    for name in names:
+        match = re.search(rf'^  function {name}\(.*?^  }}\n', text, re.M | re.S)
+        assert match, f'app.js 里没有函数 {name}'
+        found.append(match.group(0))
+    return ''.join(found)
+
+
+def call_page_function(name: str, helpers: tuple[str, ...], args: list) -> list:
+    """用 node 跑 app.js 里的函数 name（helpers 是它用到的别的函数）：args 里每一项当参数调一次，返回各次的结果。"""
+    script = (page_functions(*helpers, name)
+              + f'process.stdout.write(JSON.stringify({json.dumps(args, ensure_ascii=False)}.map((arg) => {name}(arg))));\n')
+    done = subprocess.run([NODE], input=script, capture_output=True, encoding='utf-8')
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+PUSH_FAILED = assets_check.PUSH_FAILED_TEXT.format(reason='网络不通或超时')
+FETCH_FAILED = assets_check.FETCH_FAILED_TEXT.format(reason='网络不通或超时')
+COMMIT_FAILED = assets_check.GIT_FAILED_TEXT.format(reason='Author identity unknown')
+SAME_IMAGE = '图和已提交的版本相同，没有新的提交'
+REPLACE_MESSAGES = [        # (上传替换的结果, 页面上的 [提示, 样式])
+    ({'replaced': False, 'commit': None, 'pushed': False, 'error': assets_check.BUSY_TEXT, 'uncommitted': False},
+     ['没有替换：' + assets_check.BUSY_TEXT, 'error']),
+    ({'replaced': True, 'commit': '0123456789abcdef', 'pushed': True, 'error': '', 'uncommitted': False},
+     ['已替换并保存到 fork（提交 0123456），重启实例后生效', 'ok']),
+    ({'replaced': True, 'commit': '0123456789abcdef', 'pushed': False, 'error': PUSH_FAILED, 'uncommitted': False},
+     ['图已替换并在本地提交，但没有推送到 fork：' + PUSH_FAILED, 'error']),
+    ({'replaced': True, 'commit': None, 'pushed': False, 'error': COMMIT_FAILED, 'uncommitted': True},
+     ['图已替换，但没有提交成功：' + COMMIT_FAILED + '。点"提交并推送"重试；不提交的话下次启动服务会还原这张图', 'error']),
+    ({'replaced': True, 'commit': None, 'pushed': False, 'error': PUSH_FAILED, 'uncommitted': False},
+     [SAME_IMAGE + '：' + PUSH_FAILED, 'error']),
+    ({'replaced': True, 'commit': None, 'pushed': False, 'error': FETCH_FAILED, 'uncommitted': False},
+     [SAME_IMAGE + '：' + FETCH_FAILED, 'error']),
+    ({'replaced': True, 'commit': None, 'pushed': True, 'error': '', 'uncommitted': False},
+     [SAME_IMAGE + '；之前没推送的提交已推送到 fork', 'ok']),
+    ({'replaced': True, 'commit': None, 'pushed': False, 'error': '', 'uncommitted': False}, [SAME_IMAGE, 'ok']),
+]
+
+
+@pytest.mark.skipif(NODE is None, reason='没有 node，跑不了页面脚本')
+def test_replace_messages_follow_the_result():
+    """上传替换的提示：只有 git 说图还没提交（uncommitted）时才说"没有提交成功、会还原这张图"；图和已提交的一样时
+    （commit 为空、uncommitted 为假）说没有新的提交，这时的 error 和 pushed 说的是之前那个提交或者拉取。"""
+    results = [result for result, _ in REPLACE_MESSAGES]
+    assert call_page_function('describeReplace', ('shortSha', 'commitNote'), results) == [
+        message for _, message in REPLACE_MESSAGES]
 
 
 def test_page_references_resolve_to_local_files():

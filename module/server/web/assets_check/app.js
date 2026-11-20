@@ -214,22 +214,26 @@
     return [subject + "没有改动，不需要提交", "ok"];
   }
 
-  // 上传替换的结果：后端换完图立刻提交并推送，replaced 说明图写下了没有
+  // 上传替换的结果：后端换完图立刻提交并推送。replaced 说明图写下了没有，uncommitted 是 git 看这张图还有没有没提交的改动
   function describeReplace(result) {
     if (!result.replaced) {
       return ["没有替换：" + (result.error || "原因不明"), "error"];
     }
-    if (result.pushed) {
-      return ["已替换并保存到 fork" + commitNote(result) + "，重启实例后生效", "ok"];
-    }
     if (result.commit) {
-      return ["图已替换并在本地提交，但没有推送到 fork：" + result.error, "error"];
+      return result.pushed
+        ? ["已替换并保存到 fork" + commitNote(result) + "，重启实例后生效", "ok"]
+        : ["图已替换并在本地提交，但没有推送到 fork：" + result.error, "error"];
     }
-    if (result.error) {
-      return ["图已替换，但没有提交成功：" + result.error
+    if (result.uncommitted) {
+      return ["图已替换，但没有提交成功：" + (result.error || "原因不明")
         + "。点\"提交并推送\"重试；不提交的话下次启动服务会还原这张图", "error"];
     }
-    return ["图已替换，内容和 fork 上的一样，不需要提交", "ok"];
+    // 图和已提交的一样，没有新的提交：error 和 pushed 说的是之前没推上去的提交，或者拉取
+    const same = "图和已提交的版本相同，没有新的提交";
+    if (result.pushed) {
+      return [same + "；之前没推送的提交已推送到 fork", "ok"];
+    }
+    return result.error ? [same + "：" + result.error, "error"] : [same, "ok"];
   }
 
   // ---------------------------------------------------------------------------------------------------------------

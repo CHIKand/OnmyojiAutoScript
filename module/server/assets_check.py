@@ -727,35 +727,57 @@ def _push_if_ahead(runner: GitRunner, branch: str) -> tuple[bool, str]:
 
 
 def _commit_and_push(runner: GitRunner, branch: str, paths: list[str], message: str,
-                     write: Callable[[], None] | None = None) -> dict:
+                     write: Callable[[], None] | None = None, after: Callable[[], None] | None = None) -> dict:
     """commit_and_push、replace_and_commit 和 commit_tags 共用的核心，整个过程持有写入守卫（见 _write_guard）。
 
     顺序：拉取 fork → fork 有运行目录没有的提交就拒绝（什么都没提交，write 也没调）→ write()（保存标签靠它在拒绝之后才落盘，
     拒绝时检出保持干净）→ 只提交 paths（原子写入的临时文件除外，见 _write_atomically）→ 拉取失败就不推送 → 推送。
     拉取失败不挡着本地提交（启动器守卫不会冲掉没推上去的提交），只是不推送并提示重试；推送失败同理，提交留在本地，下次补推。
     git 命令跑了但退出码非零（没配提交身份、index.lock……）转成 error，不往外抛；写文件失败等别的异常照常往外抛。
+    after 在结果定下之后（被 fork 拒绝、git 失败也算）、放锁之前调用，调用方用它查提交推送之后的仓库，查到的不会被别的写入插队改掉；
+    它自己不该抛异常。
     """
-    commit = None
     try:
         with _write_guard(lambda: _ref_exists(runner, 'MERGE_HEAD')):
-            fetch_failure = _fetch(runner, FORK_REMOTE, branch)
-            refusal = '' if fetch_failure else _fork_refusal(runner, branch)
-            if refusal:
-                return _outcome(None, False, refusal)
-            if write is not None:
-                write()
-            commit = commit_paths(runner, [*paths, SCRATCH_PATHSPEC], message)
-            if fetch_failure:
-                logger.warning(f'素材提交：拉取 fork 失败：{fetch_failure.message}')
-                reason = _first_line(fetch_failure.message) or UNKNOWN_REASON
-                return _outcome(commit, False, FETCH_FAILED_TEXT.format(reason=reason))
-            pushed, error = _push_if_ahead(runner, branch)
-            return _outcome(commit, pushed, error)
+            outcome = _locked_commit_and_push(runner, branch, paths, message, write)
+            if after is not None:
+                after()
+            return outcome
     except WriteRefused as exc:
         return _outcome(None, False, str(exc))
+
+
+def _locked_commit_and_push(runner: GitRunner, branch: str, paths: list[str], message: str,
+                            write: Callable[[], None] | None) -> dict:
+    """_commit_and_push 拿到写入守卫之后的部分：拉取、核对 fork、write()、提交、推送，git 失败转成 error。"""
+    commit = None
+    try:
+        fetch_failure = _fetch(runner, FORK_REMOTE, branch)
+        refusal = '' if fetch_failure else _fork_refusal(runner, branch)
+        if refusal:
+            return _outcome(None, False, refusal)
+        if write is not None:
+            write()
+        commit = commit_paths(runner, [*paths, SCRATCH_PATHSPEC], message)
+        if fetch_failure:
+            logger.warning(f'素材提交：拉取 fork 失败：{fetch_failure.message}')
+            reason = _first_line(fetch_failure.message) or UNKNOWN_REASON
+            return _outcome(commit, False, FETCH_FAILED_TEXT.format(reason=reason))
+        pushed, error = _push_if_ahead(runner, branch)
+        return _outcome(commit, pushed, error)
     except subprocess.CalledProcessError as exc:
         logger.warning(f'素材提交：git 命令失败：{exc.cmd}\n{exc.stderr}')
         return _outcome(commit, False, GIT_FAILED_TEXT.format(reason=_first_line(exc.stderr or '') or UNKNOWN_REASON))
+
+
+def _uncommitted(runner: GitRunner, path: str) -> bool:
+    """git 看来 path（仓库相对路径）还有没提交的改动：工作区或索引与 HEAD 不同，或者它没被跟踪（被忽略的也算，它提交不进去）。
+    git status 自己失败时看不出来，记一条警告，按没提交算：页面据此提示点"提交并推送"，真没有改动时那只是一次空操作。"""
+    status = runner.run('status', '--porcelain', '--untracked-files=all', '--ignored', '--', path, check=False)
+    if status.returncode != 0:
+        logger.warning(f'素材替换：git status 查不了 {path}：{_first_line(status.stderr) or UNKNOWN_REASON}')
+        return True
+    return bool(status.stdout.strip())
 
 
 def commit_and_push(task: str, message: str, runner: GitRunner, branch: str) -> dict:
@@ -773,24 +795,33 @@ def commit_and_push(task: str, message: str, runner: GitRunner, branch: str) -> 
 def replace_and_commit(task: str, json_relpath: str, image_name: str, content_base64: str, runner: GitRunner,
                        branch: str, regenerate: Callable[[str], None] | None = None) -> dict:
     """页面上的"上传替换"：换图、重新生成 assets.py、提交 tasks/<task>、推送到 fork，一步做完。返回
-    {'target': 仓库相对路径, 'replaced': 图写下了没有, 'commit': sha | None, 'pushed': 推上去了没有, 'error': 原因}。
+    {'target': 仓库相对路径, 'replaced': 图写下了没有, 'commit': sha | None, 'pushed': 推上去了没有, 'error': 原因,
+    'uncommitted': 图还有没有没提交的改动}。
 
     换下的图不能留在运行目录里不提交：OASX 下次启动服务时启动器 git reset --hard 会把它还原，没提交的改动还会挡住每一次合并上游。
     落盘之前的检查同 replace_image（仓库是 runner.repo），全部在碰 git 和磁盘之前做完，不通过照样抛异常（ValueError，默认重新生成
     对当前目录的检查是 RuntimeError）。之后走 commit_and_push 的流程（见 _commit_and_push）：拉取 fork → fork 领先或分叉就拒绝，
     图不写 → 写图并重新生成 assets.py → 提交 → 推送。replaced 只在写图和重新生成都做完时为真：正在合并或保存、仓库里有没做完的
     合并、fork 领先或分叉时 replaced 为假，什么都没写，原因在 error 里。提交说明是"素材维护：替换 <target>"，历史里能看出换的是哪张图。
-    写下之后 git 失败（commit 为 None、error 非空）时图留在工作区没提交，"提交并推送"可以重试；推送失败时提交留在本地，同样可以重试。
+    uncommitted 是提交推送之后、放锁之前 git status 对这张图的看法（不看 error 的文字），replaced 为假时一律为假。写下之后提交失败时
+    它为真，图留在工作区没提交，"提交并推送"可以重试。传上来的图和已提交的一样时没有新的提交：commit 为 None、uncommitted 为假，
+    这时的 error（推送、拉取失败）和 pushed 说的是之前没推上去的提交。推送失败时提交留在本地，同样可以重试。
     """
     replacement = _prepare_replacement(task, json_relpath, image_name, content_base64, runner.repo, regenerate)
-    written = []
+    replaced = uncommitted = False
 
     def write() -> None:
+        nonlocal replaced
         _apply_replacement(replacement)
-        written.append(replacement.shown)
+        replaced = True
 
-    outcome = _commit_and_push(runner, branch, [f'tasks/{task}'], f'素材维护：替换 {replacement.shown}', write=write)
-    return {'target': replacement.shown, 'replaced': bool(written), **outcome}
+    def after() -> None:
+        nonlocal uncommitted
+        uncommitted = replaced and _uncommitted(runner, replacement.shown)
+
+    outcome = _commit_and_push(runner, branch, [f'tasks/{task}'], f'素材维护：替换 {replacement.shown}', write=write,
+                               after=after)
+    return {'target': replacement.shown, 'replaced': replaced, **outcome, 'uncommitted': uncommitted}
 
 
 def commit_tags(tags: dict, runner: GitRunner, branch: str, path: Path | None = None) -> dict:
