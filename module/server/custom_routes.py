@@ -4,6 +4,7 @@
 """
 from fastapi import FastAPI
 
+from module.server.assets_check_router import STATIC_PREFIX, WEB_DIR, NoCacheStaticFiles, assets_api, assets_page
 from module.server.custom_jobs import start_custom_jobs  # noqa: F401  转出给 app.py
 from module.server.instance_control import instance_app
 from module.server.orchestra_router import orchestra_app
@@ -12,3 +13,7 @@ from module.server.orchestra_router import orchestra_app
 def register_custom(app: FastAPI) -> None:
     app.include_router(orchestra_app)
     app.include_router(instance_app)
+    app.include_router(assets_api)
+    app.include_router(assets_page)
+    if WEB_DIR.is_dir():        # 同 app.py 挂标注工具静态目录的做法：目录缺了不挡着服务启动，页面回 404
+        app.mount(STATIC_PREFIX, NoCacheStaticFiles(directory=str(WEB_DIR)), name='assets_check_static')

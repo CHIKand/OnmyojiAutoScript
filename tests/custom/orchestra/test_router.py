@@ -442,7 +442,8 @@ def test_restart_endpoint(instance_dir, monkeypatch):
 def test_register_custom_mounts_the_routes():
     app = FastAPI()
     register_custom(app)
-    mounted = {(route.path, method) for route in app.routes if route.path.startswith('/custom') for method in route.methods}
+    mounted = {(route.path, method) for route in app.routes
+               if route.path.startswith(('/custom/orchestra', '/custom/instance')) for method in route.methods}
     assert mounted == {
         ('/custom/orchestra/{script_name}', 'GET'),
         ('/custom/orchestra/{script_name}', 'PUT'),

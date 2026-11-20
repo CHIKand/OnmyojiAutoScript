@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OAS 素材维护</title>
+  <link rel="stylesheet" href="/tool/annotator/static/css/base.css">
+  <link rel="stylesheet" href="/custom/assets/static/style.css">
+</head>
+<body>
+  <div class="page-head">
+    <header class="topbar">
+      <h1>OAS 素材维护</h1>
+      <div class="topbar-actions">
+        <div class="session-meta"><span>截屏会话：</span><code id="sessionId">-</code></div>
+      </div>
+    </header>
+    <div class="page-message hidden" id="pageMessage" role="status"></div>
+  </div>
+
+  <main class="assets-main">
+    <section class="panel">
+      <h2>任务</h2>
+      <div class="row">
+        <select id="taskSelect" aria-label="任务"></select>
+        <label class="inline-check"><input type="checkbox" id="showAllTasks">显示全部任务</label>
+        <button type="button" id="reloadBtn">重新读取</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>素材清单</h2>
+        <div class="panel-tools">
+          <span class="status-text" id="tagsStatus"></span>
+          <button type="button" id="saveTagsBtn" disabled>保存标签</button>
+        </div>
+      </div>
+      <div class="table-wrap rules-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>缩略图</th><th>条目</th><th>类型</th><th>文件</th><th>每期必换</th><th>画面</th><th>ROI</th><th>阈值</th><th>替换</th>
+            </tr>
+          </thead>
+          <tbody id="rulesBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>静态检查</h2>
+      <div id="staticResult"></div>
+    </section>
+
+    <section class="panel">
+      <h2>按画面体检</h2>
+      <div class="row">
+        <select id="instanceSelect" aria-label="实例"></select>
+        <button type="button" id="startCaptureBtn">开始截屏</button>
+        <span class="status-text" id="captureStatus">未开始截屏</span>
+      </div>
+      <div class="row">
+        <select id="screenSelect" aria-label="画面"></select>
+        <button type="button" id="screenCheckBtn">体检</button>
+      </div>
+      <div class="tip hidden" id="checkHint"></div>
+      <div class="check-body">
+        <a class="hidden" id="captureLink" target="_blank" rel="noopener">
+          <img class="capture-preview" id="capturePreview" alt="体检用的截图">
+        </a>
+        <div class="table-wrap check-wrap hidden" id="checkWrap">
+          <table class="data-table">
+            <thead>
+              <tr><th>条目</th><th>文件</th><th>得分</th><th>阈值</th><th>结果</th></tr>
+            </thead>
+            <tbody id="checkBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>提交与生效</h2>
+      <div class="row">
+        <input type="text" id="commitMessage" placeholder="提交说明，可留空">
+        <button type="button" id="commitPushBtn">提交并推送</button>
+        <button type="button" id="restartBtn">重启实例使其生效</button>
+        <button type="button" id="exportBtn">导出补丁包</button>
+        <button type="button" id="annotatorBtn">去标注工具框选</button>
+      </div>
+      <p class="status-text">重启的是"按画面体检"里选中的实例。导出补丁包导出的是本页最近一次"提交并推送"的提交。</p>
+    </section>
+  </main>
+
+  <script src="/custom/assets/static/app.js"></script>
+</body>
+</html>

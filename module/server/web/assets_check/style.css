@@ -1,0 +1,218 @@
+/*
+ * 素材维护页：颜色、字号、按钮和输入框沿用标注工具的 base.css（同一套 CSS 变量），这里只放本页的布局。
+ */
+
+.page-head {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.page-message {
+  padding: 7px 14px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-secondary);
+  background: var(--bg-subpanel);
+  border-bottom: 1px solid var(--line-main);
+}
+
+.page-message.ok {
+  color: var(--ok);
+  border-bottom-color: var(--ok-border);
+}
+
+.page-message.error {
+  color: var(--danger);
+  border-bottom-color: var(--danger-border);
+}
+
+.assets-main {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 10px;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.panel-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+/* base.css 把 label 排成上下两行，勾选框要和文字同一行 */
+.inline-check {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+
+.status-text {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.status-text.ok {
+  color: var(--ok);
+}
+
+.status-text.error {
+  color: var(--danger);
+}
+
+.table-wrap {
+  overflow: auto;
+  border: 1px solid var(--line-main);
+  border-radius: 6px;
+  background: var(--bg-subpanel);
+}
+
+.rules-wrap {
+  max-height: 62vh;
+}
+
+.check-wrap {
+  flex: 1 1 480px;
+  max-height: 52vh;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.data-table th,
+.data-table td {
+  padding: 5px 8px;
+  text-align: left;
+  vertical-align: middle;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.data-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-panel-2);
+}
+
+.data-table tbody tr:hover {
+  background: var(--selected-bg);
+}
+
+.data-table select {
+  padding: 3px 6px;
+}
+
+.data-table button {
+  padding: 4px 8px;
+}
+
+.thumb {
+  width: 64px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border: 1px solid var(--line-main);
+  border-radius: 4px;
+  background: var(--bg-stage-inner);
+}
+
+.thumb img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.thumb.missing {
+  font-size: 11px;
+  color: var(--danger);
+  border-color: var(--danger-border);
+}
+
+.cell-line {
+  display: block;
+}
+
+.roi-text {
+  line-height: 1.5;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.text-ok {
+  color: var(--ok);
+}
+
+.text-danger {
+  color: var(--danger);
+}
+
+.row-muted td {
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
+.issue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.issue-list li {
+  padding: 5px 8px;
+  font-size: 12px;
+  word-break: break-word;
+  color: var(--danger);
+  background: var(--bg-subpanel);
+  border: 1px solid var(--danger-border);
+  border-radius: 5px;
+}
+
+.issue-kind {
+  margin-right: 6px;
+  font-weight: 600;
+}
+
+.check-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.capture-preview {
+  display: block;
+  width: 320px;
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--line-main);
+  border-radius: 6px;
+}
