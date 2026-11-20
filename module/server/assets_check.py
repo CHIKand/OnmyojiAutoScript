@@ -1,6 +1,6 @@
-"""素材维护页的业务逻辑：任务清单、静态检查、标签文件。
+"""素材维护页的业务逻辑：任务清单、静态检查、标签文件、按画面体检，以及换图、提交推送、导出补丁。
 
-这一层只读素材、做判断，不碰 git，也不改素材。root 是仓库根目录（任务在 root/tasks/ 下），不传就取进程的当前目录，
+清单、静态检查、体检只读素材、做判断，不碰 git，也不改素材。root 是仓库根目录（任务在 root/tasks/ 下），不传就取进程的当前目录，
 与标注工具的 PROJECT_ROOT 一致；测试传临时目录，不依赖全局状态。
 
 清单和检查看到的 json，与 dev_tools/assets_extract.py 编进 assets.py 的完全一致：直接用 AssetsExtractor.all_json_file，
@@ -13,16 +13,28 @@ dev_tools.assets_extract 依赖 numpy 和 tqdm，用到时才导入。文件类�
 服务启动时早已导入过，别在换过当前目录之后第一次导入它。
 标签文件随 fork 提交，结构是 {任务: {json 相对路径: {条目名: {"periodic": 布尔, "screen": 画面名}}}}。
 没有标签的条目取默认值（periodic 为假，画面为"未分类"）；标签文件里已经不存在的条目、文件、任务，清单一概忽略。
+写入这一半（replace_image、commit_and_push、commit_tags）与合并上游共用 fork_updater.MERGE_LOCK：merge_upstream 不可重入，
+它的中止流程还会把合并窗口里的改动登记进索引再丢掉，所以写入要等合并让出锁。拿锁不阻塞，拿不到立刻拒绝，免得占住线程池里的
+工作线程等上几分钟；仓库里留着没做完的合并（MERGE_HEAD）时同样拒绝。换图不碰 git，只写文件、重新生成 assets.py。
+提交推送只 add 任务目录（保存标签只 add 标签文件），先拉取 fork：fork 上有运行目录没有的提交就一个提交都不做，免得造出
+推不上去、又被启动器守卫钉死在运行目录里的提交。导出补丁用 git archive，二进制内容不经过 GitRunner.run 的 UTF-8 解码。
 """
+import base64
 import json
 import math
 import os
 import re
+import subprocess
 import tempfile
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from module.logger import logger
+from module.server import fork_updater
+from module.server.fork_git import (FORK_REMOTE, GitRunner, _count, _fetch, _fork_state, _ref_exists, commit_paths,
+                                    push)
 
 DEFAULT_TASKS = ('ActivityShikigami', 'MetaDemon')      # 页面默认只列这两个限时活动，可以切换成全部任务
 CONTAINER_TASK = 'Component'                            # 组件的容器目录，素材在 Component/<组件>/ 里，它自己不是任务
@@ -34,6 +46,18 @@ TAGS_RELPATH = Path('assets') / 'custom' / 'assets_tags.json'
 _ROI_FIELDS = ('roiFront', 'roiBack')
 _ATTRIBUTE = re.compile(r'^\t([A-Z]+_[A-Z0-9_]+) =', re.MULTILINE)      # assets.py 里的属性名
 _NAMES_SHOWN = 10                                       # 说明里最多列出几个属性名
+SCORED_TYPES = ('image', 'ocr')                         # 体检只给这两类条目打分，别的类型没有"在画面上匹配"一说
+IMAGE_SUFFIXES = ('.png', '.jpg', '.jpeg', '.bmp')      # 允许替换的图片后缀（标注工具额外放行的 .webp 这里不收）
+TAGS_COMMIT_MESSAGE = '素材维护：更新标签'
+BUSY_TEXT = '正在合并上游或保存素材，请稍后再试'
+MERGING_TEXT = '仓库里有未完成的上游合并，请先在 OASX 更新页点"执行更新"处理，再保存素材'
+FORK_AHEAD_TEXT = ('fork 上有 {n} 个运行目录还没有的提交，现在提交会和 fork 分叉：请先在 OASX 重启服务同步，'
+                   '再重新替换并提交（重启会还原未提交的改动）')
+DIVERGED_TEXT = '运行目录和 fork 已经分叉，需要人工处理，这次没有提交'
+FETCH_FAILED_TEXT = '拉取 fork 失败，没有推送：{reason}。已提交的改动留在本地，启动器不会冲掉，联网后再点"提交并推送"'
+PUSH_FAILED_TEXT = '推送失败：{reason}。改动已在本地提交，可以稍后再点"提交并推送"重试'
+GIT_FAILED_TEXT = 'git 命令失败：{reason}'
+UNKNOWN_REASON = '原因不明'
 
 
 @dataclass(frozen=True)
@@ -384,3 +408,338 @@ def static_check(task: str, root: Path | None = None) -> list[Issue]:
     if not any(issue.kind == 'json_error' for issue in issues):
         issues += _outdated_issues(task_dir, root)
     return issues
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# 按画面体检
+# ------------------------------------------------------------------------------------------------------------------
+
+def _scored_entries(task_dir: Path) -> list[tuple[str, str, dict]]:
+    """要打分的条目：[(json 相对任务目录的路径, 标注工具的类型名, json 里的条目原样)]，按文件、条目的顺序。
+
+    文件清单同 list_rules（AssetsExtractor 编进 assets.py 的那些），只取标注工具认作 image 和 ocr 的文件；
+    解析不了的文件类型是 unknown，跳过。
+    """
+    scored = []
+    for path in _json_files(task_dir):
+        data, _ = _read_rules(path)
+        rule_type = _annotator_rule_type(data)
+        if rule_type in SCORED_TYPES:
+            scored += [(_relpath(path, task_dir), rule_type, entry) for entry in _entries(data)]
+    return scored
+
+
+def screen_check(task: str, screen: str, session_id: str, image_id: str, tester: Callable | None = None,
+                 tags: dict | None = None, root: Path | None = None) -> list[dict]:
+    """用标注工具会话里的一张截图，给任务的图片和 OCR 条目逐条打分，返回 [{'file', 'item', 'matched', 'similarity', 'threshold', 'expected'}]。
+
+    标签画面等于 screen 的条目 expected 为真，其余为假：截图是 screen 这个画面，该匹配上的是 expected 的条目；别的条目照样打分，
+    由页面置灰。没有任何图片或 OCR 条目标在这个画面上就返回 []，一条都不打分。
+    threshold 是图片条目 json 里的阈值，OCR 条目没有，为 None。某一条打分出错（模板图不存在、ROI 写坏……）不中断整个体检：
+    这一条 matched 为假、similarity 为 None，另有一个 error 键写原因。
+    tester 的参数和返回值同 annotator_manager.test_rule，不传就用它，rule 参数给的是 json 里的条目原样；
+    tags 不传就读 root 下的标签文件（损坏时抛 ValueError，见 load_tags），传了就只用它。task 不在清单里抛 ValueError。
+    """
+    task_dir = task_root(task, root)
+    tags = load_tags(tags_path(root)) if tags is None else tags
+    scored = _scored_entries(task_dir)
+    expected = [_tag_of(tags, task, file, entry.get('itemName'))['screen'] == screen for file, _, entry in scored]
+    if not any(expected):
+        return []
+    if tester is None:
+        from module.server.tool import annotator_manager
+        tester = annotator_manager.test_rule
+    results = []
+    for (file, rule_type, entry), is_expected in zip(scored, expected):
+        result = {'file': file, 'item': _name_of(entry), 'matched': False, 'similarity': None,
+                  'threshold': entry.get('threshold') if rule_type == 'image' else None, 'expected': is_expected}
+        try:
+            detail = tester(session_id, image_id, task, file, rule_type, entry)
+        except Exception as exc:
+            logger.warning(f'素材体检：{file} 的 {result["item"]} 打分失败：{exc!r}')
+            result['error'] = str(exc) or type(exc).__name__
+        else:
+            result.update(matched=bool(detail.get('matched')), similarity=detail.get('similarity'))
+        results.append(result)
+    return results
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# 写入的守卫
+# ------------------------------------------------------------------------------------------------------------------
+
+class WriteRefused(RuntimeError):
+    """素材写入被拒绝：MERGE_LOCK 被占着（别处正在合并或保存），或者仓库里留着没做完的合并（MERGE_HEAD）。
+
+    str(异常) 就是给用户看的原因，HTTP 接口据此回 409。replace_image 直接抛它，什么都没改；commit_and_push 和 commit_tags
+    把它放进返回值的 error。
+    """
+
+
+@contextmanager
+def _write_guard(merging: Callable[[], bool]):
+    """写素材的守卫：非阻塞地拿 MERGE_LOCK，拿不到抛 WriteRefused（BUSY_TEXT）；拿到后用 merging() 看仓库里有没有没做完的合并，
+    有就抛 WriteRefused（MERGING_TEXT）。with 块里一直持有锁，不管怎么退出都会放锁。"""
+    if not fork_updater.MERGE_LOCK.acquire(blocking=False):
+        raise WriteRefused(BUSY_TEXT)
+    try:
+        if merging():
+            raise WriteRefused(MERGING_TEXT)
+        yield
+    finally:
+        fork_updater.MERGE_LOCK.release()
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# 替换图片
+# ------------------------------------------------------------------------------------------------------------------
+
+def _replace_target(task_dir: Path, json_relpath: str, image_name: str) -> Path:
+    """替换的目标：json_relpath 这个素材文件里某个条目的 imageName 指向的图片（按 json 所在目录算，同 assets.py 里的路径）。
+
+    先过名单：json 必须是 AssetsExtractor 编进 assets.py 的那些文件之一，image_name 必须是其中某个条目的 imageName，
+    所以 ../x.png、a.exe 这类名字根本进不来；再核对路径落在任务目录内、后缀是图片，json 被改坏时这两条是第二道防线。
+    不符合的一律抛 ValueError。图片文件本身可以不存在：json 里有、磁盘上缺的图正是要补的。task_dir 要是已经 resolve 过的。
+    """
+    files = {_relpath(path, task_dir): path for path in _json_files(task_dir)}
+    path = files.get(json_relpath) if isinstance(json_relpath, str) else None
+    if path is None:
+        raise ValueError(f'任务里没有这个素材文件：{json_relpath!r}')
+    data, error = _read_rules(path)
+    if error:
+        raise ValueError(f'素材文件 {json_relpath} 读不了：{error}')
+    image_names = {entry['imageName'] for entry in _entries(data) if isinstance(entry.get('imageName'), str)}
+    if not isinstance(image_name, str) or image_name not in image_names:
+        raise ValueError(f'{json_relpath} 里没有 imageName 为 {image_name!r} 的条目')
+    target = (path.parent / image_name).resolve()
+    if task_dir not in target.parents:
+        raise ValueError(f'图片路径落在任务目录之外：{image_name}')
+    if target.suffix.lower() not in IMAGE_SUFFIXES:
+        raise ValueError(f'不支持的图片后缀 {target.suffix!r}，只收 {"、".join(IMAGE_SUFFIXES)}')
+    if target.is_dir():
+        raise ValueError(f'目标是目录，不是图片：{image_name}')
+    return target
+
+
+def _decode_base64(content) -> bytes:
+    """上传内容的 base64 解码：裸的 base64，或浏览器 FileReader 给的 data URL（data:image/png;base64, 开头）都行，空白和换行忽略。"""
+    if not isinstance(content, str):
+        raise ValueError('图片内容应当是 base64 字符串')
+    text = content.strip()
+    if text.startswith('data:'):
+        header, _, text = text.partition(',')
+        if not header.endswith(';base64'):
+            raise ValueError('data URL 不是 base64 编码')
+    try:
+        return base64.b64decode(''.join(text.split()), validate=True)
+    except ValueError as exc:       # binascii.Error 是 ValueError 的子类，含非 ASCII 字符的字符串也是
+        raise ValueError('图片内容不是合法的 base64') from exc
+
+
+def _reencode(raw: bytes, suffix: str) -> bytes:
+    """校验 raw 是 cv2 读得出的图片，再按目标后缀重新编码：上传的是 PNG、目标是 .jpg，写下去的就是真的 JPEG，
+    图片后面夹带的别的内容也不会落盘。读不出、编码不了都抛 ValueError。
+    cv2 对空数据抛 cv2.error（断言失败）而不是返回 None，所以空数据先挡掉。cv2 和 numpy 用到时才导入。"""
+    import cv2
+    import numpy as np
+    if not raw:
+        raise ValueError('图片内容为空')
+    try:
+        image = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED)
+    except cv2.error:
+        image = None
+    if image is None:
+        raise ValueError('上传的内容不是可以读取的图片')
+    try:
+        ok, encoded = cv2.imencode(suffix, image)
+    except cv2.error:
+        ok = False
+    if not ok:
+        raise ValueError(f'图片无法编码成 {suffix}')
+    return encoded.tobytes()
+
+
+def _write_atomically(path: Path, data: bytes) -> None:
+    """先写同目录的临时文件再 os.replace 换上去：写到一半出错或断电，原文件原样还在；出错时临时文件也清掉。
+    和 save_tags 同一套做法，那边写文本。临时文件用固定的名字（同一时刻只有一个写入者，见 _write_guard），不留随机名的残渣。"""
+    scratch = path.with_name(f'{path.name}.tmp')
+    try:
+        with open(scratch, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(scratch, path)
+    except BaseException:
+        try:
+            os.unlink(scratch)
+        except OSError:
+            pass
+        raise
+
+
+def _default_regenerate(repo: Path) -> Callable[[str], None]:
+    """默认的重新生成 assets.py：AssetsExtractor 按当前目录算素材的相对路径，所以当前目录必须就是仓库根，否则抛 RuntimeError
+    （同 ForkUpdater.regenerate；不在服务进程里 os.chdir，进程是各线程共用的）。检查在这里做、调用方在写盘之前调它，
+    免得图换了、assets.py 没生成。"""
+    cwd = Path.cwd().resolve()
+    if cwd != repo:
+        raise RuntimeError(f'重新生成 assets.py 需要在仓库根目录下进行：当前目录 {cwd}，仓库 {repo}')
+
+    def regenerate(task: str) -> None:
+        _extractor().AssetsExtractor(str(repo / 'tasks' / task)).extract()
+
+    return regenerate
+
+
+def replace_image(task: str, json_relpath: str, image_name: str, content_base64: str, root: Path | None = None,
+                  regenerate: Callable[[str], None] | None = None) -> dict:
+    """用上传的图片替换 json_relpath 里 imageName 为 image_name 的素材图，再调 regenerate(task) 重新生成 assets.py。
+    返回 {'target': 仓库相对路径}，比如 tasks/ActivityShikigami/fire/fire_pass_8.png。
+
+    content_base64 是裸 base64 或 data URL。落盘之前的检查都抛 ValueError、什么都不改：任务和素材文件得在清单里，image_name 得是
+    那个文件里某个条目的 imageName，路径落在任务目录内、后缀是 .png .jpg .jpeg .bmp，内容得是 cv2 读得出的图片。
+    写入先把解码后的图片按目标后缀重新编码（不是原样落盘），写进同目录的临时文件再 os.replace，原图要么整张换掉要么不动；
+    目标文件原来不存在（json 里有、磁盘上缺的图）就是新建。
+    regenerate 不传就用默认的（见 _default_regenerate，当前目录不是仓库根时在写盘之前抛 RuntimeError）。regenerate 自己出错时
+    图已经换上了，异常照常往外抛，不回滚。
+    持有 MERGE_LOCK 做完整个替换；别处正在合并或保存、或仓库里有没做完的合并时抛 WriteRefused，什么都不改。
+    """
+    repo = _repo_root(root)
+    with _write_guard(lambda: (repo / '.git' / 'MERGE_HEAD').exists()):
+        task_dir = task_root(task, root).resolve()
+        target = _replace_target(task_dir, json_relpath, image_name)
+        encoded = _reencode(_decode_base64(content_base64), target.suffix.lower())
+        if regenerate is None:
+            regenerate = _default_regenerate(repo)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _write_atomically(target, encoded)
+        regenerate(task)
+    shown = f'tasks/{task}/{target.relative_to(task_dir).as_posix()}'
+    logger.info(f'素材替换：{shown}')
+    return {'target': shown}
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# 提交并推送
+# ------------------------------------------------------------------------------------------------------------------
+
+def _outcome(commit: str | None, pushed: bool, error: str = '') -> dict:
+    return {'commit': commit, 'pushed': pushed, 'error': error}
+
+
+def _first_line(text: str) -> str:
+    return next((line.strip() for line in text.splitlines() if line.strip()), '')
+
+
+def _fork_refusal(runner: GitRunner, branch: str) -> str:
+    """刚拉取的 fork 比运行目录多出提交时，不能再往本地提交：fork 领先（fork_ahead）或两边分叉（diverged）都会让这个提交
+    推不上去。返回给用户看的拒绝原因，没有这种情况返回 ''。"""
+    state = _fork_state(runner, branch)
+    if state is None:
+        return ''
+    return FORK_AHEAD_TEXT.format(n=state.commits) if state.status == 'fork_ahead' else DIVERGED_TEXT
+
+
+def _push_if_ahead(runner: GitRunner, branch: str) -> tuple[bool, str]:
+    """HEAD 领先 origin/<分支>，或者这个引用不存在（拉取没写它，比不了）就推送，返回 (是否推上去了, error)；
+    没有领先的提交什么也不做。所以上次推送失败留下的提交，下一次调用（哪怕这次没有新改动）会补推。"""
+    tracked = f'{FORK_REMOTE}/{branch}'
+    if _ref_exists(runner, tracked) and _count(runner, f'{tracked}..HEAD') == 0:
+        return False, ''
+    pushed, stderr = push(runner, branch)
+    if pushed:
+        return True, ''
+    logger.warning(f'素材提交：推送失败：{stderr}')
+    return False, PUSH_FAILED_TEXT.format(reason=fork_updater.push_reason(stderr) or UNKNOWN_REASON)
+
+
+def _commit_and_push(runner: GitRunner, branch: str, paths: list[str], message: str,
+                     write: Callable[[], None] | None = None) -> dict:
+    """commit_and_push 和 commit_tags 共用的核心，整个过程持有写入守卫（见 _write_guard）。
+
+    顺序：拉取 fork → fork 有运行目录没有的提交就拒绝（什么都没提交，write 也没调）→ write()（保存标签靠它在拒绝之后才落盘，
+    拒绝时检出保持干净）→ 只提交 paths → 拉取失败就不推送 → 推送。
+    拉取失败不挡着本地提交（启动器守卫不会冲掉没推上去的提交），只是不推送并提示重试；推送失败同理，提交留在本地，下次补推。
+    git 命令跑了但退出码非零（没配提交身份、index.lock……）转成 error，不往外抛；写文件失败等别的异常照常往外抛。
+    """
+    commit = None
+    try:
+        with _write_guard(lambda: _ref_exists(runner, 'MERGE_HEAD')):
+            fetch_failure = _fetch(runner, FORK_REMOTE, branch)
+            refusal = '' if fetch_failure else _fork_refusal(runner, branch)
+            if refusal:
+                return _outcome(None, False, refusal)
+            if write is not None:
+                write()
+            commit = commit_paths(runner, paths, message)
+            if fetch_failure:
+                logger.warning(f'素材提交：拉取 fork 失败：{fetch_failure.message}')
+                reason = _first_line(fetch_failure.message) or UNKNOWN_REASON
+                return _outcome(commit, False, FETCH_FAILED_TEXT.format(reason=reason))
+            pushed, error = _push_if_ahead(runner, branch)
+            return _outcome(commit, pushed, error)
+    except WriteRefused as exc:
+        return _outcome(None, False, str(exc))
+    except subprocess.CalledProcessError as exc:
+        logger.warning(f'素材提交：git 命令失败：{exc.cmd}\n{exc.stderr}')
+        return _outcome(commit, False, GIT_FAILED_TEXT.format(reason=_first_line(exc.stderr or '') or UNKNOWN_REASON))
+
+
+def commit_and_push(task: str, message: str, runner: GitRunner, branch: str) -> dict:
+    """提交 tasks/<task> 下的改动并推送到 fork 的 branch 分支，返回 {'commit': sha | None, 'pushed': 是否推上去了, 'error': 原因}。
+
+    只 add tasks/<task>：别的任务、未提交的代码和索引里别处已暂存的内容都不带进提交。message 为空白时用
+    "素材维护：替换 <task> 素材"。task 必须是 list_tasks 列得出来的名字，否则抛 ValueError（免得 ../ 混进 git 路径）。
+    没有改动时不建空提交，commit 为 None；本地还有没推上去的提交（上次推送失败留下的）照样推，所以失败之后再调一次就能补推。
+    error 为空表示没有问题，非空是给用户看的原因（拉取失败、推送失败、fork 领先或分叉、正在合并或保存），见 _commit_and_push。
+    """
+    task_root(task, runner.repo)
+    return _commit_and_push(runner, branch, [f'tasks/{task}'], (message or '').strip() or f'素材维护：替换 {task} 素材')
+
+
+def commit_tags(tags: dict, runner: GitRunner, branch: str, path: Path | None = None) -> dict:
+    """把 tags 存成标签文件，立刻提交并推送，返回值同 commit_and_push，提交说明固定为"素材维护：更新标签"。
+
+    tags 必须是对象：顶层不是对象的标签文件，load_tags 会当成损坏，存进去就读不回来。path 不传就是 runner.repo 下的
+    标签文件；传了也必须是仓库里的文件（仓库根目录本身不算：提交路径会变成 "."，把整个工作区带进去），以仓库相对路径提交，
+    只提交这一个文件。这两条不符合都在动仓库之前抛 ValueError。
+    先拉取并核对 fork，被拒绝（fork 领先、分叉、正在合并或保存）时标签文件一个字都没写，检出保持干净。保存后马上提交，
+    因为未提交的标签文件会让运行目录一直"有未提交的改动"，挡住之后每一次合并上游。
+    """
+    if not isinstance(tags, dict):
+        raise ValueError(f'标签应当是对象，实际是 {type(tags).__name__}')
+    repo = _repo_root(runner.repo)
+    path = (tags_path(repo) if path is None else Path(path)).resolve()
+    if repo not in path.parents:
+        raise ValueError(f'标签文件必须是仓库里的文件：{path}')
+    relative = path.relative_to(repo).as_posix()
+    return _commit_and_push(runner, branch, [relative], TAGS_COMMIT_MESSAGE, write=lambda: save_tags(tags, path))
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# 导出补丁
+# ------------------------------------------------------------------------------------------------------------------
+
+def export_patch(commit: str, runner: GitRunner, out_dir: Path) -> Path:
+    """把 commit 新增或修改的文件打成 zip，返回 out_dir/assets-patch-<短 sha>.zip。zip 里是仓库相对路径，解压到仓库根就是覆盖。
+
+    commit 得是仓库里的提交（完整或短 sha、分支名、HEAD 都行），否则抛 ValueError；提交没有新增或修改的文件（比如只删了文件，
+    删除的不进补丁包）也抛 ValueError。校验都在建 out_dir 之前。
+    zip 由 git archive 直接写成文件，二进制内容不经过 GitRunner.run 的 UTF-8 解码；--literal-pathspecs 让文件名里的 [ * ?
+    不被当成通配符。git archive 会顺手加上目录项，它们不是文件。
+    """
+    if not isinstance(commit, str) or not commit.strip() or commit.startswith('-'):        # 开头是 - 的会被 git 当成选项
+        raise ValueError(f'不是有效的提交：{commit!r}')
+    verified = runner.run('rev-parse', '--verify', f'{commit}^{{commit}}', check=False)
+    if verified.returncode != 0:
+        raise ValueError(f'仓库里没有这个提交：{commit!r}')
+    sha = verified.stdout.strip()
+    listed = runner.run('diff-tree', '-r', '--root', '--no-commit-id', '--name-only', '--diff-filter=AM', '-z', sha)
+    paths = [path for path in listed.stdout.split('\0') if path]
+    if not paths:
+        raise ValueError(f'提交 {sha[:7]} 没有新增或修改的文件，没有可导出的内容')
+    out_dir = Path(out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / f'assets-patch-{sha[:7]}.zip'
+    runner.run('--literal-pathspecs', 'archive', '--format=zip', '-o', str(target), sha, '--', *paths)
+    return target
