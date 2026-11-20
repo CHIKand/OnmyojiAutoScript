@@ -291,6 +291,22 @@ def test_missing_image_ignores_rules_without_image(root):
     assert issues_of(static_check('Foo', root=root), 'missing_image') == []
 
 
+def test_missing_image_of_a_list_file_is_the_one_rule_list_loads(root):
+    """列表文件的图：type 为 image 时 RuleList 加载 <json 所在目录>/<itemName>.png（ListExtractor 把 json 所在目录编成 folder），
+    条目里的 imageName 它不看；type 为 ocr 的列表没有图。"""
+    pictures = list_rule('pics', ['p', 'q'])
+    pictures['list'].append({'itemName': 'r', 'roiFront': '0,0,50,50', 'imageName': 'other.png'})
+    put_json(root, 'tasks/Foo/lists/image_list.json', pictures)
+    put_json(root, 'tasks/Foo/lists/ocr_list.json', list_rule('words', ['w'], type='ocr'))
+    put_image(root, 'tasks/Foo/lists/p.png')
+    put_image(root, 'tasks/Foo/lists/other.png')
+
+    missing = [issue for issue in static_check('Foo', root=root) if issue.kind == 'missing_image']
+
+    assert [(issue.file, issue.item) for issue in missing] == [('lists/image_list.json', 'q'), ('lists/image_list.json', 'r')]
+    assert 'lists/q.png' in missing[0].detail and 'lists/r.png' in missing[1].detail
+
+
 def test_json_error_detected(root):
     put_text(root, 'tasks/Foo/as/broken.json', '{')
     put_json(root, 'tasks/Foo/as/image.json', [image_rule('b')])
@@ -697,6 +713,15 @@ def test_save_tags_replaces_the_whole_file(tmp_path):
     save_tags({'Foo': {'a.json': {'x': {'periodic': True, 'screen': '战斗中'}}}}, path)
     save_tags({'Bar': {}}, path)
     assert load_tags(path) == {'Bar': {}}
+
+
+def test_save_tags_removes_a_stale_scratch_file(tmp_path):
+    """临时文件名固定（<文件名>.assets-check.tmp）：上次写到一半进程被杀留下的残渣，这次写入时先删掉，不会一直留着。"""
+    path = tmp_path / 'assets_tags.json'
+    (tmp_path / 'assets_tags.json.assets-check.tmp').write_bytes(b'half-written')
+    save_tags({'Foo': {}}, path)
+    assert load_tags(path) == {'Foo': {}}
+    assert list(tmp_path.iterdir()) == [path]
 
 
 def test_save_tags_keeps_the_old_file_when_replace_fails(tmp_path, monkeypatch):

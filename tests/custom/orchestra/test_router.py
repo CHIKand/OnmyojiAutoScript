@@ -19,6 +19,8 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI, HTTPException
+from fastapi.routing import APIRoute
+from starlette.routing import Mount
 
 from module.config import config_model
 from module.config.config_model import ConfigModel
@@ -440,16 +442,27 @@ def test_restart_endpoint(instance_dir, monkeypatch):
 # ---------- 注册与导入 ----------
 
 def test_register_custom_mounts_the_routes():
+    """register_custom 加的全部 /custom 接口在这里一次列全，多出、少了都会发现；静态目录是 Mount，没有方法，单独核对。"""
     app = FastAPI()
     register_custom(app)
     mounted = {(route.path, method) for route in app.routes
-               if route.path.startswith(('/custom/orchestra', '/custom/instance')) for method in route.methods}
+               if isinstance(route, APIRoute) and route.path.startswith('/custom') for method in route.methods}
     assert mounted == {
         ('/custom/orchestra/{script_name}', 'GET'),
         ('/custom/orchestra/{script_name}', 'PUT'),
         ('/custom/orchestra/{script_name}/command', 'POST'),
         ('/custom/instance/{script_name}/restart', 'POST'),
+        ('/custom/assets/tasks', 'GET'),
+        ('/custom/assets/{task}/rules', 'GET'),
+        ('/custom/assets/{task}/static-check', 'GET'),
+        ('/custom/assets/tags', 'GET'),
+        ('/custom/assets/tags', 'PUT'),
+        ('/custom/assets/{task}/screen-check', 'POST'),
+        ('/custom/assets/{task}/replace-image', 'POST'),
+        ('/custom/assets/{task}/commit-push', 'POST'),
+        ('/custom/assets/{task}/export', 'GET'),
     }
+    assert [route.path for route in app.routes if isinstance(route, Mount)] == ['/custom/assets/static']
 
 
 def test_blocking_io_runs_off_the_event_loop(instance_dir, monkeypatch):

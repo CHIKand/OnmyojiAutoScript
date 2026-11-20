@@ -28,7 +28,6 @@ import math
 import os
 import re
 import subprocess
-import tempfile
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -46,6 +45,8 @@ SCREENS = ('活动主页', '普通挑战页', 'Boss挑战页', '战斗中', '退
 EXTRA_SCREENS = {'MetaDemon': ('超鬼王主页', '超鬼王战斗', '合成页')}     # 个别任务多出来的画面
 FRAME_WIDTH, FRAME_HEIGHT = 1280, 720                   # 模拟器画面尺寸，ROI 以它为界
 TAGS_RELPATH = Path('assets') / 'custom' / 'assets_tags.json'
+SCRATCH_SUFFIX = '.assets-check.tmp'                    # 原子写入的临时文件：<文件名>.assets-check.tmp
+SCRATCH_PATHSPEC = f':(exclude)*{SCRATCH_SUFFIX}'       # 提交时排除临时文件（git 路径规格里 * 也匹配 /，哪一层都排除）
 _ROI_FIELDS = ('roiFront', 'roiBack')
 _ATTRIBUTE = re.compile(r'^\t([A-Z]+_[A-Z0-9_]+) =', re.MULTILINE)      # assets.py 里的属性名
 _NAMES_SHOWN = 10                                       # 说明里最多列出几个属性名
@@ -143,18 +144,19 @@ def load_tags(path: Path | None = None) -> dict:
     return tags
 
 
-def save_tags(tags: dict, path: Path | None = None) -> None:
-    """整份写回标签文件：UTF-8、不转义中文、缩进 2、末尾换行、LF 换行，键序照传入的。
+def _write_atomically(path: Path, data: bytes) -> None:
+    """把 data 写成 path：先写同目录的临时文件 <文件名>.assets-check.tmp，再 os.replace 换上去。写到一半出错或断电，原文件
+    原样还在；出错时临时文件也清掉。目录不存在就先建。保存标签和换图共用。
 
-    先写同目录的临时文件再 os.replace 换上去，写到一半出错或断电，旧文件原样还在；出错时临时文件也清掉。
+    临时文件名固定（同一时刻只有一个写入者，见 _write_guard）：上次写到一半进程被杀留下的同名残渣，这次先删掉再新建；
+    别的文件留下的残渣提交时也带不进去，_commit_and_push 用 SCRATCH_PATHSPEC 把这类文件排除在外。
     """
-    path = Path(path) if path is not None else tags_path()
-    text = json.dumps(tags, ensure_ascii=False, indent=2) + '\n'     # 先序列化：内容不合法时不留下临时文件
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, scratch = tempfile.mkstemp(dir=path.parent, prefix=f'{path.name}.', suffix='.tmp')
+    scratch = path.with_name(path.name + SCRATCH_SUFFIX)
+    scratch.unlink(missing_ok=True)
     try:
-        with os.fdopen(descriptor, 'w', encoding='utf-8', newline='\n') as f:
-            f.write(text)
+        with open(scratch, 'xb') as f:
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(scratch, path)
@@ -164,6 +166,13 @@ def save_tags(tags: dict, path: Path | None = None) -> None:
         except OSError:
             pass
         raise
+
+
+def save_tags(tags: dict, path: Path | None = None) -> None:
+    """整份写回标签文件：UTF-8、不转义中文、缩进 2、末尾换行、LF 换行，键序照传入的。原子写入，见 _write_atomically。"""
+    path = Path(path) if path is not None else tags_path()
+    text = json.dumps(tags, ensure_ascii=False, indent=2) + '\n'     # 先序列化：内容不合法时不留下临时文件
+    _write_atomically(path, text.encode('utf-8'))
 
 
 def _tag_of(tags: dict, task: str, file: str, name) -> dict:
@@ -272,13 +281,26 @@ def list_rules(task: str, root: Path | None = None) -> list[dict]:
 # 静态检查
 # ------------------------------------------------------------------------------------------------------------------
 
-def _missing_images(file: str, path: Path, entries: list[dict]) -> list[Issue]:
-    """imageName 指向的图片不在磁盘上。图片路径按 json 所在目录算，和 assets.py 里的 file="./<json 目录>/<imageName>" 一致。"""
+def _entry_images(data) -> list[tuple[dict, object]]:
+    """json 里每个条目运行时加载的图片：[(条目, 图片名)]，图片名相对 json 所在目录。
+
+    普通文件是条目的 imageName，原样返回（json 写坏时不一定是字符串）：ImageExtractor 把它编成 file="./<json 目录>/<imageName>"。
+    列表文件只有 type 为 image 时有图：ListExtractor 把 json 所在目录编成 RuleList 的 folder，RuleList 按 <folder>/<itemName>.png
+    加载，条目里就算有 imageName 它也不看；没有 itemName 的条目跳过。
+    """
+    entries = _entries(data)
+    if _is_list_file(data):
+        if data.get('type') != 'image':
+            return []
+        return [(entry, f'{name}.png') for entry in entries if (name := _name_of(entry))]
+    return [(entry, entry['imageName']) for entry in entries if 'imageName' in entry]
+
+
+def _missing_images(file: str, path: Path, data) -> list[Issue]:
+    """条目运行时要加载的图片（见 _entry_images）不在磁盘上。图片路径按 json 所在目录算，和 assets.py 里的一致。"""
     issues = []
-    for entry in entries:
-        if 'imageName' not in entry:
-            continue
-        image_name = str(entry['imageName'])
+    for entry, image in _entry_images(data):
+        image_name = str(image)
         if not (path.parent / image_name).is_file():
             shown = (PurePosixPath(file).parent / image_name).as_posix()
             issues.append(Issue('missing_image', file, _name_of(entry), f'图片不存在：{shown}'))
@@ -441,9 +463,8 @@ def static_check(task: str, root: Path | None = None) -> list[Issue]:
             issues.append(Issue('json_error', file, '', error))
             broken.add(extract_dir)
             continue
-        entries = _entries(data)
-        issues += _missing_images(file, path, entries)
-        issues += _roi_issues(file, data, entries)
+        issues += _missing_images(file, path, data)
+        issues += _roi_issues(file, data, _entries(data))
         for attribute, name in _attributes(data):
             places.setdefault((extract_dir, attribute), []).append((file, name))
     issues += _duplicate_issues(places)
@@ -538,10 +559,10 @@ def _write_guard(merging: Callable[[], bool]):
 # ------------------------------------------------------------------------------------------------------------------
 
 def _replace_target(task_dir: Path, json_relpath: str, image_name: str) -> tuple[Path, Path]:
-    """替换的目标：json_relpath 这个素材文件里某个条目的 imageName 指向的图片（按 json 所在目录算，同 assets.py 里的路径）。
-    返回 (json 文件, 图片)，都是绝对路径。
+    """替换的目标：json_relpath 这个素材文件里某个条目运行时加载的图片（见 _entry_images：imageName，图片列表是
+    <itemName>.png；按 json 所在目录算，同 assets.py 里的路径）。返回 (json 文件, 图片)，都是绝对路径。
 
-    先过名单：json 必须是 AssetsExtractor 编进 assets.py 的那些文件之一，image_name 必须是其中某个条目的 imageName，
+    先过名单：json 必须是 AssetsExtractor 编进 assets.py 的那些文件之一，image_name 必须是其中某个条目运行时加载的图片名，
     所以 ../x.png、a.exe 这类名字根本进不来；再核对路径落在任务目录内、后缀是图片，json 被改坏时这两条是第二道防线。
     不符合的一律抛 ValueError。图片文件本身可以不存在：json 里有、磁盘上缺的图正是要补的。task_dir 要是已经 resolve 过的。
     """
@@ -552,9 +573,9 @@ def _replace_target(task_dir: Path, json_relpath: str, image_name: str) -> tuple
     data, error = _read_rules(path)
     if error:
         raise ValueError(f'素材文件 {json_relpath} 读不了：{error}')
-    image_names = {entry['imageName'] for entry in _entries(data) if isinstance(entry.get('imageName'), str)}
+    image_names = {image for _, image in _entry_images(data) if isinstance(image, str)}
     if not isinstance(image_name, str) or image_name not in image_names:
-        raise ValueError(f'{json_relpath} 里没有 imageName 为 {image_name!r} 的条目')
+        raise ValueError(f'{json_relpath} 里没有用到图片 {image_name!r} 的条目')
     target = (path.parent / image_name).resolve()
     if task_dir not in target.parents:
         raise ValueError(f'图片路径落在任务目录之外：{image_name}')
@@ -603,24 +624,6 @@ def _reencode(raw: bytes, suffix: str) -> bytes:
     return encoded.tobytes()
 
 
-def _write_atomically(path: Path, data: bytes) -> None:
-    """先写同目录的临时文件再 os.replace 换上去：写到一半出错或断电，原文件原样还在；出错时临时文件也清掉。
-    和 save_tags 同一套做法，那边写文本。临时文件用固定的名字（同一时刻只有一个写入者，见 _write_guard），不留随机名的残渣。"""
-    scratch = path.with_name(f'{path.name}.tmp')
-    try:
-        with open(scratch, 'wb') as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(scratch, path)
-    except BaseException:
-        try:
-            os.unlink(scratch)
-        except OSError:
-            pass
-        raise
-
-
 def _default_regenerate(repo: Path) -> Callable[[str], None]:
     """默认的重新生成 assets.py：AssetsExtractor 按当前目录算素材的相对路径，所以当前目录必须就是仓库根，否则抛 RuntimeError
     （同 ForkUpdater.regenerate；不在服务进程里 os.chdir，进程是各线程共用的）。检查在这里做、调用方在写盘之前调它，
@@ -660,8 +663,7 @@ def _prepare_replacement(task: str, json_relpath: str, image_name: str, content_
 
 
 def _apply_replacement(replacement: _Replacement) -> None:
-    """写图（同目录临时文件再 os.replace），再重新生成 assets.py。调用方持有写入守卫。"""
-    replacement.target.parent.mkdir(parents=True, exist_ok=True)
+    """写图（原子写入，见 _write_atomically），再重新生成 assets.py。调用方持有写入守卫。"""
     _write_atomically(replacement.target, replacement.data)
     replacement.regenerate(replacement.extract_dir)
     logger.info(f'素材替换：{replacement.shown}')
@@ -669,13 +671,14 @@ def _apply_replacement(replacement: _Replacement) -> None:
 
 def replace_image(task: str, json_relpath: str, image_name: str, content_base64: str, root: Path | None = None,
                   regenerate: Callable[[str], None] | None = None) -> dict:
-    """用上传的图片替换 json_relpath 里 imageName 为 image_name 的素材图，再重新生成 assets.py：regenerate 收到相对 tasks/
+    """用上传的图片替换 json_relpath 里某个条目运行时加载的图 image_name，再重新生成 assets.py：regenerate 收到相对 tasks/
     的目录，普通任务是任务名，组件是 Component/<组件>（同 ForkUpdater.regenerate）。
     返回 {'target': 仓库相对路径}，比如 tasks/ActivityShikigami/fire/fire_pass_8.png。不提交：页面上的上传替换走
     replace_and_commit，换完立刻提交推送。
 
     content_base64 是裸 base64 或 data URL。落盘之前的检查都抛 ValueError、什么都不改：任务和素材文件得在清单里，image_name 得是
-    那个文件里某个条目的 imageName，路径落在任务目录内、后缀是 .png .jpg .jpeg .bmp，内容得是 cv2 读得出的图片。
+    那个文件里某个条目运行时加载的图（imageName；图片列表是 <itemName>.png，见 _entry_images），路径落在任务目录内、后缀是
+    .png .jpg .jpeg .bmp，内容得是 cv2 读得出的图片。
     写入先把解码后的图片按目标后缀重新编码（不是原样落盘），写进同目录的临时文件再 os.replace，原图要么整张换掉要么不动；
     目标文件原来不存在（json 里有、磁盘上缺的图）就是新建。
     regenerate 不传就用默认的（见 _default_regenerate，当前目录不是仓库根时在写盘之前抛 RuntimeError）。regenerate 自己出错时
@@ -725,10 +728,10 @@ def _push_if_ahead(runner: GitRunner, branch: str) -> tuple[bool, str]:
 
 def _commit_and_push(runner: GitRunner, branch: str, paths: list[str], message: str,
                      write: Callable[[], None] | None = None) -> dict:
-    """commit_and_push 和 commit_tags 共用的核心，整个过程持有写入守卫（见 _write_guard）。
+    """commit_and_push、replace_and_commit 和 commit_tags 共用的核心，整个过程持有写入守卫（见 _write_guard）。
 
     顺序：拉取 fork → fork 有运行目录没有的提交就拒绝（什么都没提交，write 也没调）→ write()（保存标签靠它在拒绝之后才落盘，
-    拒绝时检出保持干净）→ 只提交 paths → 拉取失败就不推送 → 推送。
+    拒绝时检出保持干净）→ 只提交 paths（原子写入的临时文件除外，见 _write_atomically）→ 拉取失败就不推送 → 推送。
     拉取失败不挡着本地提交（启动器守卫不会冲掉没推上去的提交），只是不推送并提示重试；推送失败同理，提交留在本地，下次补推。
     git 命令跑了但退出码非零（没配提交身份、index.lock……）转成 error，不往外抛；写文件失败等别的异常照常往外抛。
     """
@@ -741,7 +744,7 @@ def _commit_and_push(runner: GitRunner, branch: str, paths: list[str], message: 
                 return _outcome(None, False, refusal)
             if write is not None:
                 write()
-            commit = commit_paths(runner, paths, message)
+            commit = commit_paths(runner, [*paths, SCRATCH_PATHSPEC], message)
             if fetch_failure:
                 logger.warning(f'素材提交：拉取 fork 失败：{fetch_failure.message}')
                 reason = _first_line(fetch_failure.message) or UNKNOWN_REASON

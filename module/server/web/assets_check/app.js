@@ -29,6 +29,7 @@
     + "请先关闭标注工具页面，再点“开始截屏”。";
   const ANNOTATOR_CONFIRM_TEXT = "标注工具同一时间只能有一个会话：打开它会关闭本页的截屏会话，两个页面不要同时使用。\n"
     + "框选完成后，请先关闭标注工具页面，再回到本页重新点“开始截屏”。\n\n现在打开标注工具？";
+  const UNSAVED_TAGS_NOTE = "（标签有未保存的改动：这次体检按已保存的标签划分画面，保存后再体检才按页面上的）";
 
   const el = {};
   const state = {
@@ -44,6 +45,7 @@
     sessionId: "",
     captureConfig: "",
     pollTimer: 0,
+    pollGeneration: 0,          // stopPolling() 每调一次加一：旧的状态轮询看到变了就停下，同一时刻只有一条轮询链
     annotatorOpened: false,
     lastCommits: {},            // 任务 -> 本页最近一次上传替换或"提交并推送"得到的提交，导出补丁包用
   };
@@ -593,7 +595,9 @@
     }
   }
 
+  // 停掉状态轮询：取消等着的下一轮，代数加一，让正在等状态返回的那一轮回来后自己停下（见 pollStatus）
   function stopPolling() {
+    state.pollGeneration += 1;
     if (state.pollTimer) {
       window.clearTimeout(state.pollTimer);
       state.pollTimer = 0;
@@ -655,11 +659,14 @@
     pollStatus(sessionId, 0);
   }
 
-  // 开始截屏之后轮询到有画面（或出错）为止
+  // 开始截屏之后轮询到有画面（或出错）为止。同一时刻只有一条轮询链：链记下开始时的代数，每次 await 回来都核对，
+  // stopPolling() 改过代数（又点了"开始截屏"、会话被丢掉）就停下，不改状态、不报错、不再续下一轮
   function pollStatus(sessionId, round) {
+    const generation = state.pollGeneration;
+    const stale = () => generation !== state.pollGeneration || sessionId !== state.sessionId;
     state.pollTimer = window.setTimeout(async () => {
       state.pollTimer = 0;
-      if (sessionId !== state.sessionId) {
+      if (stale()) {
         return;
       }
       let status;
@@ -667,10 +674,12 @@
         const data = await api(ANNOTATOR_API + "/emulator/status?session_id=" + encodeURIComponent(sessionId));
         status = (data && data.emulator) || {};
       } catch (error) {
-        reportError(error);
+        if (!stale()) {
+          reportError(error);
+        }
         return;
       }
-      if (sessionId !== state.sessionId) {
+      if (stale()) {
         return;
       }
       if (status.state === "running" && status.last_frame_at) {
@@ -717,6 +726,7 @@
       json: { session_id: state.sessionId },
     });
     const image = (capture && capture.image) || {};
+    const unsavedTags = state.tagsDirty;      // 后端按标签文件里已保存的标签划分画面，页面上没保存的改动不算
     const data = await api(taskUrl(task, "screen-check"), {
       method: "POST",
       json: { session_id: state.sessionId, image_id: image.id, screen: screen },
@@ -730,11 +740,12 @@
     renderCheck(data.results || [], data.hint || "");
     const expected = (data.results || []).filter((result) => result.expected);
     const passed = expected.filter((result) => result.matched && !result.error);
+    const note = unsavedTags ? UNSAVED_TAGS_NOTE : "";
     if (expected.length) {
-      showMessage("体检完成：" + screen + " 的 " + expected.length + " 个条目通过 " + passed.length + " 个",
+      showMessage("体检完成：" + screen + " 的 " + expected.length + " 个条目通过 " + passed.length + " 个" + note,
         passed.length === expected.length ? "ok" : "error");
     } else {
-      showMessage(data.hint || "体检完成", "ok");
+      showMessage((data.hint || "体检完成") + note, "ok");
     }
   }
 

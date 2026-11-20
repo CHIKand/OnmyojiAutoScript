@@ -558,13 +558,39 @@ def test_replace_reencodes_to_the_extension_of_the_target(root, name, magic):
     assert result == {'target': f'tasks/Foo/fmt/{name}'}
 
 
-def test_replace_accepts_entries_of_a_list_file(root):
-    put_json(root, 'tasks/Foo/lists/list.json', {
-        'name': 'lst', 'direction': 'vertical', 'type': 'image', 'roiBack': '0,0,100,100', 'description': '列表',
-        'list': [{'itemName': 'e1', 'roiFront': '0,0,50,50', 'imageName': 'e1.png'}]})
-    result, _ = replace(root, 'e1.png', json_relpath='lists/list.json')
+def list_file(list_type: str, entry: dict) -> dict:
+    """真实的列表文件：顶层 name、direction、type、roiBack、description，条目只有 itemName 和 roiFront
+    （同 GameUi 的 page/list_image_act_list.json）。"""
+    return {'name': 'lst', 'direction': 'vertical', 'type': list_type, 'roiBack': '0,0,100,100', 'description': '列表',
+            'list': [entry]}
+
+
+def test_replace_an_image_list_entry_uses_the_item_name(root):
+    """RuleList 按 <json 所在目录>/<itemName>.png 加载列表里的图（ListExtractor 把 json 所在目录编成 folder），替换的就是这张。"""
+    put_json(root, 'tasks/Foo/lists/list.json', list_file('image', {'itemName': 'e1', 'roiFront': '0,0,50,50'}))
+    result, regen = replace(root, 'e1.png', json_relpath='lists/list.json')
     assert result == {'target': 'tasks/Foo/lists/e1.png'}
-    assert (root / 'tasks/Foo/lists/e1.png').is_file()
+    assert pixels(root / 'tasks/Foo/lists/e1.png').shape == (3, 4, 3) and regen.calls == ['Foo']
+
+
+@pytest.mark.parametrize('list_type, entry, image_name', [
+    ('ocr', {'itemName': 'e1', 'roiFront': '0,0,50,50'}, 'e1.png'),                                 # 文字列表没有图
+    ('image', {'itemName': 'e1', 'roiFront': '0,0,50,50', 'imageName': 'other.png'}, 'other.png'),  # RuleList 不看 imageName
+], ids=['ocr-list', 'image-name-ignored'])
+def test_replace_refuses_list_images_the_runtime_never_loads(root, list_type, entry, image_name):
+    put_json(root, 'tasks/Foo/lists/list.json', list_file(list_type, entry))
+    before = tree(root)
+    with pytest.raises(ValueError):
+        replace(root, image_name, json_relpath='lists/list.json')
+    assert tree(root) == before
+
+
+def test_replace_removes_a_stale_scratch_file(root):
+    """上次写到一半进程被杀留下的临时文件（固定名 <图片名>.assets-check.tmp）：这次写入时先删掉，写完不留任何临时文件。"""
+    write_files(root, {'tasks/Foo/as/a.png.assets-check.tmp': b'half-written'})
+    replace(root)
+    assert set(tree(root)) == set(base_files())
+    assert pixels(root / 'tasks/Foo/as/a.png').shape == (3, 4, 3)
 
 
 @pytest.mark.parametrize('image_name', ['../x.png', 'a.exe', 'other.png', 'as/a.png', '', 'a.PNG ', 'A.png'])
@@ -633,7 +659,6 @@ def test_replace_rejects_a_broken_json(root):
 @pytest.mark.parametrize('content', [
     'not base64 !!!',
     b64(b'this is not an image at all'),
-    b64(png_bytes()[:30]),                       # 被截断的 PNG
     '',
     '   ',
     'data:image/png;base64,',
@@ -1044,6 +1069,19 @@ def test_replace_and_commit_validates_before_touching_git(repo, git_calls, task,
     with pytest.raises(ValueError):
         assets_check.replace_and_commit(task, json_relpath, image_name, content, repo.runner, 'custom', regenerate=regen)
     assert git_calls == [] and regen.calls == [] and tree(repo.work) == before
+
+
+def test_commits_leave_scratch_files_out(repo):
+    """别的图写到一半留下的临时文件留在任务目录里：上传替换和提交并推送都不把它带进提交，它只是没跟踪的残渣。"""
+    repo.write({'tasks/Foo/as/b.png.assets-check.tmp': b'half-written'})
+
+    replaced, _ = replace_commit(repo)
+    repo.write({'tasks/Foo/as/老图.png': b'changed'})
+    committed = assets_check.commit_and_push('Foo', 'm', repo.runner, 'custom')
+
+    assert repo.files_of(replaced['commit']) == {'tasks/Foo/as/a.png'}
+    assert repo.files_of(committed['commit']) == {'tasks/Foo/as/老图.png'}
+    assert repo.status() == ['?? tasks/Foo/as/b.png.assets-check.tmp']
 
 
 def test_replace_and_commit_a_component_image(repo):

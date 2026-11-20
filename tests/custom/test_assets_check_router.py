@@ -700,7 +700,7 @@ def test_failed_export_is_400_and_leaves_nothing_behind(repo, monkeypatch, tmp_p
 
     assert (error.status_code, error.detail['code']) == (400, 'invalid_request')
     assert '仓库里没有这个提交' in error.detail['message']
-    assert len(made) <= 1 and not any(path.exists() for path in made)
+    assert len(made) == 1 and not any(path.exists() for path in made)        # 建过一个临时目录，失败后删掉了
 
 
 # ------------------------------------------------------------------------------------------------------------------
