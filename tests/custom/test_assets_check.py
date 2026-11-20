@@ -211,6 +211,27 @@ def test_list_rules_types_items_and_order(root):
     assert by_file['empty.json']['items'] == []
 
 
+def test_list_rules_runtime_image_is_the_image_the_runtime_loads(root):
+    """runtime_image 是替换接口收的图片名（同 _entry_images）：图片文件取 imageName，图片列表取 <itemName>.png；
+    文字列表、点击文件（哪怕条目上带着 imageName）、OCR 文件，以及写坏了不是字符串的 imageName，都是 None。"""
+    put_json(root, 'tasks/Foo/as/image.json', [image_rule('a'), image_rule('b', image='sub/b.jpg'), image_rule('n', image=7)])
+    put_json(root, 'tasks/Foo/lists/image_list.json', list_rule('pics', ['p', 'q']))
+    put_json(root, 'tasks/Foo/lists/ocr_list.json', list_rule('words', ['w'], type='ocr'))
+    put_json(root, 'tasks/Foo/as/click.json', [click_rule('c1'), click_rule('c2', imageName='c2.png')])
+    put_json(root, 'tasks/Foo/as/ocr.json', [ocr_rule('o')])
+
+    images = {(rule['file'], item['itemName']): item['runtime_image']
+              for rule in list_rules('Foo', root=root) for item in rule['items']}
+
+    assert images == {
+        ('as/image.json', 'a'): 'a.png', ('as/image.json', 'b'): 'sub/b.jpg', ('as/image.json', 'n'): None,
+        ('lists/image_list.json', 'p'): 'p.png', ('lists/image_list.json', 'q'): 'q.png',
+        ('lists/ocr_list.json', 'w'): None,
+        ('as/click.json', 'c1'): None, ('as/click.json', 'c2'): None,
+        ('as/ocr.json', 'o'): None,
+    }
+
+
 def test_list_rules_skips_entries_that_are_not_objects(root):
     put_json(root, 'tasks/Foo/as/image.json', [image_rule('a'), 7, 'text', None])
     rules = list_rules('Foo', root=root)
@@ -288,6 +309,18 @@ def test_missing_image_resolves_relative_to_json(root):
 def test_missing_image_ignores_rules_without_image(root):
     put_json(root, 'tasks/Foo/as/ocr.json', [ocr_rule('o')])
     put_json(root, 'tasks/Foo/as/click.json', [click_rule('c')])
+    assert issues_of(static_check('Foo', root=root), 'missing_image') == []
+
+
+@pytest.mark.parametrize('data', [
+    [click_rule('c1'), click_rule('c2', imageName='c2.png')],       # 同真实的 SwitchSoul/ss/click.json：编成 RuleClick
+    [ocr_rule('o1'), ocr_rule('o2', imageName='o2.png')],
+    ['imageName', image_rule('s')],                                 # 第一个元素不是对象：AssetsExtractor 编不出图片
+    [7, image_rule('s')],
+], ids=['click', 'ocr', 'string-first', 'number-first'])
+def test_missing_image_only_counts_files_compiled_as_images(root, data):
+    """AssetsExtractor 只在第一个条目带 imageName 时把整个文件编成图片：别的文件里零星带着的 imageName 运行时不加载，不报缺图。"""
+    put_json(root, 'tasks/Foo/as/rules.json', data)
     assert issues_of(static_check('Foo', root=root), 'missing_image') == []
 
 
@@ -634,6 +667,18 @@ def test_real_component_assets_match_their_json(monkeypatch):
     issues = static_check('Component')
     assert [issue for issue in issues if issue.kind in ('json_error', 'assets_outdated')] == []
     assert all('/' in issue.file for issue in issues)              # 文件都写成 <组件>/...，同标注工具
+
+
+def test_real_click_file_with_a_stray_image_name(monkeypatch):
+    """真实的 SwitchSoul/ss/click.json 最后一条带着 imageName，但整个文件编成 RuleClick（C_SOU_TEAM_SELECT）：
+    运行时不加载那张图，静态检查不报缺图，清单里也没有可替换的图。"""
+    monkeypatch.chdir(REPO_ROOT)
+    entries = json.loads((REPO_ROOT / 'tasks/Component/SwitchSoul/ss/click.json').read_text(encoding='utf-8'))
+    assert 'imageName' not in entries[0] and any('imageName' in entry for entry in entries)
+    missing = [(issue.file, issue.item) for issue in static_check('Component') if issue.kind == 'missing_image']
+    assert [row for row in missing if row[0] == 'SwitchSoul/ss/click.json'] == []
+    rules = {rule['file']: rule for rule in list_rules('Component')}
+    assert {item['runtime_image'] for item in rules['SwitchSoul/ss/click.json']['items']} == {None}
 
 # 计划（M3b Task 1 Step 3）里的爬塔标签表：(json 文件, 画面, periodic, 条目；None 表示该文件全部条目)
 TOWER_TAGS = [

@@ -260,8 +260,10 @@ def list_rules(task: str, root: Path | None = None) -> list[dict]:
     """任务的素材清单：每个 json 文件一项 {'file', 'rule_type', 'items'}，按 file 排序。
 
     file 是相对任务目录的路径（正斜杠）。items 是文件里的条目（列表文件取 list 里的），每条带上 json 里的全部字段，
-    再加 periodic（每期必换）和 screen（所在画面）；没有标签的是 False 和"未分类"。标签文件里已经不存在的条目一概忽略，
-    清单只按 json 的实际内容输出。解析不了的文件照样列出：类型 unknown，没有条目（静态检查会把它报成 json_error）。
+    再加 periodic（每期必换）、screen（所在画面）和 runtime_image；没有标签的是 False 和"未分类"。标签文件里已经不存在的条目
+    一概忽略，清单只按 json 的实际内容输出。解析不了的文件照样列出：类型 unknown，没有条目（静态检查会把它报成 json_error）。
+    runtime_image 是这个条目运行时加载、替换接口也收的图片名（见 _entry_images：图片文件是 imageName，图片列表是 <itemName>.png），
+    没有图或图片名不是字符串时为 None；页面只给有它的条目显示缩略图和上传替换。
     标签文件损坏时抛 ValueError（见 load_tags）。
     """
     task_dir = task_root(task, root)
@@ -272,8 +274,10 @@ def list_rules(task: str, root: Path | None = None) -> list[dict]:
         data, _ = _read_rules(path)
         rule_type = _annotator_rule_type(data)
         entries = [] if rule_type == 'unknown' else _entries(data)
+        images = {id(entry): image for entry, image in _entry_images(data) if isinstance(image, str)} if entries else {}
         rules.append({'file': file, 'rule_type': rule_type,
-                      'items': [{**entry, **_tag_of(tags, task, file, entry.get('itemName'))} for entry in entries]})
+                      'items': [{**entry, **_tag_of(tags, task, file, entry.get('itemName')),
+                                 'runtime_image': images.get(id(entry))} for entry in entries]})
     return rules
 
 
@@ -281,10 +285,18 @@ def list_rules(task: str, root: Path | None = None) -> list[dict]:
 # 静态检查
 # ------------------------------------------------------------------------------------------------------------------
 
+def _is_image_file(data) -> bool:
+    """AssetsExtractor 会把这个文件编成图片（RuleImage）：判法用它的 is_image_file（第一个条目带 imageName），
+    先挡掉它不防的情况：空列表、第一个元素不是对象（是数字时它抛异常，是字符串时它做的是子串判断）。"""
+    return (isinstance(data, list) and bool(data) and isinstance(data[0], dict)
+            and _extractor().AssetsExtractor.is_image_file(data))
+
+
 def _entry_images(data) -> list[tuple[dict, object]]:
     """json 里每个条目运行时加载的图片：[(条目, 图片名)]，图片名相对 json 所在目录。
 
-    普通文件是条目的 imageName，原样返回（json 写坏时不一定是字符串）：ImageExtractor 把它编成 file="./<json 目录>/<imageName>"。
+    普通文件只有被 AssetsExtractor 编成图片时（见 _is_image_file）才有图，是条目的 imageName，原样返回（json 写坏时不一定是字符串）：
+    ImageExtractor 把它编成 file="./<json 目录>/<imageName>"。别的文件（点击、OCR……）里零星带着的 imageName 运行时不加载，不算。
     列表文件只有 type 为 image 时有图：ListExtractor 把 json 所在目录编成 RuleList 的 folder，RuleList 按 <folder>/<itemName>.png
     加载，条目里就算有 imageName 它也不看；没有 itemName 的条目跳过。
     """
@@ -293,6 +305,8 @@ def _entry_images(data) -> list[tuple[dict, object]]:
         if data.get('type') != 'image':
             return []
         return [(entry, f'{name}.png') for entry in entries if (name := _name_of(entry))]
+    if not _is_image_file(data):
+        return []
     return [(entry, entry['imageName']) for entry in entries if 'imageName' in entry]
 
 

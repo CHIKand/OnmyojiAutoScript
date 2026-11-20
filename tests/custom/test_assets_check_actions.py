@@ -585,6 +585,19 @@ def test_replace_refuses_list_images_the_runtime_never_loads(root, list_type, en
     assert tree(root) == before
 
 
+STRAY_CLICKS = [click_rule('c1'), click_rule('c2', imageName='c2.png')]      # 同真实的 SwitchSoul/ss/click.json
+
+
+def test_replace_refuses_a_stray_image_name_in_a_click_file(root):
+    """点击文件编成 RuleClick，条目上零星带着的 imageName 运行时不加载：不能替换。"""
+    put_json(root, 'tasks/Foo/as/click.json', STRAY_CLICKS)
+    before = tree(root)
+    regen = Regen()
+    with pytest.raises(ValueError, match='没有用到图片'):
+        replace(root, 'c2.png', json_relpath='as/click.json', regenerate=regen)
+    assert tree(root) == before and regen.calls == []
+
+
 def test_replace_removes_a_stale_scratch_file(root):
     """上次写到一半进程被杀留下的临时文件（固定名 <图片名>.assets-check.tmp）：这次写入时先删掉，写完不留任何临时文件。"""
     write_files(root, {'tasks/Foo/as/a.png.assets-check.tmp': b'half-written'})
@@ -1125,6 +1138,15 @@ def test_replace_and_commit_validates_before_touching_git(repo, git_calls, task,
     regen = Regen()
     with pytest.raises(ValueError):
         assets_check.replace_and_commit(task, json_relpath, image_name, content, repo.runner, 'custom', regenerate=regen)
+    assert git_calls == [] and regen.calls == [] and tree(repo.work) == before
+
+
+def test_replace_and_commit_refuses_a_stray_image_name_in_a_click_file(repo, git_calls):
+    put_json(repo.work, 'tasks/Foo/as/click.json', STRAY_CLICKS)
+    before = tree(repo.work)
+    regen = Regen()
+    with pytest.raises(ValueError, match='没有用到图片'):
+        replace_commit(repo, 'c2.png', json_relpath='as/click.json', regenerate=regen)
     assert git_calls == [] and regen.calls == [] and tree(repo.work) == before
 
 

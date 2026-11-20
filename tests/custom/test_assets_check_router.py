@@ -363,6 +363,16 @@ def test_component_paths_match_the_annotator():
     assert reward == task_dir / 'GeneralBattle' / 'gb' / 'gb_reward.png'
 
 
+def test_image_list_thumbnail_is_served_by_the_annotator():
+    """图片列表的条目也有缩略图：页面把 runtime_image（<itemName>.png）当 image_name 交给标注工具的 image-preview，
+    它按 json 所在目录找图，找到的就是 RuleList 加载的那张。拿真实仓库里唯一的图片列表核对。"""
+    rules = {rule['file']: rule for rule in assets_check.list_rules('GameUi', root=REPO_ROOT)}
+    items = rules['page/list_image_act_list.json']['items']
+    assert [item['runtime_image'] for item in items] == [f'{item["itemName"]}.png' for item in items] == ['climb_act.png']
+    found = annotator_tool.annotator_manager.get_rule_image_file('GameUi', 'page/list_image_act_list.json', 'climb_act.png')
+    assert found == (REPO_ROOT / 'tasks' / 'GameUi' / 'page' / 'climb_act.png').resolve()
+
+
 def test_rules_include_tags(foo):
     put_json(foo, TAGS_FILE, {'Foo': {'as/image.json': {'a': {'periodic': True, 'screen': '战斗中'}},
                                       'as/ocr.json': {'c': {'periodic': False, 'screen': '退出时'}}}})
@@ -379,6 +389,7 @@ def test_rules_include_tags(foo):
                     ('as/ocr.json', 'c'): (False, '退出时')}
     first = result['rules'][0]['items'][0]
     assert (first['imageName'], first['roiFront'], first['threshold']) == ('a.png', '0,0,10,10', 0.8)   # json 字段原样带着
+    assert [item['runtime_image'] for rule in result['rules'] for item in rule['items']] == ['a.png', 'b.png', None]
 
 
 def test_rules_screens_follow_the_task(root):

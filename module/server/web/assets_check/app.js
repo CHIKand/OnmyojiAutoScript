@@ -429,7 +429,8 @@
 
   function ruleRow(task, rule, item) {
     const name = typeof item.itemName === "string" ? item.itemName : "";
-    const imageName = typeof item.imageName === "string" ? item.imageName : "";
+    // 运行时加载的图（后端按 assets.py 的编法给出：图片文件是 imageName，图片列表是 <itemName>.png），没有就不显示缩略图和上传替换
+    const imageName = typeof item.runtime_image === "string" ? item.runtime_image : "";
     const tag = tagOf(task, rule.file, name);
     const editable = Boolean(name) && state.tagsLoaded;
     const tr = document.createElement("tr");
