@@ -786,6 +786,66 @@ def test_a_screenshot_upload_that_may_work_later_keeps_the_entry(tmp_path, how, 
 
 # ---- 补发 ----------------------------------------------------------------------------------------------------
 
+LATE_LINE = '（补发：原定 2026-11-21 10:00:00）'
+
+
+def put_entry(root: Path, **fields) -> Path:
+    """直接往发件箱写一条：缺省字段是一条能发的普通消息，fields 覆盖它们；值为 None 的字段不写。"""
+    entry = {'created_at': T0.isoformat(timespec='seconds'), 'receive_id_type': 'open_id', 'receive_id': 'ou_x',
+             'title': 'OAS1 t', 'lines': ['c'], 'png_base64': None, **fields}
+    return feishu_app.Outbox(root / 'log' / 'feishu_outbox').put({k: v for k, v in entry.items() if v is not None})
+
+
+def test_a_late_delivery_says_when_it_was_raised(tmp_path, clock):
+    start_instance(frame=FRAME)
+    make_notifier(down_session()).push('t', 'c')                    # 10:00:00 写进发件箱，没发出去
+    clock.now = T0 + timedelta(minutes=3)
+    session = ok_session()
+    assert flush_outbox(root=tmp_path, session=session) == 1
+    post = message(session)
+    assert texts(post) == ['c', LATE_LINE]                         # 最后一行文字
+    assert post['content'][-1] == [{'tag': 'img', 'image_key': 'img_v2_abc'}]   # 截图仍独占最后一段
+
+
+def test_a_late_line_shows_an_aware_created_at_in_local_time(tmp_path, clock):
+    put_entry(tmp_path, created_at=(T0 - timedelta(minutes=5)).astimezone().isoformat())   # 带本机时区
+    clock.now = T0
+    session = ok_session()
+    assert flush_outbox(root=tmp_path, session=session) == 1
+    assert texts(message(session)) == ['c', '（补发：原定 2026-11-21 09:55:00）']
+
+
+def test_a_delivery_within_120_seconds_has_no_late_line(tmp_path, clock):
+    make_notifier(down_session()).push('t', 'c')
+    clock.now = T0 + timedelta(seconds=120)
+    session = ok_session()
+    assert flush_outbox(root=tmp_path, session=session) == 1
+    assert texts(message(session)) == ['c']
+
+
+@pytest.mark.parametrize('created_at', [None, 'yesterday', 20261121, '2026-13-40T00:00:00'],
+                         ids=['missing', 'not-a-time', 'number', 'out-of-range'])
+def test_an_entry_without_a_readable_created_at_gets_no_late_line(tmp_path, clock, created_at):
+    put_entry(tmp_path, created_at=created_at)
+    clock.now = T0 + timedelta(hours=1)
+    session = ok_session()
+    assert flush_outbox(root=tmp_path, session=session) == 1
+    assert texts(message(session)) == ['c']
+
+
+def test_a_late_delivery_with_a_rejected_screenshot_stays_under_the_limit(tmp_path, clock):
+    row_running()
+    write_log([f'{i:02d} ' + '御' * 400 for i in range(40)])
+    start_instance(frame=FRAME)
+    make_notifier(down_session()).push('t', 'summary')
+    clock.now = T0 + timedelta(minutes=10)
+    session = ok_session().on(IMAGES, UPLOAD_REJECTED)
+    assert flush_outbox(root=tmp_path, session=session) == 1
+    call, = session.to(MESSAGES)
+    assert len(json.dumps(call['json']['content'])) <= 28_000      # 拒收截图的那行和补发的那行都算在里面
+    assert texts(message(session))[-2:] == ['截图没能附上：飞书拒收了这张图（code=99991672）', LATE_LINE]
+
+
 def test_flush_with_nothing_to_do_makes_no_request(tmp_path, monkeypatch, caplog):
     session = FakeSession()
     assert flush_outbox(root=tmp_path, session=session) == 0

@@ -42,6 +42,7 @@
 - 凭证只放 .env（FEISHU_APP_ID、FEISHU_APP_SECRET），用的时候才读，不存在对象上，不进日志、发件箱和 repr。
 - 每条消息先写进发件箱 log/feishu_outbox/，再试着立即发送：报错的实例推送完马上 exit(1)，没发出去的由主进程每 60 秒
   调 flush_outbox 补发。发送时带条目的 id（文件名去掉 .json）作 uuid，响应丢了再发，飞书 1 小时内也只发出一条。
+  写下超过 2 分钟才发出去的，文字最后加一行"（补发：原定 <时刻>）"。
 - 实例进程（on_script_loop_start 登记过截图来源的进程）合并同类错误：同一实例、标题和内容相同的报错在 aggregate_minutes
   分钟内只发第一条，窗口结束后由 flush_outbox 补发一条汇总，发给窗口里第一条的接收方。主进程的测试推送不合并。
 - 一条消息：标题，然后每行一段：错误摘要、正在跑的编排行、日志最后 30 行（脱敏），最后是截图。富文本请求体不超过
@@ -505,6 +506,7 @@ SUMMARY_CONTENT_MAX = 200                              # 汇总行里点明是�
 POST_CONTENT_LIMIT = 28_000                            # content 在请求体里占的字节数上限（富文本请求体不超过 30 KB）
 IMAGE_KEY_ALLOWANCE = 'img_v2_' + 'x' * 93             # 算长度时图片段的 image_key 按 100 个字符预留（实际约 45 个）
 ERROR_SHOT_MAX_AGE_MS = 60_000                         # log/error/<毫秒时间戳>/ 在这么久以内建的，才算这次报错存的截图
+LATE_AFTER = timedelta(seconds=120)                    # 条目写下超过这么久才发出去，末尾加一行注明原定的时刻
 NO_TEXT_LINE = '（没有说明文字）'                          # 正文一行都没有时放的那一行
 TEST_IMAGE_SIZE = (320, 80)                            # 测试图的宽、高
 TEST_IMAGE_TEXT = 'OAS TEST'                           # cv2 的字体没有中文字形，测试图上只写英文
@@ -625,14 +627,14 @@ class FeishuAppNotifier:
             return True
         lines = _compose_lines(full_title, content, self.root)
         png = _pick_image(self.root)
-        outbox = Outbox(self.root / OUTBOX_DIR)
+        outbox, entry = Outbox(self.root / OUTBOX_DIR), _entry(target, full_title, lines, png)
         try:
-            path = outbox.put(_entry(target, full_title, lines, png))
+            path = outbox.put(entry)
         except OSError as exc:
             logger.error(f'飞书推送没有发出：写不进发件箱（{exc!r}）')
             return False
         try:
-            _deliver(_client(self.session), path, target, full_title, lines, png)
+            _deliver(_client(self.session), path, target, full_title, lines, png, _created_at(entry))
         except FeishuError as exc:
             if exc.kind == 'rejected':
                 _fail(outbox, path)
@@ -702,12 +704,13 @@ def _entry_fields(entry: dict) -> tuple | None:
 
 
 def _deliver(client: FeishuClient, path: Path, target: tuple[str, str], title: str, lines: list[str],
-             png: bytes | None) -> None:
+             png: bytes | None, created: datetime | None = None) -> None:
     """发一条发件箱条目，push 的立即发送和 flush_outbox 的补发都走这里：有图先上传，再发富文本。
     条目的 id（文件名去掉 .json）作 uuid，重发不会重复。
 
     飞书拒收这张图（rejected，比如缺 im:resource 权限、图超过 10 MB）时，不附图，末尾加一行说明（带 code），文字照发，
     拒收的 code 和 msg 记一行错误。传图的其他失败（网络错误、暂时性错误、凭证错误）照常抛出，条目原样留着。
+    created 是条目的 created_at（见 _created_at）：写下已超过 LATE_AFTER 才发出去时，文字的最后加一行"（补发：原定 <时刻>）"。
     """
     image_key = None
     if png:
@@ -718,12 +721,31 @@ def _deliver(client: FeishuClient, path: Path, target: tuple[str, str], title: s
                 raise
             logger.error(f'飞书拒收了截图，这条只发文字：{exc}')
             lines = [*lines, _image_rejected_line(exc.code)]
+    if created is not None and _now() - created > LATE_AFTER:
+        lines = [*lines, _late_line(created)]
     client.send_post(target[0], target[1], title, lines, image_key, uuid=path.stem[:UUID_MAX_LENGTH])
 
 
 def _image_rejected_line(code: int | None) -> str:
     """飞书拒收截图时，代替图片段的那一行。"""
     return '截图没能附上：飞书拒收了这张图' + (f'（code={code}）' if code is not None else '')
+
+
+def _late_line(created: datetime) -> str:
+    """补发时文字最后加的那一行：原定的时刻，本机时间，精确到秒。"""
+    return f'（补发：原定 {created.isoformat(sep=" ", timespec="seconds")}）'
+
+
+def _created_at(entry: dict) -> datetime | None:
+    """条目的 created_at，换成本机的 naive 时间（带时区的换算过来）；没有、不是字符串或读不懂时为 None。"""
+    value = entry.get('created_at')
+    if not isinstance(value, str):
+        return None
+    try:
+        created = datetime.fromisoformat(value)
+        return created if created.tzinfo is None else created.astimezone().replace(tzinfo=None)
+    except (ValueError, OverflowError, OSError):       # 时刻超出范围时 astimezone 可能抛后两种
+        return None
 
 
 def _sent_ok() -> None:
@@ -842,11 +864,12 @@ def _shrink(title: str, lines: list[str]) -> list[str]:
 def _content_cost(title: str, lines: list[str]) -> int:
     """content 在发消息的请求体里实际占的字节数。send_post 用 json.dumps(ensure_ascii=False) 把它转成字符串，requests
     再用 json= 序列化整个请求体（非 ASCII 字符转成 \\uXXXX，一个汉字占 6 个字节），所以按两层 json.dumps 算。
-    拼法与 send_post 相同。末尾有没有图都预留两段：按预留 image_key 算的图片段，和截图被拒收时换上的那行说明
-    （按 10 位的 code 算），实际只会有其中一段，所以算出来的不会比真发的小。"""
+    拼法与 send_post 相同。末尾有没有图都预留三段：按预留 image_key 算的图片段、截图被拒收时换上的那行说明（按 10 位的
+    code 算）和补发时加的那一行；图片段和拒收的说明实际只会有其中一段，所以算出来的不会比真发的小。"""
     paragraphs = [[{'tag': 'text', 'text': line}] for line in lines]
     paragraphs.append([{'tag': 'img', 'image_key': IMAGE_KEY_ALLOWANCE}])
     paragraphs.append([{'tag': 'text', 'text': _image_rejected_line(9_999_999_999)}])
+    paragraphs.append([{'tag': 'text', 'text': _late_line(datetime.max)}])
     return len(json.dumps(json.dumps({'zh_cn': {'title': title, 'content': paragraphs}}, ensure_ascii=False)))
 
 
@@ -1025,7 +1048,7 @@ def _flush(root: Path, session) -> int:
             outbox._quarantine(path, '字段不全或类型不对')
             continue
         try:
-            _deliver(client, path, *fields)
+            _deliver(client, path, *fields, _created_at(entry))
         except FeishuError as exc:
             if exc.kind == 'rejected':
                 _fail(outbox, path)
