@@ -569,9 +569,50 @@ def test_due_summary_goes_out_through_flush_to_first_target(tmp_path, clock):
     assert call['params'] == {'receive_id_type': 'chat_id'}
     assert call['json']['receive_id'] == 'oc_first'
     assert message(session) == {'title': 'OAS1 t',
-                                'content': [[{'tag': 'text', 'text': 'OAS1 t：过去 5 分钟同类错误又出现 2 次'}]]}
+                                'content': [[{'tag': 'text', 'text': 'OAS1 t：过去 5 分钟同类错误又出现 2 次（c）'}]]}
     assert session.to(IMAGES) == []
     assert entries(tmp_path) == []
+
+
+def repeat_and_summarise(clock, pushes: list[tuple[str, str]]) -> list[str]:
+    """每条推送各发两次（第二次合并掉），窗口结束后补发一轮，返回发出的汇总行。"""
+    for title, content in pushes:
+        for _ in range(2):
+            make_notifier(ok_session()).push(title, content)
+    clock.now = T0 + timedelta(minutes=11)
+    session = ok_session()
+    flush_outbox(root=Path.cwd(), session=session)
+    return [texts(message(session, index))[0] for index in range(len(session.to(MESSAGES)))]
+
+
+def test_a_summary_names_which_error_repeated(tmp_path, clock):
+    # 同一个任务的两种错误：汇总各自点明是哪一种
+    start_instance()
+    lines = repeat_and_summarise(clock, [('御魂Orochi', '<oas1> GameStuckError'),
+                                         ('御魂Orochi', '<oas1> GamePageUnknownError')])
+    assert sorted(lines) == ['OAS1 御魂Orochi：过去 10 分钟同类错误又出现 1 次（<oas1> GamePageUnknownError）',
+                             'OAS1 御魂Orochi：过去 10 分钟同类错误又出现 1 次（<oas1> GameStuckError）']
+
+
+def test_a_summary_takes_the_first_content_line_capped_at_200(tmp_path, clock):
+    start_instance()
+    line, = repeat_and_summarise(clock, [('t', '\n   GameStuckError ' + '御' * 300 + '  \nsecond line')])
+    assert line == 'OAS1 t：过去 10 分钟同类错误又出现 1 次（GameStuckError ' + '御' * 185 + '）'
+    state = json.loads((tmp_path / 'log' / 'feishu_aggregate.json').read_text(encoding='utf-8'))
+    window, = state.values()
+    assert window['meta']['first_line'] == 'GameStuckError ' + '御' * 185   # 只是在 meta 里加了一项
+    assert set(window['meta']) == {'receive_id_type', 'receive_id', 'title', 'window', 'first_line'}
+
+
+def test_a_summary_from_an_older_state_keeps_the_plain_line(tmp_path, clock):
+    # 旧版本写下的 meta 没有 first_line：汇总行照旧
+    meta = {'receive_id_type': 'open_id', 'receive_id': 'ou_x', 'title': 'OAS1 t', 'window': 10}
+    write_state(tmp_path, {'OAS1|t|c': {'start': T0.isoformat(), 'end': (T0 + timedelta(minutes=10)).isoformat(),
+                                        'count': 2, 'pending': 0, 'meta': meta}})
+    clock.now = T0 + timedelta(minutes=11)
+    session = ok_session()
+    assert flush_outbox(root=tmp_path, session=session) == 1
+    assert texts(message(session)) == ['OAS1 t：过去 10 分钟同类错误又出现 2 次']
 
 
 # ---- 消息内容：编排行、日志尾、截图、长度上限 --------------------------------------------------------------------

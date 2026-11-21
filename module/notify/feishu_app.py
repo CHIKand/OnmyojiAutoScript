@@ -501,6 +501,7 @@ LOG_TAIL_LINES = 30
 LOG_TAIL_BYTES = 64 * 1024                             # 日志可能很大，只读末尾这么多字节
 LOG_LINE_MAX = 300                                     # 每行日志最多保留的字符数
 FIXED_LINE_MAX = 1_000                                 # 标题和固定的行（错误摘要、编排行、汇总行、主进程事件的各行）最多保留的字符数
+SUMMARY_CONTENT_MAX = 200                              # 汇总行里点明是哪条错误时，内容第一行最多保留的字符数
 POST_CONTENT_LIMIT = 28_000                            # content 在请求体里占的字节数上限（富文本请求体不超过 30 KB）
 IMAGE_KEY_ALLOWANCE = 'img_v2_' + 'x' * 93             # 算长度时图片段的 image_key 按 100 个字符预留（实际约 45 个）
 ERROR_SHOT_MAX_AGE_MS = 60_000                         # log/error/<毫秒时间戳>/ 在这么久以内建的，才算这次报错存的截图
@@ -620,7 +621,7 @@ class FeishuAppNotifier:
             return False
         full_title = f'{self.config_name} {title}'.strip()[:FIXED_LINE_MAX]
         key = f'{self.config_name}|{title}|{content}'
-        if _screenshot_provider is not None and not self._admit(target, full_title, key):
+        if _screenshot_provider is not None and not self._admit(target, full_title, key, content):
             return True
         lines = _compose_lines(full_title, content, self.root)
         png = _pick_image(self.root)
@@ -646,12 +647,13 @@ class FeishuAppNotifier:
         logger.info(f'飞书推送已发出：{full_title}')
         return True
 
-    def _admit(self, target: tuple[str, str], full_title: str, key: str) -> bool:
+    def _admit(self, target: tuple[str, str], full_title: str, key: str, content: str) -> bool:
         """同类合并：窗口内的第一条放行（True），之后的只计数，记一行 INFO，返回 False。
-        meta 记下接收方、完整标题和窗口分钟数，汇总照它发。合并本身出错（比如状态文件里有意外的值）按放行处理，
-        记一行警告：发送不能依赖合并。"""
+        meta 记下接收方、完整标题、窗口分钟数和内容的第一行（first_line，汇总行用它点明是哪条错误），汇总照它发。
+        合并本身出错（比如状态文件里有意外的值）按放行处理，记一行警告：发送不能依赖合并。"""
         window = _aggregate_minutes(self.cfg)
-        meta = {'receive_id_type': target[0], 'receive_id': target[1], 'title': full_title, 'window': window}
+        meta = {'receive_id_type': target[0], 'receive_id': target[1], 'title': full_title, 'window': window,
+                'first_line': _first_line(content)}
         try:
             admitted = Aggregator(self.root / AGGREGATE_STATE, window).admit(key, _now(), meta)
         except Exception as exc:
@@ -661,6 +663,19 @@ class FeishuAppNotifier:
             return True
         logger.info(f'同类错误合并中：{full_title}，{window} 分钟内只发第一条，窗口结束后由主进程补发一条汇总')
         return False
+
+
+def _first_line(content: str) -> str:
+    """内容里第一个有字的行，去掉两边空白，截到 SUMMARY_CONTENT_MAX 个字符；没有时为空字符串。"""
+    return next((line.strip() for line in content.splitlines() if line.strip()), '')[:SUMMARY_CONTENT_MAX]
+
+
+def _summary_line(title: str, meta: dict, count: int) -> str:
+    """到期汇总的那一行：{标题}：过去 {窗口} 分钟同类错误又出现 {n} 次（{内容的第一行}）。
+    meta 里没有内容的第一行（旧版本写下的合并状态）时不带括号那一段。"""
+    line = f'{title}：过去 {meta.get("window")} 分钟同类错误又出现 {count} 次'
+    first = meta.get('first_line')
+    return f'{line}（{first.strip()[:SUMMARY_CONTENT_MAX]}）' if isinstance(first, str) and first.strip() else line
 
 
 def _entry(target: tuple[str, str], title: str, lines: list[str], png: bytes | None) -> dict:
@@ -967,7 +982,8 @@ def flush_outbox(*, root: Path | None = None, session=requests) -> int:
 
     - 发件箱是空的、也没有合并状态文件：返回 0，不联网，也不读 .env。
     - 凭证缺失：每个进程只记一次错误，返回 0，发件箱和合并状态都不动。
-    - 到期的汇总：发给窗口里第一条消息的接收方，标题相同，只有一行"{标题}：过去 {窗口} 分钟同类错误又出现 {n} 次"，不附图。
+    - 到期的汇总：发给窗口里第一条消息的接收方，标题相同，只有一行"{标题}：过去 {窗口} 分钟同类错误又出现 {n} 次（{内容的
+      第一行}）"（旧版本的合并状态没存内容，不带括号那一段），不附图。
       汇总出错记一次（到下一次发送成功为止），发件箱里的消息照常发。
     - 逐条发送（与 push 同一条路径 _deliver，只拒收截图时文字照发）：成功删掉条目；飞书拒收这条消息改名为 .failed，
       记一条错误，接着发下一条；字段不全的条目改名为 .bad；
@@ -1037,7 +1053,7 @@ def _queue_summaries(outbox: Outbox, aggregator: Aggregator) -> None:
         if target is None or not isinstance(title, str):
             logger.warning(f'飞书合并汇总缺少接收方或标题，没法补发：同类错误又出现 {count} 次')
             continue
-        line = f'{title}：过去 {meta.get("window")} 分钟同类错误又出现 {count} 次'
+        line = _summary_line(title, meta, count)
         title = title[:FIXED_LINE_MAX]                 # 旧版本存下的标题没截过
         try:
             outbox.put(_entry(target, title, _fit(title, [line], []), None))
