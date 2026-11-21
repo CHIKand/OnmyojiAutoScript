@@ -496,6 +496,7 @@ LOG_LINE_MAX = 300                                     # 每行日志最多保�
 POST_CONTENT_LIMIT = 28_000                            # content 在请求体里占的字节数上限（富文本请求体不超过 30 KB）
 IMAGE_KEY_ALLOWANCE = 'img_v2_' + 'x' * 93             # 算长度时图片段的 image_key 按 100 个字符预留（实际约 45 个）
 ERROR_SHOT_MAX_AGE_MS = 60_000                         # log/error/<毫秒时间戳>/ 在这么久以内建的，才算这次报错存的截图
+NO_TEXT_LINE = '（没有说明文字）'                          # 正文一行都没有时放的那一行
 
 _MISSING_CREDENTIALS = '飞书凭证缺失：.env 里没有 FEISHU_APP_ID 或 FEISHU_APP_SECRET'
 
@@ -583,6 +584,7 @@ class FeishuAppNotifier:
 
     def push(self, title: str, content: str) -> bool:
         """先写发件箱，再试着立即发送。返回 True 表示已发出或已合并，False 表示没发出。不抛异常。
+        title、content 为 None 时按空字符串处理。
 
         1. 没开就返回 False。接收方配置不对、凭证缺失：记一条错误，返回 False，不写发件箱。
         2. 登记过截图来源的进程先过合并：窗口内的同类错误只计数，记一行 INFO，返回 True。
@@ -598,6 +600,7 @@ class FeishuAppNotifier:
     def _push(self, title: str, content: str) -> bool:
         if not self.enable:
             return False
+        title, content = ('' if value is None else str(value) for value in (title, content))
         target = _parse_target(self.cfg)
         if target is None:
             logger.error(f'{_target_error(self.cfg)}。这条推送没有发出')
@@ -713,12 +716,13 @@ def _fail(outbox: Outbox, path: Path) -> None:
 
 
 def _compose_lines(title: str, content: str, root: Path) -> list[str]:
-    """正文的各行，每行一段：错误摘要（有多行就逐行）、正在跑的编排行、日志尾部（前面加一行小标题）。空行不要。"""
+    """正文的各行，每行一段：错误摘要（有多行就逐行）、正在跑的编排行、日志尾部（前面加一行小标题）。空行不要。
+    一行都没有时（没给内容，也没有编排行和日志）放一行 NO_TEXT_LINE：飞书对空的 content 怎么处理没核实过。"""
     fixed = [line for line in str(content).splitlines() if line.strip()]
     row = _orchestra_row_line(root)
     if row:
         fixed.append(row)
-    return _fit(title, fixed, _log_tail())
+    return _fit(title, fixed, _log_tail()) or [NO_TEXT_LINE]
 
 
 def _orchestra_row_line(root: Path) -> str | None:

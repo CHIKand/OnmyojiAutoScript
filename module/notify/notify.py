@@ -56,7 +56,7 @@ class Notifier:
             return False
         if getattr(self, 'delegate', None) is not None:
             self.delegate.config_name = self.config_name
-            return self.delegate.push(kwargs['title'], kwargs['content'])
+            return self.delegate.push(kwargs.get('title', ''), kwargs.get('content') or kwargs.get('message', ''))
         # 更新配置
         kwargs["title"] = f"{self.config_name} {kwargs['title']}"
         self.config.update(kwargs)

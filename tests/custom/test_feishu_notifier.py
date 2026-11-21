@@ -318,6 +318,41 @@ def test_notifier_delegation(tmp_path):
 
 # ---- notify.py 与 script.py 的接入 -----------------------------------------------------------------------------
 
+def delegating_notifier(session: FakeSession) -> Notifier:
+    notifier = Notifier(FEISHU_YAML, True)
+    notifier.delegate.session = session
+    notifier.config_name = 'OAS1'
+    return notifier
+
+
+def test_a_dye_trials_push_with_message_instead_of_content(tmp_path):
+    # tasks/DyeTrials/script_task.py 的写法：push(title=..., message=...)，没有 content
+    session = ok_session()
+    assert delegating_notifier(session).push(title='超鬼王', message='识别超时退出') is True
+    assert message(session)['title'] == 'OAS1 超鬼王'
+    assert texts(message(session)) == ['识别超时退出']
+
+
+@pytest.mark.parametrize('kwargs, title', [
+    ({'title': '超鬼王'}, 'OAS1 超鬼王'),
+    ({}, 'OAS1'),
+    ({'title': None, 'content': None}, 'OAS1'),
+], ids=['title-only', 'nothing', 'none-values'])
+def test_a_push_with_neither_content_nor_message(tmp_path, kwargs, title):
+    session = ok_session()
+    assert delegating_notifier(session).push(**kwargs) is True
+    post = message(session)
+    assert post['title'] == title
+    assert texts(post) == ['（没有说明文字）']                     # 正文不留空：飞书怎么处理空的 content 没核实
+
+
+def test_no_placeholder_when_the_log_tail_has_lines(tmp_path):
+    write_log(['line 1'])
+    session = ok_session()
+    assert delegating_notifier(session).push(title='超鬼王') is True
+    assert texts(message(session)) == ['日志最后 1 行：', 'line 1']
+
+
 def test_disabled_notifier_does_nothing(tmp_path):
     notifier = Notifier(FEISHU_YAML, False)
     assert getattr(notifier, 'delegate', None) is None
