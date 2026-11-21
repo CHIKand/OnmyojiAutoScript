@@ -122,6 +122,9 @@ class Clock:
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
+    # 编排行要用的 module.orchestra.mapping 第一次导入时会把当前目录改到仓库根（上游模块导入时的副作用）：先导入再切目录，
+    # 免得单跑某个用例时它在用例中途换了目录，之后的 Path.cwd() 指到仓库里
+    import module.orchestra.mapping  # noqa: F401
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv('FEISHU_APP_ID', 'cli_fake')
     monkeypatch.setenv('FEISHU_APP_SECRET', SECRET)
@@ -499,6 +502,53 @@ def test_no_aggregation_without_screenshot_source_or_window(tmp_path, clock, ins
     assert notifier.push('t', 'c') is True
     assert len(session.to(MESSAGES)) == 2
     assert (tmp_path / 'log' / 'feishu_aggregate.json').exists() == instance
+
+
+AWARE_WINDOW = {'start': '2026-11-21T10:00:00+08:00', 'end': '2026-11-21T10:10:00+08:00', 'count': 2, 'pending': 0,
+                'meta': {'receive_id_type': 'open_id', 'receive_id': 'ou_x', 'title': 'OAS1 t', 'window': 10}}
+
+
+def write_state(root: Path, windows: dict) -> None:
+    path = root / 'log' / 'feishu_aggregate.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(windows, ensure_ascii=False), encoding='utf-8')
+
+
+def test_an_aware_timestamp_in_the_state_neither_loses_a_push_nor_stalls_a_flush(tmp_path, clock):
+    start_instance()
+    write_state(tmp_path, {'OAS1|t|c': AWARE_WINDOW})
+    session = ok_session()
+    assert make_notifier(session).push('t', 'c') is True
+    assert texts(message(session)) == ['c']
+    make_notifier(down_session()).push('t', 'later')                # 留在发件箱
+    write_state(tmp_path, {'OAS1|t|c': AWARE_WINDOW})
+    session = ok_session()
+    assert flush_outbox(root=tmp_path, session=session) == 1
+    assert texts(message(session)) == ['later']
+    assert entries(tmp_path) == []
+
+
+def test_an_aggregator_that_raises_neither_loses_a_push_nor_stalls_a_flush(tmp_path, monkeypatch, caplog):
+    def broken(self, *args, **kwargs):
+        raise RuntimeError('aggregator broke')
+
+    monkeypatch.setattr(feishu_app.Aggregator, 'admit', broken)
+    monkeypatch.setattr(feishu_app.Aggregator, 'due_summaries', broken)
+    start_instance()
+    session = ok_session()
+    assert make_notifier(session).push('t', 'c') is True            # 按放行处理：照常写发件箱、发送
+    assert texts(message(session)) == ['c']
+    assert make_notifier(down_session()).push('t', 'later') is False
+    assert len(entries(tmp_path)) == 1
+    for _ in range(2):                                              # 断网的两轮：汇总出错只记一次
+        assert flush_outbox(root=tmp_path, session=down_session()) == 0
+    session = ok_session()
+    assert flush_outbox(root=tmp_path, session=session) == 1        # 汇总出错，发件箱里的照样发
+    assert texts(message(session)) == ['later']
+    broke = [r for r in caplog.records if r.name == 'oas' and 'aggregator broke' in r.getMessage()]
+    assert len(broke) == 3                                          # 两次推送各一行，补发在下一次发送成功之前只记一行
+    assert all(r.levelno == logging.WARNING for r in broke)
+    assert not [r for r in caplog.records if r.exc_info]
 
 
 def test_due_summary_goes_out_through_flush_to_first_target(tmp_path, clock):

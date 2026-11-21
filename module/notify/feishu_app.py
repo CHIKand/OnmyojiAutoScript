@@ -379,7 +379,10 @@ class _Window:
             raise ValueError('count、pending 不是非负整数')
         if meta is not None and not isinstance(meta, dict):
             raise ValueError('meta 不是对象')
-        return cls(datetime.fromisoformat(item['start']), datetime.fromisoformat(item['end']), count, pending, meta)
+        start, end = datetime.fromisoformat(item['start']), datetime.fromisoformat(item['end'])
+        if start.tzinfo is not None or end.tzinfo is not None:
+            raise ValueError('start、end 带着时区：窗口一律用本机的 naive 时间，和它比较会抛 TypeError')
+        return cls(start, end, count, pending, meta)
 
 
 class Aggregator:
@@ -389,7 +392,7 @@ class Aggregator:
     每次读改写都在进程内的锁里做（本类的所有对象共用一把），写入用 atomic_write 整个替换。不加跨进程锁：两个进程
     同一瞬间改同一个文件时后写的覆盖先写的，最多让汇总少算一次，或多放行一条。
 
-    - 文件不存在按空处理，什么都不交时也不建文件；内容损坏记一条 WARNING，按空处理，下次写入时覆盖。
+    - 文件不存在按空处理，什么都不交时也不建文件；内容损坏（包括带时区的时刻）记一条 WARNING，按空处理，下次写入时覆盖。
     - 暂时读不了（比如 Windows 上正赶上别的进程替换文件）记 WARNING，这次不写，免得拿空状态盖掉别的 key：
       admit 放行，due_summaries 返回空，meta 返回 None。
     - 写不进去记 WARNING：admit 放行（宁可多发，不漏发），due_summaries 这次返回空（计数还在文件里，下次再交，
@@ -594,7 +597,7 @@ class FeishuAppNotifier:
         title、content 为 None 时按空字符串处理。
 
         1. 没开就返回 False。接收方配置不对、凭证缺失：记一条错误，返回 False，不写发件箱。
-        2. 登记过截图来源的进程先过合并：窗口内的同类错误只计数，记一行 INFO，返回 True。
+        2. 登记过截图来源的进程先过合并：窗口内的同类错误只计数，记一行 INFO，返回 True。合并出错按放行处理。
         3. 拼消息、选截图，写进发件箱，再发送：成功删掉条目；飞书拒收这条消息改名为 .failed（只拒收截图时文字照发，
            见 _deliver）；网络错误、暂时性错误、凭证错误和意外异常留着条目，由主进程补发。写不进发件箱就不发，返回 False。
         """
@@ -645,10 +648,16 @@ class FeishuAppNotifier:
 
     def _admit(self, target: tuple[str, str], full_title: str, key: str) -> bool:
         """同类合并：窗口内的第一条放行（True），之后的只计数，记一行 INFO，返回 False。
-        meta 记下接收方、完整标题和窗口分钟数，汇总照它发。"""
+        meta 记下接收方、完整标题和窗口分钟数，汇总照它发。合并本身出错（比如状态文件里有意外的值）按放行处理，
+        记一行警告：发送不能依赖合并。"""
         window = _aggregate_minutes(self.cfg)
         meta = {'receive_id_type': target[0], 'receive_id': target[1], 'title': full_title, 'window': window}
-        if Aggregator(self.root / AGGREGATE_STATE, window).admit(key, _now(), meta):
+        try:
+            admitted = Aggregator(self.root / AGGREGATE_STATE, window).admit(key, _now(), meta)
+        except Exception as exc:
+            logger.warning(f'飞书同类合并出错，这条照常发送：{type(exc).__name__}: {exc}')
+            return True
+        if admitted:
             return True
         logger.info(f'同类错误合并中：{full_title}，{window} 分钟内只发第一条，窗口结束后由主进程补发一条汇总')
         return False
@@ -959,6 +968,7 @@ def flush_outbox(*, root: Path | None = None, session=requests) -> int:
     - 发件箱是空的、也没有合并状态文件：返回 0，不联网，也不读 .env。
     - 凭证缺失：每个进程只记一次错误，返回 0，发件箱和合并状态都不动。
     - 到期的汇总：发给窗口里第一条消息的接收方，标题相同，只有一行"{标题}：过去 {窗口} 分钟同类错误又出现 {n} 次"，不附图。
+      汇总出错记一次（到下一次发送成功为止），发件箱里的消息照常发。
     - 逐条发送（与 push 同一条路径 _deliver，只拒收截图时文字照发）：成功删掉条目；飞书拒收这条消息改名为 .failed，
       记一条错误，接着发下一条；字段不全的条目改名为 .bad；
       网络错误、暂时性错误、凭证错误和意外异常留着这一条和后面的，这一轮到此为止。
@@ -981,7 +991,11 @@ def _flush(root: Path, session) -> int:
             _flush_missing_logged = True
             logger.error(f'{_MISSING_CREDENTIALS}，发件箱里的消息先留着，补上凭证后再发')
         return 0
-    _queue_summaries(outbox, Aggregator(state, DEFAULT_AGGREGATE_MINUTES))
+    try:
+        _queue_summaries(outbox, Aggregator(state, DEFAULT_AGGREGATE_MINUTES))
+    except Exception as exc:                           # 汇总出错不能拦着发件箱里的消息
+        _flush_log_once('summaries', f'飞书合并汇总出错，这一轮照常补发发件箱里的消息：{type(exc).__name__}: {exc}',
+                        error=False)
     pending = outbox.pending()
     if not pending:
         return 0
