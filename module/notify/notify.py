@@ -30,6 +30,10 @@ class Notifier:
             logger.error("Fail to load onepush config, skip sending")
             return
         self.config = config
+        if config.get('provider') == 'feishu_app':
+            from module.notify.feishu_app import FeishuAppNotifier
+            self.delegate = FeishuAppNotifier(config, enable)
+            return
         try:
             # 获取provider
             self.provider_name: str = self.config.pop("provider", None)
@@ -50,6 +54,9 @@ class Notifier:
     def push(self, **kwargs) -> bool:
         if not self.enable:
             return False
+        if getattr(self, 'delegate', None) is not None:
+            self.delegate.config_name = self.config_name
+            return self.delegate.push(kwargs['title'], kwargs['content'])
         # 更新配置
         kwargs["title"] = f"{self.config_name} {kwargs['title']}"
         self.config.update(kwargs)

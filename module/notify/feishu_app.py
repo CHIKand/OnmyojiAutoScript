@@ -1,6 +1,8 @@
-"""飞书自建应用推送：HTTP 客户端（FeishuClient）、发件箱（Outbox）、同类错误合并器（Aggregator）。
+"""飞书自建应用推送：HTTP 客户端（FeishuClient）、发件箱（Outbox）、同类错误合并器（Aggregator），以及接在现有
+推送配置上的通知器（FeishuAppNotifier）、主进程补发（flush_outbox）和实例启动时的登记与自检（on_script_loop_start）。
 
-导入本模块不联网，也不建文件和目录（module.logger 自己导入时会打开日志文件，与其他模块相同）。只用已有依赖 requests。
+导入本模块不联网，也不建文件和目录（module.logger 自己导入时会打开日志文件，与其他模块相同）。
+只用已有依赖：requests、PyYAML、Pillow。
 
 飞书开放平台接口，2026-11-21 按 open.feishu.cn 官方文档核对，错误响应用假凭证实测过：
 - 取 token：POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal，JSON {app_id, app_secret}，
@@ -33,20 +35,36 @@
 带 token 的请求遇到 token 错误码时，作废缓存的 token，重新取一个，原请求重发一次。每个请求都带超时 (5, 10) 秒。
 异常消息只含接口名、HTTP 状态码、code、msg 和网络异常的说明，不含 app secret 和 token。网络异常不串联 requests 的
 原异常；本模块各帧的局部变量里也不留 app secret 和 token。项目日志会渲染 traceback 里的局部变量，记日志的规矩见 FeishuError。
+
+通知器：推送配置（OASX 里实例的 脚本 → 出错设置 → 消息推送配置）写 provider: feishu_app 时，notify.Notifier 把 push
+转交给 FeishuAppNotifier。
+- 凭证只放 .env（FEISHU_APP_ID、FEISHU_APP_SECRET），用的时候才读，不存在对象上，不进日志、发件箱和 repr。
+- 每条消息先写进发件箱 log/feishu_outbox/，再试着立即发送：报错的实例推送完马上 exit(1)，没发出去的由主进程每 60 秒
+  调 flush_outbox 补发。发送时带条目的 id（文件名去掉 .json）作 uuid，响应丢了再发，飞书 1 小时内也只发出一条。
+- 实例进程（on_script_loop_start 登记过截图来源的进程）合并同类错误：同一实例、标题和内容相同的报错在 aggregate_minutes
+  分钟内只发第一条，窗口结束后由 flush_outbox 补发一条汇总，发给窗口里第一条的接收方。主进程的测试推送不合并。
+- 一条消息：标题，然后每行一段：错误摘要、正在跑的编排行、日志最后 30 行（脱敏），最后是截图。富文本请求体不超过
+  30 KB，超了从最早的日志行删起。
 """
+import base64
+import io
 import json
 import os
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from uuid import uuid4
 
 import requests
+import yaml
+from PIL import Image
 
 from module.config.atomicwrites import atomic_write
+from module.config.dotenv import read_env
 from module.logger import logger
 
 TOKEN_PATH = '/open-apis/auth/v3/tenant_access_token/internal'
@@ -463,3 +481,481 @@ class Aggregator:
             logger.warning(f'飞书合并状态写不进去（{self.state_path}）：{exc!r}')
             return False
         return True
+
+
+# ---- 通知器：notify.Notifier 遇到 provider: feishu_app 时转交到这里 -------------------------------------------
+
+OUTBOX_DIR = Path('log') / 'feishu_outbox'             # 相对根目录（缺省为当前目录：实例和服务都是仓库根目录）
+AGGREGATE_STATE = Path('log') / 'feishu_aggregate.json'
+RECEIVE_ID_TYPES = ('open_id', 'chat_id')
+DEFAULT_AGGREGATE_MINUTES = 10
+MAX_AGGREGATE_MINUTES = 1440                           # 合并窗口最长一天，更大的值按无效处理
+LOG_TAIL_LINES = 30
+LOG_TAIL_BYTES = 64 * 1024                             # 日志可能很大，只读末尾这么多字节
+LOG_LINE_MAX = 300                                     # 每行日志最多保留的字符数
+POST_CONTENT_LIMIT = 28_000                            # content 在请求体里占的字节数上限（富文本请求体不超过 30 KB）
+IMAGE_KEY_ALLOWANCE = 'img_v2_' + 'x' * 93             # 算长度时图片段的 image_key 按 100 个字符预留（实际约 45 个）
+ERROR_SHOT_MAX_AGE_MS = 60_000                         # log/error/<毫秒时间戳>/ 在这么久以内建的，才算这次报错存的截图
+
+_MISSING_CREDENTIALS = '飞书凭证缺失：.env 里没有 FEISHU_APP_ID 或 FEISHU_APP_SECRET'
+
+_screenshot_provider: Callable[[], Any | None] | None = None   # 本进程登记的截图来源，只有实例进程登记
+_instance_name: str | None = None                      # 本进程的实例名（原样，不是大写），找编排进度文件用
+_flush_quiet: set[str] = set()                         # flush 已记过的失败类别：下一次发送成功之前不再记
+_flush_missing_logged = False                          # flush 是否已记过凭证缺失：每个进程最多记一次
+
+
+def _now() -> datetime:
+    """本机的 naive 当前时间，合并窗口和条目的 created_at 都用它。单独成函数，测试可以换掉。"""
+    return datetime.now()
+
+
+def _unexpected(exc: BaseException) -> str:
+    """意外异常的日志文字：类型、说明和标准库格式的调用栈。只能在 except 块里调用。
+
+    不用 logger.exception，也不传 exc_info：项目日志的 handler 会把 traceback 里每一帧的局部变量写进日志，其中可能有
+    app secret、token 和请求体（见 FeishuError）。标准库格式的调用栈只有代码行，没有变量的值。
+    """
+    return f'{type(exc).__name__}: {exc}\n{traceback.format_exc().rstrip()}'
+
+
+def register_screenshot_provider(fn: Callable[[], Any | None]) -> None:
+    """登记本进程的截图来源：调用时返回设备最新的一帧（RGB 的 numpy 数组），没有时返回 None。
+
+    登记过的进程（实例进程）推送时才合并同类错误、才附截图；主进程从不登记。
+    """
+    global _screenshot_provider
+    _screenshot_provider = fn
+
+
+def _credentials_present() -> bool:
+    """FEISHU_APP_ID、FEISHU_APP_SECRET 都有值（进程环境变量优先，其次当前目录的 .env）。值不留在局部变量里。"""
+    return bool(read_env('FEISHU_APP_ID')) and bool(read_env('FEISHU_APP_SECRET'))
+
+
+def _client(session) -> FeishuClient:
+    """按 .env 里的凭证建客户端，调用方先用 _credentials_present 确认过。
+
+    app secret 直接传进构造函数，不绑定到这一帧的局部变量：traceback 带局部变量渲染时，这一帧也可能在里面。
+    """
+    return FeishuClient(read_env('FEISHU_APP_ID') or '', read_env('FEISHU_APP_SECRET') or '', session=session)
+
+
+def _parse_target(cfg: dict) -> tuple[str, str] | None:
+    """接收方 (receive_id_type, receive_id)：类型只能是 open_id 或 chat_id，receive_id 是非空字符串（去掉两边空格）。
+    缺了或不合法时为 None。推送配置、发件箱条目和合并的 meta 都用它检查。"""
+    id_type, receive_id = cfg.get('receive_id_type'), cfg.get('receive_id')
+    if id_type not in RECEIVE_ID_TYPES or not isinstance(receive_id, str) or not receive_id.strip():
+        return None
+    return id_type, receive_id.strip()
+
+
+def _target_error(cfg: dict) -> str:
+    return (f'飞书推送配置有误（OASX 里实例的 脚本 → 出错设置 → 消息推送配置）：receive_id_type 要写 open_id 或 chat_id，'
+            f'receive_id 不能为空；现在 receive_id_type 是 {cfg.get("receive_id_type")!r}')
+
+
+def _aggregate_minutes(cfg: dict) -> int:
+    """合并窗口的分钟数：缺省 10，0 表示不合并。不是 0 到 MAX_AGGREGATE_MINUTES 的整数时记一条警告，按缺省处理。"""
+    value = cfg.get('aggregate_minutes')
+    if value is None:
+        return DEFAULT_AGGREGATE_MINUTES
+    if _is_int(value) and 0 <= value <= MAX_AGGREGATE_MINUTES:
+        return value
+    logger.warning(f'飞书推送配置的 aggregate_minutes 无效（{value!r}），按 {DEFAULT_AGGREGATE_MINUTES} 分钟处理')
+    return DEFAULT_AGGREGATE_MINUTES
+
+
+class FeishuAppNotifier:
+    """推送配置写 provider: feishu_app 时，notify.Notifier 把 push 转交给它。
+
+    cfg 是解析好的推送配置：receive_id_type（open_id 或 chat_id）、receive_id、aggregate_minutes（可省略，缺省 10，
+    0 表示不合并）。config_name 由 Notifier 在每次 push 前同步：实例名的大写，测试推送时为空。
+    root（缺省当前目录）和 session（缺省 requests）只给测试用。
+    """
+
+    def __init__(self, cfg: dict, enable: bool, *, root: Path | None = None, session=requests):
+        self.cfg = dict(cfg) if isinstance(cfg, dict) else {}
+        self.enable = enable
+        self.config_name = ''
+        self.root = Path(root) if root is not None else Path.cwd()
+        self.session = session
+
+    def push(self, title: str, content: str) -> bool:
+        """先写发件箱，再试着立即发送。返回 True 表示已发出或已合并，False 表示没发出。不抛异常。
+
+        1. 没开就返回 False。接收方配置不对、凭证缺失：记一条错误，返回 False，不写发件箱。
+        2. 登记过截图来源的进程先过合并：窗口内的同类错误只计数，记一行 INFO，返回 True。
+        3. 拼消息、选截图，写进发件箱，再发送：成功删掉条目；飞书拒收改名为 .failed；网络错误、暂时性错误、凭证错误
+           和意外异常留着条目，由主进程补发。写不进发件箱就不发，返回 False。
+        """
+        try:
+            return self._push(title, content)
+        except Exception as exc:
+            logger.error(f'飞书推送出错：{_unexpected(exc)}')
+            return False
+
+    def _push(self, title: str, content: str) -> bool:
+        if not self.enable:
+            return False
+        target = _parse_target(self.cfg)
+        if target is None:
+            logger.error(f'{_target_error(self.cfg)}。这条推送没有发出')
+            return False
+        if not _credentials_present():
+            logger.error(f'{_MISSING_CREDENTIALS}，这条推送没有发出')
+            return False
+        full_title = f'{self.config_name} {title}'.strip()
+        key = f'{self.config_name}|{title}|{content}'
+        if _screenshot_provider is not None and not self._admit(target, full_title, key):
+            return True
+        lines = _compose_lines(full_title, content, self.root)
+        png = _pick_image(self.root)
+        outbox = Outbox(self.root / OUTBOX_DIR)
+        try:
+            path = outbox.put(_entry(target, full_title, lines, png))
+        except OSError as exc:
+            logger.error(f'飞书推送没有发出：写不进发件箱（{exc!r}）')
+            return False
+        try:
+            _deliver(_client(self.session), path, target, full_title, lines, png)
+        except FeishuError as exc:
+            if exc.kind == 'rejected':
+                _fail(outbox, path)
+                logger.error(f'飞书拒收了这条推送，已改名为 .failed 留着备查：{exc}')
+            elif exc.kind == 'credentials':
+                logger.error(f'飞书凭证错误，推送留在发件箱，凭证改好后由主进程补发：{exc}')
+            else:
+                logger.warning(f'飞书推送暂时没发出，留在发件箱，由主进程补发：{exc}')
+            return False
+        _sent_ok()
+        _done(outbox, path)
+        logger.info(f'飞书推送已发出：{full_title}')
+        return True
+
+    def _admit(self, target: tuple[str, str], full_title: str, key: str) -> bool:
+        """同类合并：窗口内的第一条放行（True），之后的只计数，记一行 INFO，返回 False。
+        meta 记下接收方、完整标题和窗口分钟数，汇总照它发。"""
+        window = _aggregate_minutes(self.cfg)
+        meta = {'receive_id_type': target[0], 'receive_id': target[1], 'title': full_title, 'window': window}
+        if Aggregator(self.root / AGGREGATE_STATE, window).admit(key, _now(), meta):
+            return True
+        logger.info(f'同类错误合并中：{full_title}，{window} 分钟内只发第一条，窗口结束后由主进程补发一条汇总')
+        return False
+
+
+def _entry(target: tuple[str, str], title: str, lines: list[str], png: bytes | None) -> dict:
+    """发件箱条目：created_at、接收方、标题、各行文字和 PNG（base64，没有图为 None）。
+
+    条目的 id 就是文件名去掉 .json（Outbox.put 起的名字），不另存。不存 image_key（有效期没写明，每次发送都重新上传），
+    也不存任何凭证。
+    """
+    return {'created_at': _now().isoformat(timespec='seconds'), 'receive_id_type': target[0], 'receive_id': target[1],
+            'title': title, 'lines': lines, 'png_base64': base64.b64encode(png).decode('ascii') if png else None}
+
+
+def _entry_fields(entry: dict) -> tuple | None:
+    """发件箱条目里发送要用的 (接收方, 标题, 各行, PNG)。字段缺了、类型不对或 base64 解不开时为 None。"""
+    target, title, lines, png = _parse_target(entry), entry.get('title'), entry.get('lines'), entry.get('png_base64')
+    if (target is None or not isinstance(title, str) or not isinstance(lines, list)
+            or not all(isinstance(line, str) for line in lines) or not (png is None or isinstance(png, str))):
+        return None
+    try:
+        image = base64.b64decode(png, validate=True) if png else None
+    except ValueError:                 # binascii.Error 是 ValueError 的子类
+        return None
+    return target, title, lines, image
+
+
+def _deliver(client: FeishuClient, path: Path, target: tuple[str, str], title: str, lines: list[str],
+             png: bytes | None) -> None:
+    """发一条发件箱条目：有图先上传，再发富文本。条目的 id（文件名去掉 .json）作 uuid，重发不会重复。"""
+    image_key = client.upload_image(png) if png else None
+    client.send_post(target[0], target[1], title, lines, image_key, uuid=path.stem[:UUID_MAX_LENGTH])
+
+
+def _sent_ok() -> None:
+    """发送成功了一次：flush 记过的失败类别清空，之后再失败重新记。"""
+    _flush_quiet.clear()
+
+
+def _done(outbox: Outbox, path: Path) -> None:
+    try:
+        outbox.done(path)
+    except OSError as exc:
+        logger.warning(f'飞书发件箱：{path.name} 已发出，但删不掉（{exc!r}）；主进程会再发一次，'
+                       f'同一 uuid 飞书 1 小时内只发出一条')
+
+
+def _fail(outbox: Outbox, path: Path) -> None:
+    try:
+        outbox.fail(path)
+    except OSError as exc:
+        logger.warning(f'飞书发件箱：{path.name} 改名为 .failed 失败（{exc!r}）')
+
+
+def _compose_lines(title: str, content: str, root: Path) -> list[str]:
+    """正文的各行，每行一段：错误摘要（有多行就逐行）、正在跑的编排行、日志尾部（前面加一行小标题）。空行不要。"""
+    fixed = [line for line in str(content).splitlines() if line.strip()]
+    row = _orchestra_row_line(root)
+    if row:
+        fixed.append(row)
+    return _fit(title, fixed, _log_tail())
+
+
+def _orchestra_row_line(root: Path) -> str | None:
+    """本实例编排正在跑的那一行：编排：第 N 行 <任务显示名>（不在映射表里的任务用原名）。
+
+    只在进度文件的阶段是 row_running 时才有；本进程没登记实例名（主进程）或进度文件读不了时没有。
+    编排模块在这里才导入：建任务映射表要导入上游的配置模型。实例进程里 script.py 早已导入过它们。
+    """
+    name = _instance_name
+    if not name:
+        return None
+    try:
+        from module.orchestra.mapping import TASK_SPECS
+        from module.orchestra.progress import load_progress, progress_path
+        p = load_progress(progress_path(name, root))
+        if p.phase != 'row_running':
+            return None
+        spec = TASK_SPECS.get(p.row_task)
+        label = spec.title if spec is not None else (p.row_task or '')
+        return f'编排：第 {p.row_index + 1} 行 {label}'.rstrip()
+    except Exception as exc:
+        logger.warning(f'飞书推送：读不了编排进度（{type(exc).__name__}: {exc}），这条不写编排行')
+        return None
+
+
+def _log_tail() -> list[str]:
+    """项目日志（logger.log_file，实例进程里就是本实例的日志）的最后 LOG_TAIL_LINES 行，经 handle_sensitive_logs 脱敏，
+    去掉空行。只读文件末尾 LOG_TAIL_BYTES 字节；读不了时为空列表，消息里就没有日志段。
+
+    脱敏模块与 script.py 的 save_error_log 一样用到时才导入：它的源码里有无效转义，编译时发 DeprecationWarning。
+    """
+    from module.handler.sensitive_info import handle_sensitive_logs
+    path = getattr(logger, 'log_file', None)
+    if not path:
+        return []
+    try:
+        with open(path, 'rb') as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - LOG_TAIL_BYTES))
+            data = f.read()
+    except OSError:
+        return []
+    lines = data.decode('utf-8', errors='replace').splitlines()
+    if size > LOG_TAIL_BYTES:
+        lines = lines[1:]              # 第一行多半是从中间截断的
+    return [line for line in handle_sensitive_logs(lines[-LOG_TAIL_LINES:]) if line.strip()]
+
+
+def _fit(title: str, fixed: list[str], log_lines: list[str]) -> list[str]:
+    """拼出全部行，把富文本请求体控制在 30 KB 以内：日志每行截到 LOG_LINE_MAX 个字符，content 仍超过 POST_CONTENT_LIMIT
+    就从最早的日志行删起。标题、摘要、编排行不删；日志一行不剩时，小标题也不要。"""
+    log_lines = [line[:LOG_LINE_MAX] for line in log_lines]
+    while True:
+        lines = fixed + ([f'日志最后 {len(log_lines)} 行：', *log_lines] if log_lines else [])
+        if not log_lines or _content_cost(title, lines) <= POST_CONTENT_LIMIT:
+            return lines
+        log_lines = log_lines[1:]
+
+
+def _content_cost(title: str, lines: list[str]) -> int:
+    """content 在发消息的请求体里实际占的字节数。send_post 用 json.dumps(ensure_ascii=False) 把它转成字符串，requests
+    再用 json= 序列化整个请求体（非 ASCII 字符转成 \\uXXXX，一个汉字占 6 个字节），所以按两层 json.dumps 算。
+    拼法与 send_post 相同；有没有图都按预留的 image_key 算上图片段。"""
+    paragraphs = [[{'tag': 'text', 'text': line}] for line in lines]
+    paragraphs.append([{'tag': 'img', 'image_key': IMAGE_KEY_ALLOWANCE}])
+    return len(json.dumps(json.dumps({'zh_cn': {'title': title, 'content': paragraphs}}, ensure_ascii=False)))
+
+
+def _pick_image(root: Path) -> bytes | None:
+    """这条消息附的截图（PNG）。没登记截图来源的进程（主进程）不附图。
+
+    先找 60 秒内 save_error_log 存的出错截图（已脱敏，原样发）；没有就取设备最新的一帧，经 handle_sensitive_image
+    脱敏后编码成 PNG。截图来源抛异常或返回 None 时不附图，文字照发。
+    """
+    provider = _screenshot_provider
+    if provider is None:
+        return None
+    png = _recent_error_png(root)
+    return png if png is not None else _frame_png(provider)
+
+
+def _recent_error_png(root: Path) -> bytes | None:
+    """log/error/ 下最新的 <毫秒时间戳> 目录（60 秒内建的）里最新的 PNG。文件名是截图时刻，按名字排序就是先后。"""
+    try:
+        stamped = [(int(p.name), p) for p in (root / 'log' / 'error').iterdir()
+                   if p.name.isascii() and p.name.isdigit() and p.is_dir()]
+        now_ms = time.time() * 1000
+        recent = [(stamp, p) for stamp, p in stamped if 0 <= now_ms - stamp <= ERROR_SHOT_MAX_AGE_MS]
+        if not recent:
+            return None
+        shots = sorted(p for p in max(recent)[1].glob('*.png') if p.is_file())
+        return shots[-1].read_bytes() if shots else None
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.warning(f'飞书推送：读不了出错截图（{exc!r}），改用设备最新的一帧')
+        return None
+
+
+def _frame_png(provider: Callable[[], Any | None]) -> bytes | None:
+    """设备最新的一帧，脱敏后按 RGB 编码成 PNG（与 module/base/utils/utils.py 的 save_image 存图方式相同）。
+    脱敏模块用到时才导入，原因见 _log_tail。"""
+    from module.handler.sensitive_info import handle_sensitive_image
+    try:
+        frame = provider()
+    except Exception as exc:
+        logger.warning(f'飞书推送：取设备截图失败（{type(exc).__name__}: {exc}），这条只发文字')
+        return None
+    if frame is None:
+        return None
+    try:
+        buffer = io.BytesIO()
+        Image.fromarray(handle_sensitive_image(frame)).save(buffer, format='PNG')
+        return buffer.getvalue()
+    except Exception as exc:
+        logger.warning(f'飞书推送：截图转成 PNG 失败（{type(exc).__name__}: {exc}），这条只发文字')
+        return None
+
+
+def _load_notify_config(text) -> dict | None:
+    """照 notify.Notifier 的方式解析推送配置：YAML 的各个文档依次合并成一个 dict。解析不了时为 None。"""
+    cfg: dict = {}
+    try:
+        for item in yaml.safe_load_all(text):
+            cfg.update(item)
+    except Exception:
+        return None
+    return cfg
+
+
+def on_script_loop_start(script, *, session=requests) -> None:
+    """实例进程的调度循环开始时调用（script.py 的 loop）。不抛异常。session 只给测试用。
+
+    - 登记截图来源和实例名。截图来源只读 script.__dict__ 里已经建好的设备，不会触发 Script.device 的懒加载；
+      实例名（script.config_name，原样）用来找编排进度文件。
+    - 本实例开着推送、provider 是 feishu_app 时自检一次，结果记一行日志：接收方配置不对、凭证缺失、凭证错误、
+      网络错误、暂时性错误各记一条错误，取到 token 记一条 INFO。
+    """
+    global _instance_name
+    try:
+        _instance_name = script.config_name
+        register_screenshot_provider(lambda: getattr(script.__dict__.get('device'), 'image', None))
+        _self_check(script.config.model.script.error, session)
+    except Exception as exc:
+        logger.error(f'飞书自检出错：{_unexpected(exc)}')
+
+
+def _self_check(error, session) -> None:
+    if not error.notify_enable:
+        return
+    cfg = _load_notify_config(error.notify_config)
+    if cfg is None or cfg.get('provider') != 'feishu_app':
+        return
+    if _parse_target(cfg) is None:
+        logger.error(_target_error(cfg))
+        return
+    if not _credentials_present():
+        logger.error(f'{_MISSING_CREDENTIALS}，报错时推送不出去')
+        return
+    try:
+        _client(session).tenant_token()
+    except FeishuError as exc:
+        if exc.kind == 'credentials':
+            logger.error(f'飞书凭证错误：code={exc.code}，msg={exc.msg}，请核对 .env 里的 FEISHU_APP_ID 和 FEISHU_APP_SECRET')
+        elif exc.kind == 'network':
+            logger.error(f'飞书网络错误：{exc}')
+        else:
+            logger.error(f'飞书自检没通过（暂时性错误，发送时会重试）：{exc}')
+        return
+    logger.info('飞书自检通过：凭证有效')
+
+
+def flush_outbox(*, root: Path | None = None, session=requests) -> int:
+    """补发：主进程每 60 秒调一次。先把到期的合并汇总写进发件箱，再按写入先后发发件箱里的消息，返回这一轮发出的条数。
+    不抛异常。root（缺省当前目录）和 session（缺省 requests）只给测试用。
+
+    - 发件箱是空的、也没有合并状态文件：返回 0，不联网，也不读 .env。
+    - 凭证缺失：每个进程只记一次错误，返回 0，发件箱和合并状态都不动。
+    - 到期的汇总：发给窗口里第一条消息的接收方，标题相同，只有一行"{标题}：过去 {窗口} 分钟同类错误又出现 {n} 次"，不附图。
+    - 逐条发送：成功删掉条目；飞书拒收改名为 .failed，记一条错误，接着发下一条；字段不全的条目改名为 .bad；
+      网络错误、暂时性错误、凭证错误和意外异常留着这一条和后面的，这一轮到此为止。
+      同一类失败在下一次发送成功之前只记一次，免得每 60 秒记一遍。
+    """
+    try:
+        return _flush(Path(root) if root is not None else Path.cwd(), session)
+    except Exception as exc:
+        _flush_log_once('unexpected', f'飞书补发出错，下一轮再试：{_unexpected(exc)}', error=True)
+        return 0
+
+
+def _flush(root: Path, session) -> int:
+    global _flush_missing_logged
+    outbox, state = Outbox(root / OUTBOX_DIR), root / AGGREGATE_STATE
+    if not outbox.pending() and not state.exists():
+        return 0
+    if not _credentials_present():
+        if not _flush_missing_logged:
+            _flush_missing_logged = True
+            logger.error(f'{_MISSING_CREDENTIALS}，发件箱里的消息先留着，补上凭证后再发')
+        return 0
+    _queue_summaries(outbox, Aggregator(state, DEFAULT_AGGREGATE_MINUTES))
+    pending = outbox.pending()
+    if not pending:
+        return 0
+    client, sent = _client(session), 0
+    for path in pending:
+        entry = outbox.load(path)
+        if entry is None:
+            continue
+        fields = _entry_fields(entry)
+        if fields is None:
+            outbox._quarantine(path, '字段不全或类型不对')
+            continue
+        try:
+            _deliver(client, path, *fields)
+        except FeishuError as exc:
+            if exc.kind == 'rejected':
+                _fail(outbox, path)
+                logger.error(f'飞书拒收了发件箱里的 {path.name}，已改名为 .failed 留着备查：{exc}')
+                continue
+            if exc.kind == 'credentials':
+                _flush_log_once(exc.kind, f'飞书补发暂停：凭证错误，消息留在发件箱，凭证改好后再发：{exc}', error=True)
+            else:
+                _flush_log_once(exc.kind, f'飞书补发暂停，消息留在发件箱，下一轮再试：{exc}', error=False)
+            break
+        except Exception as exc:
+            _flush_log_once('unexpected', f'飞书补发出错，消息留在发件箱，下一轮再试：{_unexpected(exc)}', error=True)
+            break
+        sent += 1
+        _sent_ok()
+        _done(outbox, path)
+    return sent
+
+
+def _queue_summaries(outbox: Outbox, aggregator: Aggregator) -> None:
+    """把到期的合并汇总写进发件箱：接收方和标题取窗口里第一条消息的（meta），只有一行文字，不附图。"""
+    for key, count in aggregator.due_summaries(_now()):
+        meta = aggregator.meta(key) or {}
+        target, title = _parse_target(meta), meta.get('title')
+        if target is None or not isinstance(title, str):
+            logger.warning(f'飞书合并汇总缺少接收方或标题，没法补发：同类错误又出现 {count} 次')
+            continue
+        line = f'{title}：过去 {meta.get("window")} 分钟同类错误又出现 {count} 次'
+        try:
+            outbox.put(_entry(target, title, [line], None))
+        except OSError as exc:
+            logger.error(f'飞书合并汇总写不进发件箱（{exc!r}），这条汇总没发：{line}')
+
+
+def _flush_log_once(kind: str, message: str, *, error: bool) -> None:
+    """flush 的失败日志：同一类失败在下一次发送成功之前只记一次。"""
+    if kind in _flush_quiet:
+        return
+    _flush_quiet.add(kind)
+    if error:
+        logger.error(message)
+    else:
+        logger.warning(message)

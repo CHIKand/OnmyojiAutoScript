@@ -40,6 +40,7 @@ from module.exception import *
 from module.server.i18n import I18n
 from module.ocr.rpc import ensure_ocr_server_started
 from module.orchestra.runtime import orchestra_pick, orchestra_before_run, orchestra_after_run
+from module.notify.feishu_app import on_script_loop_start
 
 
 
@@ -638,6 +639,7 @@ class Script:
             logger.set_file_logger(self.config_name, do_cleanup=True)
         start_day = date.today()
         logger.info(f'Start scheduler loop: {self.config_name}')
+        on_script_loop_start(self)
         self.config.model.running_task = ''
         self.anti_ban_guard.reset()
 
