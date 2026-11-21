@@ -254,6 +254,50 @@ def test_chats_endpoint_reports_an_unexpected_error_by_type_and_message(monkeypa
     assert not [r for r in caplog.records if r.exc_info]                # 没带 traceback（exc_info）
 
 
+HOST = '127.0.0.1:22288'
+
+
+def asgi_get(path: str, headers: dict[str, str]) -> tuple[int, dict]:
+    """按 ASGI 直接调一次挂好本分支路由的 app（GET），返回 (状态码, JSON 响应体)。不起服务器，也不用 TestClient。"""
+    app = FastAPI()
+    register_custom(app)
+    messages = []
+
+    async def receive():
+        return {'type': 'http.request', 'body': b'', 'more_body': False}
+
+    async def send(message):
+        messages.append(message)
+
+    scope = {'type': 'http', 'asgi': {'version': '3.0'}, 'http_version': '1.1', 'method': 'GET', 'scheme': 'http',
+             'path': path, 'raw_path': path.encode('ascii'), 'root_path': '', 'query_string': b'',
+             'headers': [(key.encode('latin-1'), value.encode('latin-1')) for key, value in headers.items()],
+             'client': ('127.0.0.1', 50000), 'server': ('127.0.0.1', 22288)}
+    asyncio.run(app(scope, receive, send))
+    start = next(message for message in messages if message['type'] == 'http.response.start')
+    body = b''.join(message.get('body', b'') for message in messages if message['type'] == 'http.response.body')
+    return start['status'], json.loads(body)
+
+
+@pytest.mark.parametrize('origin', ['http://evil.example', 'http://127.0.0.1:8080', 'null'],
+                         ids=['other-host', 'other-port', 'opaque'])
+def test_chats_from_another_origin_get_403_and_make_no_feishu_call(monkeypatch, origin):
+    # 别的网页借浏览器读到 chat_id，再配上上游不查来源的 /home/notify_test，就能借机器人往群里发消息
+    session = use_session(monkeypatch, FakeSession().on(TOKEN, token_reply()).on(CHATS, CHATS_REPLY))
+    status, body = asgi_get('/custom/feishu/chats', {'host': HOST, 'origin': origin})
+    assert status == 403 and body['detail']['code'] == 'cross_origin'
+    assert session.calls == []
+
+
+@pytest.mark.parametrize('origin', [None, f'http://{HOST}'], ids=['no-origin', 'same-origin'])
+def test_chats_without_origin_or_from_the_same_origin_work(monkeypatch, origin):
+    # OASX、curl 和浏览器地址栏直接打开都不带 Origin
+    use_session(monkeypatch, FakeSession().on(TOKEN, token_reply()).on(CHATS, CHATS_REPLY))
+    headers = {'host': HOST, **({'origin': origin} if origin else {})}
+    assert asgi_get('/custom/feishu/chats', headers) == (200, {
+        'ok': True, 'chats': [{'chat_id': 'oc_1', 'name': '群一'}, {'chat_id': 'oc_2', 'name': '群二'}], 'error': ''})
+
+
 def test_chats_endpoint_is_a_plain_def_under_custom_feishu():
     app = FastAPI()
     register_custom(app)

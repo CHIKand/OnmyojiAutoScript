@@ -1,6 +1,9 @@
 """飞书的接口：GET /custom/feishu/chats 列出机器人所在的群，填推送配置时用它查群的 chat_id（步骤见 .env.example）。
 
 凭证只从 read_env 读（FEISHU_APP_ID、FEISHU_APP_SECRET：进程环境变量优先，其次当前目录的 .env），请求里带不进来。
+只接受同源请求（素材维护页的 SAME_ORIGIN_ONLY）：带 Origin 头而 host[:port] 与 Host 头不同的回 403，不联网。服务对所有来源
+开放 CORS，别的网页读到 chat_id 后，再配上上游不查来源的 /home/notify_test，就能借机器人往这些群里发消息。OASX、curl 和
+浏览器地址栏直接打开都不带 Origin，照常放行。
 处理函数是普通 def，FastAPI 把它放进线程池跑，联网不卡事件循环。
 出什么错都不往外抛，按 {'ok': False, 'chats': [], 'error': 原因} 返回：抛出去会被 app.py 的全局异常处理带着 traceback
 记进日志，项目日志会渲染每一帧的局部变量，app secret 和 token 可能就在某一帧里。日志同样只记原因的文字，不带
@@ -14,6 +17,7 @@ from fastapi import APIRouter
 from module.config.dotenv import read_env
 from module.logger import logger
 from module.notify.feishu_app import FeishuClient, FeishuError
+from module.server.assets_check_router import SAME_ORIGIN_ONLY
 
 MISSING_CREDENTIALS = '飞书凭证缺失：.env 里没有 FEISHU_APP_ID 或 FEISHU_APP_SECRET'
 
@@ -25,7 +29,7 @@ def _session():
     return requests
 
 
-@feishu_app_router.get('/chats')
+@feishu_app_router.get('/chats', dependencies=SAME_ORIGIN_ONLY)
 def get_chats() -> dict:
     """机器人所在的群：{'ok': True, 'chats': [{'chat_id', 'name'}], 'error': ''}。
 
