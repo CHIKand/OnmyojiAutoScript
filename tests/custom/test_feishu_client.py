@@ -680,8 +680,10 @@ def test_a_clock_moved_back_closes_the_window(tmp_path):
     '{"k": {"start": "not a time"}}',
     '{"k": {"start": "2026-11-21T10:00:00", "end": "2026-11-21T10:10:00", "count": "1", "pending": 0, "meta": null}}',
     # 带时区的时刻：和本机的 naive 时间比较会抛 TypeError，按损坏处理
-    '{"k": {"start": "2026-11-21T10:00:00+08:00", "end": "2026-11-21T10:10:00", "count": 1, "pending": 0, "meta": null}}',
-    '{"k": {"start": "2026-11-21T10:00:00", "end": "2026-11-21T10:10:00+00:00", "count": 1, "pending": 0, "meta": null}}',
+    '{"k": {"start": "2026-11-21T10:00:00+08:00", "end": "2026-11-21T10:10:00", "count": 1, "pending": 0, '
+    '"meta": null}}',
+    '{"k": {"start": "2026-11-21T10:00:00", "end": "2026-11-21T10:10:00+00:00", "count": 1, "pending": 0, '
+    '"meta": null}}',
 ])
 def test_a_corrupt_aggregate_state_counts_as_empty(tmp_path, raw, log):
     path = tmp_path / 'agg.json'
