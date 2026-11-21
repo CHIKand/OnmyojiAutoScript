@@ -47,8 +47,8 @@
 - 一条消息：标题，然后每行一段：错误摘要、正在跑的编排行、日志最后 30 行（脱敏），最后是截图。富文本请求体不超过
   30 KB：标题和固定的行各截到 1,000 个字符，日志每行截到 300 个字符；超了从最早的日志行删起，还超就截短最长的固定行。
   主进程的测试推送（/home/notify_test）没有截图，附一张生成的测试图。
-- 主进程自己的事件（每日定时合并上游代码冲突中止、推送失败）没有对应的推送配置：notify_server_event 发给各实例配置里
-  开着飞书推送的接收方，一行文字，不附图，不合并。
+- 主进程自己的事件（每日定时合并上游需要人处理的结果）没有对应的推送配置：notify_server_event 发给各实例配置里
+  开着飞书推送的接收方，只有文字（每行最多 300 个字符），不附图，不合并。
 """
 import base64
 import io
@@ -1043,14 +1043,15 @@ def _flush_log_once(kind: str, message: str, *, error: bool) -> None:
 
 
 def notify_server_event(title: str, text: str, *, root: Path | None = None, session=requests) -> None:
-    """主进程自己的事件（每日定时合并上游代码冲突中止、推送失败）发飞书通知。不抛异常。
+    """主进程自己的事件（每日定时合并上游需要人处理的结果）发飞书通知。不抛异常。
     root（缺省当前目录）和 session（缺省 requests）只给测试用。
 
     主进程没有自己的推送配置，接收方取自 config/ 下的各实例配置（只看这一层，不含 template.json）：开着推送
     （script.error.notify_enable）、推送配置写 provider: feishu_app 的，取 (receive_id_type, receive_id)，去掉重复的。
     - 一个接收方都没有：不发，记一行 INFO。凭证缺失：记一条错误，什么都不写。
-    - 每个接收方写一条发件箱条目：标题 title，正文是 text（一行），不附图，不合并。写完立即补发一轮（flush_outbox，与补发
-      同一条路径，发件箱里早先的条目先发），没发出去的留给下一轮补发。
+    - 每个接收方写一条发件箱条目：标题 title，正文是 text 的各行（空行不要），不附图，不合并。每行最多 LOG_LINE_MAX 个
+      字符（自检失败、意外错误带着最多 20 行 stderr），整条超过上限时截短最长的行（见 _fit）。写完立即补发一轮
+      （flush_outbox，与补发同一条路径，发件箱里早先的条目先发），没发出去的留给下一轮补发。
     """
     try:
         _notify_server_event(Path(root) if root is not None else Path.cwd(), title, text, session)
@@ -1067,7 +1068,8 @@ def _notify_server_event(root: Path, title: str, text: str, session) -> None:
         logger.error(f'{_MISSING_CREDENTIALS}，飞书通知没有发出：{title}')
         return
     title = str(title)[:FIXED_LINE_MAX]
-    lines = _fit(title, [line for line in str(text).splitlines() if line.strip()] or [NO_TEXT_LINE], [])
+    lines = [line[:LOG_LINE_MAX] for line in str(text).splitlines() if line.strip()] or [NO_TEXT_LINE]
+    lines = _fit(title, lines, [])
     outbox, written = Outbox(root / OUTBOX_DIR), 0
     for target in targets:
         try:

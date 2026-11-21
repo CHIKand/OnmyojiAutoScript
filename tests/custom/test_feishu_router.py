@@ -386,23 +386,85 @@ def test_the_immediate_send_is_a_flush_round(tmp_path):
 
 # ---- custom_jobs 的接线：哪些合并结果发通知、补发任务什么时候登记 --------------------------------------------------
 
-def run_daily_merge(monkeypatch, status: str | None) -> None:
-    """跑一轮每日定时合并的检查，合并结果的状态为 status（None 表示合并没给出结果）。"""
+CONFLICT_HEADLINE = '合并上游有代码冲突，需人工处理'                      # 计划书 §6.3 的原话
+RESTARTED = '已合并上游 3 个提交并推送到 fork；已重启实例：oas1'
+RESTART_FAILED = '已合并上游 3 个提交并推送到 fork' + fork_updater.RESTART_FAILED_NOTE
+
+
+def run_daily_merge(monkeypatch, status: str | None, *, message: str = MERGE_MESSAGE, conflicts: tuple = (),
+                    attempts_before: int = 0) -> None:
+    """跑一轮每日定时合并的检查，合并结果的状态为 status（None 表示合并没给出结果），文案为 message。
+    attempts_before：今天已经试过几次（都是拉取失败，上一次在 RETRY_DELAY 之前），这一次就是第 attempts_before + 1 次。"""
     monkeypatch.setenv('OAS_UPSTREAM_MERGE_TIME', '04:30')
-    result = None if status is None else MergeResult(status, 0, [], [], '')
-    monkeypatch.setattr(custom_jobs, '_merge_on_loop', lambda loop: (result, MERGE_MESSAGE))
-    custom_jobs.CustomJobs(now=lambda: MERGE_TIME).tick(None)
+    result = None if status is None else MergeResult(status, 0, [], list(conflicts), '')
+    monkeypatch.setattr(custom_jobs, '_merge_on_loop', lambda loop: (result, message))
+    jobs = custom_jobs.CustomJobs(now=lambda: MERGE_TIME)
+    if attempts_before:
+        jobs._state = custom_jobs.MergeState(None, attempts_before, MERGE_TIME - custom_jobs.RETRY_DELAY)
+        jobs._state_loaded = True
+    jobs.tick(None)
 
 
-@pytest.mark.parametrize('status', ['merged', 'needs_install', 'pushed', 'up_to_date', 'fetch_failed', 'dirty',
-                                    'smoke_failed', 'fork_ahead', 'diverged', 'error', None,
-                                    'conflict_aborted', 'push_failed'])
-def test_only_a_code_conflict_or_a_failed_push_in_the_daily_merge_notifies(monkeypatch, status):
+@pytest.fixture
+def merge_notices(monkeypatch) -> list[tuple]:
+    """custom_jobs 调 notify_server_event 的参数，一次一项。"""
     sent = []
     monkeypatch.setattr(feishu_app, 'notify_server_event', lambda *args, **kwargs: sent.append((args, kwargs)))
-    run_daily_merge(monkeypatch, status)
-    expected = [((MERGE_TITLE, MERGE_MESSAGE), {})] if status in ('conflict_aborted', 'push_failed') else []
-    assert sent == expected
+    return sent
+
+
+@pytest.mark.parametrize('status, message, attempts_before', [
+    ('up_to_date', '已是最新，无需合并', 0),
+    ('merged', RESTARTED, 0),
+    ('pushed', '已把之前未推送的 1 个提交推送到 fork；已重启实例：无', 0),
+    ('fetch_failed', MERGE_MESSAGE, 0),                                     # 第 1 次：10 分钟后重试
+    ('fetch_failed', MERGE_MESSAGE, custom_jobs.MAX_ATTEMPTS - 2),           # 倒数第 2 次：还会重试
+], ids=['up-to-date', 'merged', 'pushed', 'fetch-failed-first', 'fetch-failed-before-last'])
+def test_a_daily_merge_that_needs_nobody_sends_nothing(monkeypatch, merge_notices, status, message, attempts_before):
+    run_daily_merge(monkeypatch, status, message=message, attempts_before=attempts_before)
+    assert merge_notices == []
+
+
+@pytest.mark.parametrize('status, conflicts, message, attempts_before', [
+    ('conflict_aborted', ('module/a.py',), MERGE_MESSAGE, 0),
+    ('conflict_aborted', (), '合并未能开始，分支未改动：error: Your local changes would be overwritten', 0),
+    ('push_failed', (), '已在本地合并上游 2 个提交，但推送失败：网络不通或超时。启动器守卫会保护本地提交，请检查网络或令牌后重试', 0),
+    ('needs_install', (), '已合并上游 2 个提交并推送到 fork；上游新增依赖 foo，请在 OASX 重启服务（启动器会先安装依赖），实例暂未重启', 0),
+    ('merged', (), RESTART_FAILED, 0),
+    ('pushed', (), '已把之前未推送的 1 个提交推送到 fork' + fork_updater.RESTART_FAILED_NOTE, 0),
+    ('fork_ahead', (), 'fork 上有运行目录还没有的 1 个新提交，已暂停合并', 0),
+    ('diverged', (), '运行目录和 fork 各有对方没有的提交，已停止，需要人工处理', 0),
+    ('dirty', (), '运行目录有未提交的改动，已跳过合并：M tasks/a.py', 0),
+    ('smoke_failed', (), '合并上游后自检失败，已中止，分支未改动：ImportError: x', 0),
+    ('error', (), '合并上游时出现意外错误，请查看服务日志：boom', 0),
+    (None, (), '合并上游时出现意外错误，请查看服务日志：RuntimeError: no deploy.yaml', 0),
+    ('fetch_failed', (), '拉取上游失败，未改动任何文件：fatal: unable to access', custom_jobs.MAX_ATTEMPTS - 1),
+    ('a_status_fork_git_adds_later', (), '合并上游时出现意外错误，请查看服务日志：a_status_fork_git_adds_later', 0),
+], ids=['conflict', 'conflict-not-started', 'push-failed', 'needs-install', 'merged-restart-failed',
+        'pushed-restart-failed', 'fork-ahead', 'diverged', 'dirty', 'smoke-failed', 'error', 'no-result',
+        'fetch-failed-last-attempt', 'unknown-status'])
+def test_a_daily_merge_that_needs_a_person_notifies_and_says_so_first(monkeypatch, merge_notices, status, conflicts,
+                                                                      message, attempts_before):
+    run_daily_merge(monkeypatch, status, message=message, conflicts=conflicts, attempts_before=attempts_before)
+    ((title, text), kwargs), = merge_notices
+    assert (title, kwargs) == (MERGE_TITLE, {})
+    headline, rest = text.split('\n', 1)
+    assert headline.startswith('合并上游') and headline.endswith('，需人工处理')     # 第一行点明结果，说要人处理
+    assert rest == message                                                  # 后面是更新页的同一句文案，一字不改
+    if status == 'a_status_fork_git_adds_later':
+        assert status in headline
+
+
+def test_a_daily_merge_conflict_carries_the_spec_line(monkeypatch, merge_notices):
+    run_daily_merge(monkeypatch, 'conflict_aborted', conflicts=('module/a.py',))
+    assert merge_notices == [((MERGE_TITLE, f'{CONFLICT_HEADLINE}\n{MERGE_MESSAGE}'), {})]
+
+
+def test_a_merge_that_never_started_is_not_called_a_code_conflict(monkeypatch, merge_notices):
+    # 与 message_of 的规矩一致：conflict_aborted 却没有冲突文件，是合并根本没开始
+    run_daily_merge(monkeypatch, 'conflict_aborted', message='合并未能开始，分支未改动：x')
+    (_, text), _ = merge_notices[0]
+    assert text.split('\n')[0] == '合并上游未能开始，需人工处理'
 
 
 def test_a_daily_merge_conflict_reaches_feishu(tmp_path, monkeypatch):
@@ -410,9 +472,26 @@ def test_a_daily_merge_conflict_reaches_feishu(tmp_path, monkeypatch):
     session = ok_session()
     real = feishu_app.notify_server_event
     monkeypatch.setattr(feishu_app, 'notify_server_event', lambda title, text: real(title, text, session=session))
-    run_daily_merge(monkeypatch, 'conflict_aborted')
+    run_daily_merge(monkeypatch, 'conflict_aborted', conflicts=('module/a.py',))
     assert receivers(session) == [('open_id', 'ou_1')]
-    assert message(session) == {'title': MERGE_TITLE, 'content': [[{'tag': 'text', 'text': MERGE_MESSAGE}]]}
+    assert message(session) == {'title': MERGE_TITLE, 'content': [[{'tag': 'text', 'text': CONFLICT_HEADLINE}],
+                                                                  [{'tag': 'text', 'text': MERGE_MESSAGE}]]}
+
+
+@pytest.mark.parametrize('body', ['x' * 1_000, '御' * 1_000], ids=['ascii', 'cjk'])
+def test_a_server_event_caps_each_line_and_the_whole_message(tmp_path, body):
+    # 自检失败、意外错误的文案带着最多 20 行 stderr：每行最多 300 个字符，整条照 requests 的 json= 算不超过 28,000 字节
+    write_instance(tmp_path, 'a.json', notify_config=feishu_yaml('open_id', 'ou_1'))
+    stderr = [f'{i:02d} {body}' for i in range(20)]
+    text = '\n'.join([CONFLICT_HEADLINE, '合并上游后自检失败，已中止，分支未改动：' + body, *stderr])
+    session = ok_session()
+    notify_server_event(MERGE_TITLE, text, root=tmp_path, session=session)
+    call, = session.to(MESSAGES)
+    assert len(json.dumps(call['json']['content'])) <= 28_000
+    lines = texts(message(session))
+    assert lines[0] == CONFLICT_HEADLINE                                    # 第一行短，不截
+    assert [line[:2] for line in lines[2:]] == [f'{i:02d}' for i in range(20)]   # 一行不删，只截长的
+    assert all(0 < len(line) <= 300 for line in lines)
 
 
 def test_the_update_button_sends_nothing(monkeypatch):
@@ -515,3 +594,13 @@ def test_env_example_explains_how_to_find_the_receive_id(monkeypatch):
     monkeypatch.delenv('FEISHU_APP_SECRET')
     assert read_env('FEISHU_APP_ID', env_file=REPO_ROOT / '.env.example') == ''      # 示例里的两个值仍是空的
     assert read_env('FEISHU_APP_SECRET', env_file=REPO_ROOT / '.env.example') == ''
+
+
+def test_env_example_says_who_gets_the_daily_merge_message():
+    lines = (REPO_ROOT / '.env.example').read_text(encoding='utf-8').splitlines()
+    start = lines.index(f'OAS_UPSTREAM_BRANCH={fork_updater.DEFAULT_UPSTREAM_BRANCH}') + 1
+    sample = next(index for index, line in enumerate(lines) if line.lstrip('# ').startswith('OAS_UPSTREAM_MERGE_TIME='))
+    line, = [line for line in lines[start:sample] if '飞书' in line]       # 定时合并那一节里的一行注释
+    assert line.startswith('#')
+    for words in ('需要人处理', '各实例', '接收方'):
+        assert words in line, words
