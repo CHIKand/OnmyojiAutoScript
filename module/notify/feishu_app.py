@@ -45,7 +45,8 @@
 - 实例进程（on_script_loop_start 登记过截图来源的进程）合并同类错误：同一实例、标题和内容相同的报错在 aggregate_minutes
   分钟内只发第一条，窗口结束后由 flush_outbox 补发一条汇总，发给窗口里第一条的接收方。主进程的测试推送不合并。
 - 一条消息：标题，然后每行一段：错误摘要、正在跑的编排行、日志最后 30 行（脱敏），最后是截图。富文本请求体不超过
-  30 KB，超了从最早的日志行删起。主进程的测试推送（/home/notify_test）没有截图，附一张生成的测试图。
+  30 KB：标题和固定的行各截到 1,000 个字符，日志每行截到 300 个字符；超了从最早的日志行删起，还超就截短最长的固定行。
+  主进程的测试推送（/home/notify_test）没有截图，附一张生成的测试图。
 - 主进程自己的事件（每日定时合并上游代码冲突中止、推送失败）没有对应的推送配置：notify_server_event 发给各实例配置里
   开着飞书推送的接收方，一行文字，不附图，不合并。
 """
@@ -496,6 +497,7 @@ MAX_AGGREGATE_MINUTES = 1440                           # 合并窗口最长一�
 LOG_TAIL_LINES = 30
 LOG_TAIL_BYTES = 64 * 1024                             # 日志可能很大，只读末尾这么多字节
 LOG_LINE_MAX = 300                                     # 每行日志最多保留的字符数
+FIXED_LINE_MAX = 1_000                                 # 标题和固定的行（错误摘要、编排行、汇总行、主进程事件的各行）最多保留的字符数
 POST_CONTENT_LIMIT = 28_000                            # content 在请求体里占的字节数上限（富文本请求体不超过 30 KB）
 IMAGE_KEY_ALLOWANCE = 'img_v2_' + 'x' * 93             # 算长度时图片段的 image_key 按 100 个字符预留（实际约 45 个）
 ERROR_SHOT_MAX_AGE_MS = 60_000                         # log/error/<毫秒时间戳>/ 在这么久以内建的，才算这次报错存的截图
@@ -613,7 +615,7 @@ class FeishuAppNotifier:
         if not _credentials_present():
             logger.error(f'{_MISSING_CREDENTIALS}，这条推送没有发出')
             return False
-        full_title = f'{self.config_name} {title}'.strip()
+        full_title = f'{self.config_name} {title}'.strip()[:FIXED_LINE_MAX]
         key = f'{self.config_name}|{title}|{content}'
         if _screenshot_provider is not None and not self._admit(target, full_title, key):
             return True
@@ -777,14 +779,40 @@ def _log_tail() -> list[str]:
 
 
 def _fit(title: str, fixed: list[str], log_lines: list[str]) -> list[str]:
-    """拼出全部行，把富文本请求体控制在 30 KB 以内：日志每行截到 LOG_LINE_MAX 个字符，content 仍超过 POST_CONTENT_LIMIT
-    就从最早的日志行删起。标题、摘要、编排行不删；日志一行不剩时，小标题也不要。"""
+    """拼出全部行，把富文本请求体控制在 30 KB 以内：固定的行（摘要、编排行、汇总行、主进程事件的各行）每行截到
+    FIXED_LINE_MAX 个字符，日志每行截到 LOG_LINE_MAX 个字符；content 仍超过 POST_CONTENT_LIMIT 就从最早的日志行删起，
+    日志一行不剩时小标题也不要；还超就截短最长的固定行（_shrink）。标题由调用方先截到 FIXED_LINE_MAX 个字符。"""
+    fixed = [line[:FIXED_LINE_MAX] for line in fixed]
     log_lines = [line[:LOG_LINE_MAX] for line in log_lines]
     while True:
         lines = fixed + ([f'日志最后 {len(log_lines)} 行：', *log_lines] if log_lines else [])
-        if not log_lines or _content_cost(title, lines) <= POST_CONTENT_LIMIT:
+        if _content_cost(title, lines) <= POST_CONTENT_LIMIT:
             return lines
+        if not log_lines:
+            return _shrink(title, fixed)
         log_lines = log_lines[1:]
+
+
+def _shrink(title: str, lines: list[str]) -> list[str]:
+    """日志行删光后 content 仍超过上限：截短最长的行，直到放得下。找出最大的 n，使每行最多留 n 个字符时放得下，
+    只截比 n 长的行，所以最长的行先截，其余不动。每行只留一个字符也放不下（行数太多）时，先从最后一行删起，至少留一行。
+    截完只剩空白的行不要；一行都不剩时放一行 NO_TEXT_LINE。标题不超过 FIXED_LINE_MAX 个字符时，一行总放得下。"""
+    def cut(width: int, count: int) -> list[str]:
+        return [line[:width] for line in lines[:count]]
+
+    def fits(candidate: list[str]) -> bool:
+        return _content_cost(title, candidate) <= POST_CONTENT_LIMIT
+
+    def largest(low: int, high: int, ok: Callable[[int], bool]) -> int:
+        """[low, high] 里让 ok 成立的最大值（ok 随取值增大由真变假）；都不成立时为 low。"""
+        while low < high:
+            middle = (low + high + 1) // 2
+            low, high = (middle, high) if ok(middle) else (low, middle - 1)
+        return low
+
+    count = largest(1, len(lines), lambda n: fits(cut(1, n))) if lines else 0
+    width = largest(1, max((len(line) for line in lines[:count]), default=1), lambda n: fits(cut(n, count)))
+    return [line for line in cut(width, count) if line.strip()] or [NO_TEXT_LINE]
 
 
 def _content_cost(title: str, lines: list[str]) -> int:
@@ -996,8 +1024,9 @@ def _queue_summaries(outbox: Outbox, aggregator: Aggregator) -> None:
             logger.warning(f'飞书合并汇总缺少接收方或标题，没法补发：同类错误又出现 {count} 次')
             continue
         line = f'{title}：过去 {meta.get("window")} 分钟同类错误又出现 {count} 次'
+        title = title[:FIXED_LINE_MAX]                 # 旧版本存下的标题没截过
         try:
-            outbox.put(_entry(target, title, [line], None))
+            outbox.put(_entry(target, title, _fit(title, [line], []), None))
         except OSError as exc:
             logger.error(f'飞书合并汇总写不进发件箱（{exc!r}），这条汇总没发：{line}')
 
@@ -1037,7 +1066,8 @@ def _notify_server_event(root: Path, title: str, text: str, session) -> None:
     if not _credentials_present():
         logger.error(f'{_MISSING_CREDENTIALS}，飞书通知没有发出：{title}')
         return
-    lines = [line for line in str(text).splitlines() if line.strip()] or [NO_TEXT_LINE]
+    title = str(title)[:FIXED_LINE_MAX]
+    lines = _fit(title, [line for line in str(text).splitlines() if line.strip()] or [NO_TEXT_LINE], [])
     outbox, written = Outbox(root / OUTBOX_DIR), 0
     for target in targets:
         try:

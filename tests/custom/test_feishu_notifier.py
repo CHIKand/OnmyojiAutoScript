@@ -573,6 +573,50 @@ def test_post_body_stays_under_size_cap(tmp_path):
     assert log_lines[-1].startswith('39 ')                          # 最新的一行留着
 
 
+def assert_under_the_limit(session: FakeSession) -> list[str]:
+    """最后一条发出的消息：content 照 requests 的 json= 算不超过 28,000 字节，标题和每行不超过 1,000 个字符，
+    不是空消息，也没有空行。返回各行文字。"""
+    call = session.to(MESSAGES)[-1]
+    assert len(json.dumps(call['json']['content'])) <= 28_000
+    post = message(session)
+    assert 0 < len(post['title']) <= 1_000
+    lines = texts(post)
+    assert lines and all(line.strip() and len(line) <= 1_000 for line in lines)
+    return lines
+
+
+@pytest.mark.parametrize('title, content', [
+    ('t', '御' * 12_000),
+    ('t', '\n'.join(f'{i:02d} ' + '御' * 397 for i in range(30))),
+    ('御' * 12_000, 'c'),
+], ids=['one-long-line', 'thirty-long-lines', 'long-title'])
+def test_long_content_or_title_is_delivered_under_the_limit(tmp_path, title, content):
+    row_running()
+    write_log([f'{i:02d} ' + '御' * 400 for i in range(40)])
+    start_instance()
+    session = ok_session()
+    assert make_notifier(session).push(title, content) is True
+    lines = assert_under_the_limit(session)
+    if content.startswith('00 '):                                   # 截短最长的行，一行都不删：编排行也在
+        assert [line[:2] for line in lines[:30]] == [f'{i:02d}' for i in range(30)]
+        assert lines[30:] == [ROW_LINE]
+
+
+def test_a_long_summary_is_delivered_under_the_limit(tmp_path, clock):
+    # 旧版本写下的合并状态：标题没截过，汇总行跟着有一万多字
+    meta = {'receive_id_type': 'open_id', 'receive_id': 'ou_x', 'title': 'OAS1 ' + '御' * 12_000, 'window': 10}
+    window = {'start': T0.isoformat(), 'end': (T0 + timedelta(minutes=10)).isoformat(), 'count': 3, 'pending': 0,
+              'meta': meta}
+    (tmp_path / 'log').mkdir()
+    (tmp_path / 'log' / 'feishu_aggregate.json').write_text(json.dumps({'k': window}, ensure_ascii=False),
+                                                            encoding='utf-8')
+    clock.now = T0 + timedelta(minutes=11)
+    session = ok_session()
+    assert flush_outbox(root=tmp_path, session=session) == 1
+    line, = assert_under_the_limit(session)
+    assert line.startswith('OAS1 御')
+
+
 def test_recent_error_screenshot_is_preferred_and_sent_as_saved(tmp_path):
     start_instance(frame=FRAME)
     now_ms = int(time.time() * 1000)
