@@ -131,7 +131,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(logger, 'handlers', [])
     monkeypatch.setattr(logger, 'log_file', str(tmp_path / 'log' / 'server.txt'), raising=False)
     for name, value in (('_screenshot_provider', None), ('_instance_name', None), ('_flush_quiet', set()),
-                        ('_flush_missing_logged', False)):
+                        ('_flush_missing_logged', False), ('_sent_stems', set()), ('_pruned_on', None)):
         monkeypatch.setattr(feishu_app, name, value)
     monkeypatch.setattr(feishu_router, '_session', lambda: FakeSession())
 
@@ -375,9 +375,9 @@ def test_a_merge_failure_that_cannot_go_out_now_waits_for_the_next_flush(tmp_pat
 def test_the_immediate_send_is_a_flush_round(tmp_path):
     # 与补发同一条路径：发件箱里早先留下的条目先发，这条通知跟在后面
     write_instance(tmp_path, 'a.json', notify_config=feishu_yaml('open_id', 'ou_1'))
-    feishu_app.Outbox(tmp_path / 'log' / 'feishu_outbox').put(
-        {'created_at': '2026-11-17T04:00:00', 'receive_id_type': 'open_id', 'receive_id': 'ou_earlier',
-         'title': 'OAS1 t', 'lines': ['c'], 'png_base64': None})
+    feishu_app.Outbox(tmp_path / 'log' / 'feishu_outbox').put(          # 刚写下的：超过 24 小时的不再补发
+        {'created_at': datetime.now().isoformat(timespec='seconds'), 'receive_id_type': 'open_id',
+         'receive_id': 'ou_earlier', 'title': 'OAS1 t', 'lines': ['c'], 'png_base64': None})
     session = ok_session()
     notify_server_event(MERGE_TITLE, MERGE_MESSAGE, root=tmp_path, session=session)
     assert receivers(session) == [('open_id', 'ou_earlier'), ('open_id', 'ou_1')]

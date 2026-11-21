@@ -42,7 +42,8 @@
 - 凭证只放 .env（FEISHU_APP_ID、FEISHU_APP_SECRET），用的时候才读，不存在对象上，不进日志、发件箱和 repr。
 - 每条消息先写进发件箱 log/feishu_outbox/，再试着立即发送：报错的实例推送完马上 exit(1)，没发出去的由主进程每 60 秒
   调 flush_outbox 补发。发送时带条目的 id（文件名去掉 .json）作 uuid，响应丢了再发，飞书 1 小时内也只发出一条。
-  写下超过 2 分钟才发出去的，文字最后加一行"（补发：原定 <时刻>）"。
+  写下超过 2 分钟才发出去的，文字最后加一行"（补发：原定 <时刻>）"；超过 24 小时还没发出去的改名为 .expired，不再补发。
+  放到一边的 .failed、.bad、.expired 和没写完的临时文件留 14 天。
 - 实例进程（on_script_loop_start 登记过截图来源的进程）合并同类错误：同一实例、标题和内容相同的报错在 aggregate_minutes
   分钟内只发第一条，窗口结束后由 flush_outbox 补发一条汇总，发给窗口里第一条的接收方。主进程的测试推送不合并。
 - 一条消息：标题，然后每行一段：错误摘要、正在跑的编排行、日志最后 30 行（脱敏），最后是截图。富文本请求体不超过
@@ -59,7 +60,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -296,8 +297,8 @@ class Outbox:
     - pending：只列 *.json 文件，跳过 .bad、.failed 和临时文件；目录不存在时返回空列表，也不建目录。
     - load：内容损坏（不是 UTF-8、不是 JSON、不是对象）时改名为 <原名>.bad，记一条 WARNING，返回 None。
       文件已被别的进程处理掉（不存在）时返回 None；暂时读不了时记 WARNING、返回 None，文件留着下次再读。
-    - done：删掉文件，文件已不在不算错。fail：改名为 <原名>.failed 留着备查，文件已不在不算错。
-      其他 OSError 照常抛出。
+    - done：删掉文件，文件已不在不算错。fail：改名为 <原名>.failed 留着备查；expire：改名为 <原名>.expired（太久没发出去，
+      不再补发）。这两个文件已不在都不算错。其他 OSError 照常抛出。
     """
 
     def __init__(self, dir: Path):
@@ -340,6 +341,13 @@ class Outbox:
         p = Path(p)
         try:
             os.replace(p, p.with_name(p.name + '.failed'))
+        except FileNotFoundError:
+            pass
+
+    def expire(self, p: Path) -> None:
+        p = Path(p)
+        try:
+            os.replace(p, p.with_name(p.name + '.expired'))
         except FileNotFoundError:
             pass
 
@@ -507,6 +515,9 @@ POST_CONTENT_LIMIT = 28_000                            # content 在请求体里
 IMAGE_KEY_ALLOWANCE = 'img_v2_' + 'x' * 93             # 算长度时图片段的 image_key 按 100 个字符预留（实际约 45 个）
 ERROR_SHOT_MAX_AGE_MS = 60_000                         # log/error/<毫秒时间戳>/ 在这么久以内建的，才算这次报错存的截图
 LATE_AFTER = timedelta(seconds=120)                    # 条目写下超过这么久才发出去，末尾加一行注明原定的时刻
+EXPIRE_AFTER = timedelta(hours=24)                     # 条目写下超过这么久还没发出去，改名为 .expired，不再补发
+PRUNE_AFTER_SECONDS = 14 * 24 * 3600                   # 发件箱里放到一边的文件留这么久（按修改时间），之后删掉
+PRUNE_PATTERNS = ('*.failed', '*.bad', '*.expired', 'tmp*')   # 放到一边的条目，和 atomic_write 没写完留下的临时文件
 NO_TEXT_LINE = '（没有说明文字）'                          # 正文一行都没有时放的那一行
 TEST_IMAGE_SIZE = (320, 80)                            # 测试图的宽、高
 TEST_IMAGE_TEXT = 'OAS TEST'                           # cv2 的字体没有中文字形，测试图上只写英文
@@ -517,6 +528,8 @@ _screenshot_provider: Callable[[], Any | None] | None = None   # 本进程登记
 _instance_name: str | None = None                      # 本进程的实例名（原样，不是大写），找编排进度文件用
 _flush_quiet: set[str] = set()                         # flush 已记过的失败类别：下一次发送成功之前不再记
 _flush_missing_logged = False                          # flush 是否已记过凭证缺失：每个进程最多记一次
+_sent_stems: set[str] = set()                          # 本进程发出了、文件却没删掉的条目（文件名去掉 .json）：不再发
+_pruned_on: date | None = None                         # 本进程上一次清理发件箱的日期：每天最多清一次
 
 
 def _now() -> datetime:
@@ -754,11 +767,13 @@ def _sent_ok() -> None:
 
 
 def _done(outbox: Outbox, path: Path) -> None:
+    """删掉已发出的条目。删不掉时记一行警告，并在本进程里记住它（_sent_stems）：之后的补发跳过它，只再试着删掉。"""
     try:
         outbox.done(path)
     except OSError as exc:
-        logger.warning(f'飞书发件箱：{path.name} 已发出，但删不掉（{exc!r}）；主进程会再发一次，'
-                       f'同一 uuid 飞书 1 小时内只发出一条')
+        _sent_stems.add(path.stem)
+        logger.warning(f'飞书发件箱：{path.name} 已发出，但删不掉（{exc!r}）；本进程不会再发它，'
+                       f'别的进程补发时带同一 uuid，飞书 1 小时内只发出一条')
 
 
 def _fail(outbox: Outbox, path: Path) -> None:
@@ -1012,6 +1027,11 @@ def flush_outbox(*, root: Path | None = None, session=requests) -> int:
       记一条错误，接着发下一条；字段不全的条目改名为 .bad；
       网络错误、暂时性错误、凭证错误和意外异常留着这一条和后面的，这一轮到此为止。
       同一类失败在下一次发送成功之前只记一次，免得每 60 秒记一遍。
+    - 写下超过 EXPIRE_AFTER（24 小时）的条目不再发，改名为 .expired，这一轮记一行条数：一条总发不出去的旧消息不会一直
+      挡着后面的，断了很久之后也不会一下子补发一大批旧消息。读不出 created_at 的条目照常发。
+    - 本进程发出了、文件却删不掉的条目（见 _done）不再发，每轮只再试着删一次。
+    - 每天第一次有事可做的那一轮（进程启动后的第一轮也是），删掉发件箱里放了超过 14 天的 .failed、.bad、.expired 和
+      tmp 开头的临时文件（见 _prune）。没事可做的那一轮照旧什么都不做。
     """
     try:
         return _flush(Path(root) if root is not None else Path.cwd(), session)
@@ -1030,6 +1050,7 @@ def _flush(root: Path, session) -> int:
             _flush_missing_logged = True
             logger.error(f'{_MISSING_CREDENTIALS}，发件箱里的消息先留着，补上凭证后再发')
         return 0
+    _prune(outbox)
     try:
         _queue_summaries(outbox, Aggregator(state, DEFAULT_AGGREGATE_MINUTES))
     except Exception as exc:                           # 汇总出错不能拦着发件箱里的消息
@@ -1038,8 +1059,11 @@ def _flush(root: Path, session) -> int:
     pending = outbox.pending()
     if not pending:
         return 0
-    client, sent = _client(session), 0
+    client, sent, expired = _client(session), 0, 0
     for path in pending:
+        if path.stem in _sent_stems:                   # 已经发出、只是没删掉：不再发，再试着删一次
+            _retry_done(outbox, path)
+            continue
         entry = outbox.load(path)
         if entry is None:
             continue
@@ -1047,8 +1071,12 @@ def _flush(root: Path, session) -> int:
         if fields is None:
             outbox._quarantine(path, '字段不全或类型不对')
             continue
+        created = _created_at(entry)
+        if created is not None and _now() - created > EXPIRE_AFTER:
+            expired += _expire(outbox, path)
+            continue
         try:
-            _deliver(client, path, *fields, _created_at(entry))
+            _deliver(client, path, *fields, created)
         except FeishuError as exc:
             if exc.kind == 'rejected':
                 _fail(outbox, path)
@@ -1065,7 +1093,50 @@ def _flush(root: Path, session) -> int:
         sent += 1
         _sent_ok()
         _done(outbox, path)
+    if expired:
+        logger.warning(f'飞书发件箱：{expired} 条消息写下超过 24 小时还没发出去，已改名为 .expired，不再补发')
     return sent
+
+
+def _expire(outbox: Outbox, path: Path) -> int:
+    """把太久没发出去的条目改名为 .expired，改成了返回 1。改名失败记一次（到下一次发送成功为止），这一轮不发它，返回 0。"""
+    try:
+        outbox.expire(path)
+    except OSError as exc:
+        _flush_log_once('expire', f'飞书发件箱：{path.name} 超过 24 小时没发出去，改名为 .expired 失败（{exc!r}），'
+                                  f'先不发它，下一轮再改名', error=False)
+        return 0
+    return 1
+
+
+def _retry_done(outbox: Outbox, path: Path) -> None:
+    """再试着删掉一个已发出、上次没删掉的条目：删掉了就忘掉它，还删不掉就留到下一轮，不再记日志。"""
+    try:
+        outbox.done(path)
+    except OSError:
+        return
+    _sent_stems.discard(path.stem)
+
+
+def _prune(outbox: Outbox) -> None:
+    """每天最多一次：删掉发件箱里修改时间在 14 天以前的 .failed、.bad、.expired 和 tmp 开头的临时文件（atomic_write 没写完
+    留下的）。本进程今天已经清过就什么都不做，这个判断只比一下日期。删不掉的跳过，明天再删；删掉了文件时记一行 INFO。"""
+    global _pruned_on
+    today = _now().date()
+    if _pruned_on == today:
+        return
+    _pruned_on = today
+    cutoff, removed = time.time() - PRUNE_AFTER_SECONDS, 0
+    for pattern in PRUNE_PATTERNS:
+        for path in outbox.dir.glob(pattern):
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    if removed:
+        logger.info(f'飞书发件箱：删掉了 {removed} 个放了超过 14 天的文件（.failed、.bad、.expired 和没写完的临时文件）')
 
 
 def _queue_summaries(outbox: Outbox, aggregator: Aggregator) -> None:

@@ -10,6 +10,7 @@ import copy
 import io
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -131,7 +132,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(logger, 'handlers', [])
     monkeypatch.setattr(logger, 'log_file', str(tmp_path / 'log' / 'instance.txt'), raising=False)
     for name, value in (('_screenshot_provider', None), ('_instance_name', None), ('_flush_quiet', set()),
-                        ('_flush_missing_logged', False)):
+                        ('_flush_missing_logged', False), ('_sent_stems', set()), ('_pruned_on', None)):
         monkeypatch.setattr(feishu_app, name, value)
 
 
@@ -918,18 +919,97 @@ def test_flush_quarantines_an_entry_with_missing_fields(tmp_path, caplog):
     assert len(session.to(MESSAGES)) == 2
 
 
+def locked(self, path):
+    raise PermissionError('locked')
+
+
 def test_flush_counts_a_send_whose_entry_cannot_be_deleted(tmp_path, monkeypatch, caplog):
     make_notifier(down_session()).push('t', 'c')
-
-    def locked(self, path):
-        raise PermissionError('locked')
-
+    real_done = feishu_app.Outbox.done
     monkeypatch.setattr(feishu_app.Outbox, 'done', locked)
     session = ok_session()
     assert flush_outbox(root=tmp_path, session=session) == 1
     assert len(session.to(MESSAGES)) == 1                           # 这一轮不重发
-    assert len(entries(tmp_path)) == 1                              # 下一轮再发，同一 uuid 飞书 1 小时内只发一条
-    assert [line for line in logged(caplog, logging.WARNING) if 'locked' in line]
+    assert len(entries(tmp_path)) == 1                              # 文件删不掉，还在
+    for _ in range(2):
+        assert flush_outbox(root=tmp_path, session=session) == 0    # 本进程记住了它：之后几轮也不再发
+    assert len(session.to(MESSAGES)) == 1
+    assert len([line for line in logged(caplog, logging.WARNING) if 'locked' in line]) == 1   # 只记一次
+    monkeypatch.setattr(feishu_app.Outbox, 'done', real_done)
+    assert flush_outbox(root=tmp_path, session=session) == 0        # 又能删了：删掉，仍不重发
+    assert entries(tmp_path) == []
+    assert len(session.to(MESSAGES)) == 1
+
+
+def test_a_pushed_entry_that_cannot_be_deleted_is_not_resent_by_the_same_process(tmp_path, monkeypatch):
+    monkeypatch.setattr(feishu_app.Outbox, 'done', locked)
+    session = ok_session()
+    assert make_notifier(session).push('t', 'c') is True            # 主进程的测试推送：发出了，文件删不掉
+    assert flush_outbox(root=tmp_path, session=session) == 0
+    assert len(session.to(MESSAGES)) == 1
+
+
+def test_flush_sets_aside_entries_older_than_24_hours(tmp_path, clock, caplog):
+    put_entry(tmp_path, lines=['old 1'])                            # 10:00 写下
+    put_entry(tmp_path, lines=['old 2'])
+    put_entry(tmp_path, created_at=(T0 + timedelta(hours=1)).isoformat(timespec='seconds'), lines=['fresh'])
+    clock.now = T0 + timedelta(hours=2)
+    stuck = ok_session().on(MESSAGES, FakeResponse(503, {'code': 1, 'msg': 'busy'}))
+    assert flush_outbox(root=tmp_path, session=stuck) == 0          # 最早那条一直发不出去，后面的都排在它后面
+    assert len(entries(tmp_path)) == 3
+    clock.now = T0 + timedelta(hours=24, seconds=1)
+    session = ok_session()
+    assert flush_outbox(root=tmp_path, session=session) == 1        # 超过 24 小时的放到一边，不再挡着后面的
+    assert texts(message(session))[0] == 'fresh'
+    expired = sorted((tmp_path / 'log' / 'feishu_outbox').glob('*.json.expired'))
+    assert [json.loads(p.read_text(encoding='utf-8'))['lines'] for p in expired] == [['old 1'], ['old 2']]
+    assert entries(tmp_path) == []
+    line, = [m for m in logged(caplog, logging.WARNING) if '.expired' in m]   # 一轮一行，写明条数
+    assert '2 条' in line
+
+
+def old_file(path: Path, days: float) -> Path:
+    """写一个修改时间在 days 天前的文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{}', encoding='utf-8')
+    stamp = time.time() - days * 86400
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def set_aside_files(folder: Path, days: float, tag: str) -> list[Path]:
+    """发件箱里放到一边的四种文件（.failed、.bad、.expired、tmp 开头的临时文件），修改时间都在 days 天前。"""
+    names = [f'1795000000000-1-{tag}.json.failed', f'1795000000000-2-{tag}.json.bad',
+             f'1795000000000-3-{tag}.json.expired', f'tmp{tag}x9q']
+    return [old_file(folder / name, days) for name in names]
+
+
+def test_flush_prunes_set_aside_files_older_than_14_days_once_a_day(tmp_path, clock, caplog):
+    folder = tmp_path / 'log' / 'feishu_outbox'
+    old, recent = set_aside_files(folder, 15, 'old'), set_aside_files(folder, 13, 'new')
+    other = old_file(folder / 'notes.txt', 30)
+    put_entry(tmp_path, lines=['c'])
+    assert flush_outbox(root=tmp_path, session=ok_session()) == 1
+    assert not [p for p in old if p.exists()]
+    assert all(p.exists() for p in recent) and other.exists()      # 不到 14 天的、别的文件都不动
+    line, = [m for m in logged(caplog, logging.INFO) if '14 天' in m]
+    assert '4 个' in line
+    later = set_aside_files(folder, 15, 'later')                    # 同一天再补发：不再清
+    put_entry(tmp_path, lines=['c'])
+    assert flush_outbox(root=tmp_path, session=ok_session()) == 1
+    assert all(p.exists() for p in later)
+    clock.now = T0 + timedelta(days=1)                              # 第二天第一次补发时再清一次
+    put_entry(tmp_path, created_at=clock.now.isoformat(timespec='seconds'), lines=['c'])
+    assert flush_outbox(root=tmp_path, session=ok_session()) == 1
+    assert not [p for p in later if p.exists()]
+
+
+def test_an_idle_flush_prunes_nothing(tmp_path, clock):
+    old = set_aside_files(tmp_path / 'log' / 'feishu_outbox', 15, 'old')
+    session = FakeSession()
+    assert flush_outbox(root=tmp_path, session=session) == 0        # 没有要发的、也没有合并状态：和以前一样什么都不做
+    assert session.calls == []
+    assert all(p.exists() for p in old)
 
 
 # ---- 实例启动：登记与自检 --------------------------------------------------------------------------------------
