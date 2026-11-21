@@ -1,12 +1,15 @@
 """本分支的后台任务线程：可选的每日定时合并上游，以及别的里程碑注册进来的周期任务。
 
 app.py 的 on_startup 经 custom_routes 调 start_custom_jobs()，起一个名为 custom-jobs 的守护线程。线程每 TICK_SECONDS
-秒醒来一次：先看每日定时合并该不该跑，再按间隔依次跑已注册的任务（register_job，M4 用它注册飞书补发）。
+秒醒来一次：先看每日定时合并该不该跑，再按间隔依次跑已注册的任务（register_job）。start_custom_jobs 起线程之前登记
+飞书补发（feishu_flush，每 60 秒调一次 feishu_app.flush_outbox）。
 
 每日定时合并：.env 的 OAS_UPSTREAM_MERGE_TIME（HH:MM；缺省或留空就是关闭，不合法的值也按关闭处理，并给每个取值记一次日志），
 每次检查都重新读，改了不用重启。当天已过这个时刻、当天的合并还没用掉，就让服务的事件循环跑 fork_updater.run_update_result：
 与更新页的按钮同一条路径（同一把锁，代码变了同样重启实例，同样的文案），线程在这里等它做完，把文案记进日志（只在这里记一次）。
 时刻错过了（电脑休眠，或服务当时没开）不要紧：之后第一次检查发现"过了时刻、今天的还没用掉"就补跑，线程一启动就先查一次。
+结果是代码冲突中止（conflict_aborted）或推送失败（push_failed）时，再把这条文案发一条飞书通知（feishu_app.notify_server_event，
+发给各实例配置里开着飞书推送的接收方）；更新页的按钮不发。
 
 一天只合并一次：每次试之前先把今天记成用掉了，不论结果好坏。唯一的例外是拉取失败（fetch_failed，比如电脑刚醒、网络还没通）：
 拿到这个结果后把今天退回去，RETRY_DELAY 之后再试，一天最多试 MAX_ATTEMPTS 次，最后一次也失败就用掉今天。出错、等不到结果、
@@ -47,6 +50,8 @@ MERGE_TIME_KEY = 'OAS_UPSTREAM_MERGE_TIME'
 STATE_KEY = 'upstream_merge_last_run'
 ATTEMPTS_KEY = 'upstream_merge_attempts'
 LAST_ATTEMPT_KEY = 'upstream_merge_last_attempt'
+FEISHU_MERGE_TITLE = 'OAS 合并上游'                  # 每日定时合并失败时飞书通知的标题
+FEISHU_MERGE_STATUSES = frozenset({'conflict_aborted', 'push_failed'})   # 每日定时合并的这两种结果发飞书通知
 _HHMM = re.compile(r'([01][0-9]|2[0-3]):([0-5][0-9])')
 
 
@@ -255,6 +260,9 @@ class CustomJobs:
             return
         if result is None or result.status != 'fetch_failed':
             logger.info(f'每日定时合并上游：{message}')
+            if result is not None and result.status in FEISHU_MERGE_STATUSES:
+                from module.notify import feishu_app           # 用到时才导入，同 start_custom_jobs
+                feishu_app.notify_server_event(FEISHU_MERGE_TITLE, message)     # 不抛异常
         elif attempt < MAX_ATTEMPTS:
             self._remember(MergeState(state.last_run, attempt, now))      # 拉取失败不占用今天
             minutes = int(RETRY_DELAY.total_seconds() // 60)
@@ -286,5 +294,11 @@ def register_job(name: str, interval_seconds: float, fn: Callable[[], None]) -> 
 
 
 def start_custom_jobs(loop: asyncio.AbstractEventLoop | None = None) -> None:
-    """启动后台任务线程（每 60 秒检查一次每日定时合并并跑已登记的任务）；线程活着时再调是空操作。见 CustomJobs.start。"""
+    """启动后台任务线程（每 60 秒检查一次每日定时合并并跑已登记的任务）；线程活着时再调是空操作。见 CustomJobs.start。
+
+    起线程之前先登记飞书补发（每 60 秒一次 flush_outbox）。在这里登记、在这里才导入飞书模块，导入本模块就没有副作用；
+    同名再登记只是换掉原来的，再调一次也无妨。
+    """
+    from module.notify.feishu_app import flush_outbox
+    register_job('feishu_flush', 60, flush_outbox)
     _default.start(loop)

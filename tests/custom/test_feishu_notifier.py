@@ -211,6 +211,7 @@ def snapshot(folder: Path) -> dict[str, bytes]:
 # ---- 计划里的七个用例 ----------------------------------------------------------------------------------------
 
 def test_message_persisted_before_send_attempt(tmp_path):
+    start_instance()
     session = down_session()
     seen = []
     session.on_request = lambda path: seen.append(len(entries(tmp_path)))
@@ -677,6 +678,7 @@ def test_flush_missing_credentials_logs_once_and_touches_nothing(tmp_path, monke
 
 
 def test_flush_stops_at_a_network_error_and_keeps_the_rest(tmp_path, caplog):
+    start_instance()
     for content in ('c1', 'c2', 'c3'):
         make_notifier(down_session()).push('t', content)
     session = FakeSession().on(TOKEN, token_reply()).on(MESSAGES, SENT, requests.ConnectionError('offline'))

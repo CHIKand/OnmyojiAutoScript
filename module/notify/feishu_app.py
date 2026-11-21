@@ -1,8 +1,9 @@
 """飞书自建应用推送：HTTP 客户端（FeishuClient）、发件箱（Outbox）、同类错误合并器（Aggregator），以及接在现有
-推送配置上的通知器（FeishuAppNotifier）、主进程补发（flush_outbox）和实例启动时的登记与自检（on_script_loop_start）。
+推送配置上的通知器（FeishuAppNotifier）、主进程补发（flush_outbox）、主进程的事件通知（notify_server_event）和实例启动时的
+登记与自检（on_script_loop_start）。
 
 导入本模块不联网，也不建文件和目录（module.logger 自己导入时会打开日志文件，与其他模块相同）。
-只用已有依赖：requests、PyYAML、Pillow。
+只用已有依赖：requests、PyYAML、Pillow；测试图用 OpenCV（cv2），用到时才导入。
 
 飞书开放平台接口，2026-11-21 按 open.feishu.cn 官方文档核对，错误响应用假凭证实测过：
 - 取 token：POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal，JSON {app_id, app_secret}，
@@ -44,7 +45,9 @@
 - 实例进程（on_script_loop_start 登记过截图来源的进程）合并同类错误：同一实例、标题和内容相同的报错在 aggregate_minutes
   分钟内只发第一条，窗口结束后由 flush_outbox 补发一条汇总，发给窗口里第一条的接收方。主进程的测试推送不合并。
 - 一条消息：标题，然后每行一段：错误摘要、正在跑的编排行、日志最后 30 行（脱敏），最后是截图。富文本请求体不超过
-  30 KB，超了从最早的日志行删起。
+  30 KB，超了从最早的日志行删起。主进程的测试推送（/home/notify_test）没有截图，附一张生成的测试图。
+- 主进程自己的事件（每日定时合并上游代码冲突中止、推送失败）没有对应的推送配置：notify_server_event 发给各实例配置里
+  开着飞书推送的接收方，一行文字，不附图，不合并。
 """
 import base64
 import io
@@ -497,6 +500,8 @@ POST_CONTENT_LIMIT = 28_000                            # content 在请求体里
 IMAGE_KEY_ALLOWANCE = 'img_v2_' + 'x' * 93             # 算长度时图片段的 image_key 按 100 个字符预留（实际约 45 个）
 ERROR_SHOT_MAX_AGE_MS = 60_000                         # log/error/<毫秒时间戳>/ 在这么久以内建的，才算这次报错存的截图
 NO_TEXT_LINE = '（没有说明文字）'                          # 正文一行都没有时放的那一行
+TEST_IMAGE_SIZE = (320, 80)                            # 测试图的宽、高
+TEST_IMAGE_TEXT = 'OAS TEST'                           # cv2 的字体没有中文字形，测试图上只写英文
 
 _MISSING_CREDENTIALS = '飞书凭证缺失：.env 里没有 FEISHU_APP_ID 或 FEISHU_APP_SECRET'
 
@@ -794,16 +799,38 @@ def _content_cost(title: str, lines: list[str]) -> int:
 
 
 def _pick_image(root: Path) -> bytes | None:
-    """这条消息附的截图（PNG）。没登记截图来源的进程（主进程）不附图。
+    """这条消息附的图（PNG）。没登记截图来源的进程（主进程，推送只有 /home/notify_test 这类测试）附一张测试图。
 
-    先找 60 秒内 save_error_log 存的出错截图（已脱敏，原样发）；没有就取设备最新的一帧，经 handle_sensitive_image
+    实例进程先找 60 秒内 save_error_log 存的出错截图（已脱敏，原样发）；没有就取设备最新的一帧，经 handle_sensitive_image
     脱敏后编码成 PNG。截图来源抛异常或返回 None 时不附图，文字照发。
     """
     provider = _screenshot_provider
     if provider is None:
-        return None
+        return _test_png()
     png = _recent_error_png(root)
     return png if png is not None else _frame_png(provider)
+
+
+def _test_png() -> bytes | None:
+    """测试图：TEST_IMAGE_SIZE 大小的浅灰底，正中写 TEST_IMAGE_TEXT，用 cv2 画、cv2.imencode 编码成 PNG。
+    每次生成的字节都一样，不到 2 KB；它只用来验证上传图片的权限（im:resource）。生成失败记一条警告，不附图，文字照发。
+    cv2 用到时才导入：只有主进程的测试推送用它。"""
+    try:
+        import cv2
+        import numpy as np
+        width, height = TEST_IMAGE_SIZE
+        font, scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3
+        (text_width, text_height), _ = cv2.getTextSize(TEST_IMAGE_TEXT, font, scale, thickness)
+        image = np.full((height, width, 3), 240, np.uint8)
+        cv2.putText(image, TEST_IMAGE_TEXT, ((width - text_width) // 2, (height + text_height) // 2), font, scale,
+                    (0, 0, 0), thickness, cv2.LINE_8)
+        ok, encoded = cv2.imencode('.png', image)
+        if not ok:
+            raise ValueError('cv2.imencode 没能编码')
+        return encoded.tobytes()
+    except Exception as exc:
+        logger.warning(f'飞书推送：生成测试图失败（{type(exc).__name__}: {exc}），这条只发文字')
+        return None
 
 
 def _recent_error_png(root: Path) -> bytes | None:
@@ -984,3 +1011,69 @@ def _flush_log_once(kind: str, message: str, *, error: bool) -> None:
         logger.error(message)
     else:
         logger.warning(message)
+
+
+def notify_server_event(title: str, text: str, *, root: Path | None = None, session=requests) -> None:
+    """主进程自己的事件（每日定时合并上游代码冲突中止、推送失败）发飞书通知。不抛异常。
+    root（缺省当前目录）和 session（缺省 requests）只给测试用。
+
+    主进程没有自己的推送配置，接收方取自 config/ 下的各实例配置（只看这一层，不含 template.json）：开着推送
+    （script.error.notify_enable）、推送配置写 provider: feishu_app 的，取 (receive_id_type, receive_id)，去掉重复的。
+    - 一个接收方都没有：不发，记一行 INFO。凭证缺失：记一条错误，什么都不写。
+    - 每个接收方写一条发件箱条目：标题 title，正文是 text（一行），不附图，不合并。写完立即补发一轮（flush_outbox，与补发
+      同一条路径，发件箱里早先的条目先发），没发出去的留给下一轮补发。
+    """
+    try:
+        _notify_server_event(Path(root) if root is not None else Path.cwd(), title, text, session)
+    except Exception as exc:
+        logger.error(f'飞书通知出错：{_unexpected(exc)}')
+
+
+def _notify_server_event(root: Path, title: str, text: str, session) -> None:
+    targets = _event_targets(root)
+    if not targets:
+        logger.info(f'没有实例开着飞书推送，不发飞书通知：{title}')
+        return
+    if not _credentials_present():
+        logger.error(f'{_MISSING_CREDENTIALS}，飞书通知没有发出：{title}')
+        return
+    lines = [line for line in str(text).splitlines() if line.strip()] or [NO_TEXT_LINE]
+    outbox, written = Outbox(root / OUTBOX_DIR), 0
+    for target in targets:
+        try:
+            outbox.put(_entry(target, title, lines, None))
+            written += 1
+        except OSError as exc:
+            logger.error(f'飞书通知写不进发件箱（{exc!r}），发给 {target[1]} 的没发：{title}')
+    if written:
+        logger.info(f'飞书通知已写进发件箱，发给 {written} 个接收方：{title}')
+        flush_outbox(root=root, session=session)
+
+
+def _event_targets(root: Path) -> list[tuple[str, str]]:
+    """config/ 下各实例配置里开着飞书推送的接收方，按配置文件名的顺序，去掉重复的。
+
+    配置用上游的 read_file 读：它与实例写配置时加同一把文件锁，读的时候不会撞上实例正在替换文件。读不了的配置、
+    接收方写得不对的推送配置各记一条警告，跳过。
+    """
+    from module.config.utils import read_file
+    targets: list[tuple[str, str]] = []
+    for path in sorted((root / 'config').glob('*.json')):
+        if path.name == 'template.json' or not path.is_file():
+            continue
+        try:
+            error = read_file(str(path))['script']['error']
+            enabled, notify_config = error.get('notify_enable'), error.get('notify_config')
+        except Exception as exc:
+            logger.warning(f'飞书通知：读不了实例配置 {path.name}（{type(exc).__name__}: {exc}），跳过')
+            continue
+        cfg = _load_notify_config(notify_config) if enabled is True else None
+        if cfg is None or cfg.get('provider') != 'feishu_app':
+            continue
+        target = _parse_target(cfg)
+        if target is None:
+            logger.warning(f'飞书通知：实例 {path.stem} 的{_target_error(cfg)}，跳过')
+            continue
+        if target not in targets:
+            targets.append(target)
+    return targets

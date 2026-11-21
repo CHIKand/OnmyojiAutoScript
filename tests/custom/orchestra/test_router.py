@@ -461,6 +461,7 @@ def test_register_custom_mounts_the_routes():
         ('/custom/assets/{task}/replace-image', 'POST'),
         ('/custom/assets/{task}/commit-push', 'POST'),
         ('/custom/assets/{task}/export', 'GET'),
+        ('/custom/feishu/chats', 'GET'),
     }
     assert [route.path for route in app.routes if isinstance(route, Mount)] == ['/custom/assets/static']
 
