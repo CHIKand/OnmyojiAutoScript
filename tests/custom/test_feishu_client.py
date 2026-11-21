@@ -496,7 +496,9 @@ def test_a_traceback_logged_with_locals_shows_neither_the_secret_nor_a_token(sce
     with pytest.raises(FeishuError) as info:
         CALLS[call](client)
     text = rendered(info.value)
-    assert 'locals' in text                                         # 确实带着局部变量渲染了
+    # 确实带着局部变量渲染了：局部变量 client、self 的 repr 在里面。要找的字样运行时拼出来：本行源码就在渲染出的上下文里，
+    # 写成字面量的话，不渲染局部变量也找得到
+    assert f'{type(client).__name__} object at' in text
     assert SECRET not in text
     assert TOKEN_VALUE not in text
     assert NEW_TOKEN_VALUE not in text
