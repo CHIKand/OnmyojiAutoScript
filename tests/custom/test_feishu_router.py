@@ -288,6 +288,18 @@ def test_test_push_attaches_image(tmp_path):
     assert entries(tmp_path) == []
 
 
+def test_the_test_push_carries_no_server_log_tail(tmp_path):
+    # 主进程的日志是服务的日志，与测试推送无关：主进程没登记实例名，消息里就不带日志尾
+    log_file = Path(logger.log_file)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text('server line 1\nserver line 2\n', encoding='utf-8')
+    notifier = Notifier(FEISHU_YAML, True)
+    session = ok_session()
+    notifier.delegate.session = session
+    assert notifier.push(title='测试', content='OAS 推送测试') is True
+    assert texts(message(session)) == ['OAS 推送测试']
+
+
 def test_the_notify_test_endpoint_still_pushes_through_notifier():
     # 上面的用例照这个写法走 /home/notify_test 的路径；home_router.py 不改（R14）
     tree = ast.parse((REPO_ROOT / 'module' / 'server' / 'home_router.py').read_text(encoding='utf-8'))

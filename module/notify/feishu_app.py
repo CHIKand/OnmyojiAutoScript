@@ -48,7 +48,7 @@
   分钟内只发第一条，窗口结束后由 flush_outbox 补发一条汇总，发给窗口里第一条的接收方。主进程的测试推送不合并。
 - 一条消息：标题，然后每行一段：错误摘要、正在跑的编排行、日志最后 30 行（脱敏），最后是截图。富文本请求体不超过
   30 KB：标题和固定的行各截到 1,000 个字符，日志每行截到 300 个字符；超了从最早的日志行删起，还超就截短最长的固定行。
-  主进程的测试推送（/home/notify_test）没有截图，附一张生成的测试图。
+  主进程的测试推送（/home/notify_test）没有截图，附一张生成的测试图，也不带日志尾（主进程的日志是服务的日志）。
 - 主进程自己的事件（每日定时合并上游需要人处理的结果）没有对应的推送配置：notify_server_event 发给各实例配置里
   开着飞书推送的接收方，只有文字（每行最多 300 个字符），不附图，不合并。
 """
@@ -785,12 +785,13 @@ def _fail(outbox: Outbox, path: Path) -> None:
 
 def _compose_lines(title: str, content: str, root: Path) -> list[str]:
     """正文的各行，每行一段：错误摘要（有多行就逐行）、正在跑的编排行、日志尾部（前面加一行小标题）。空行不要。
-    一行都没有时（没给内容，也没有编排行和日志）放一行 NO_TEXT_LINE：飞书对空的 content 怎么处理没核实过。"""
+    一行都没有时（没给内容，也没有编排行和日志）放一行 NO_TEXT_LINE：飞书对空的 content 怎么处理没核实过。
+    日志尾部只在登记过实例名的进程（实例进程）里有：主进程的 logger.log_file 是服务的日志，与它的推送（测试推送）无关。"""
     fixed = [line for line in str(content).splitlines() if line.strip()]
     row = _orchestra_row_line(root)
     if row:
         fixed.append(row)
-    return _fit(title, fixed, _log_tail()) or [NO_TEXT_LINE]
+    return _fit(title, fixed, _log_tail() if _instance_name else []) or [NO_TEXT_LINE]
 
 
 def _orchestra_row_line(root: Path) -> str | None:

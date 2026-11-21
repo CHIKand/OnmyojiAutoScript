@@ -353,6 +353,7 @@ def test_a_push_with_neither_content_nor_message(tmp_path, kwargs, title):
 
 def test_no_placeholder_when_the_log_tail_has_lines(tmp_path):
     write_log(['line 1'])
+    start_instance()                                                # 日志尾只在实例进程里有
     session = ok_session()
     assert delegating_notifier(session).push(title='超鬼王') is True
     assert texts(message(session)) == ['日志最后 1 行：', 'line 1']
@@ -642,9 +643,17 @@ def test_log_tail_is_the_last_30_lines_masked(tmp_path, monkeypatch):
     write_log(filler + [f'line {i:02d} private' for i in range(1, 41)])
     monkeypatch.setattr('module.handler.sensitive_info.handle_sensitive_logs',
                         lambda lines: [line.replace('private', '***') for line in lines])
+    start_instance()                                                # 日志尾只在实例进程里有
     session = ok_session()
     make_notifier(session).push('t', 'c')
     assert texts(message(session)) == ['c', '日志最后 30 行：'] + [f'line {i:02d} ***' for i in range(11, 41)]
+
+
+def test_a_server_process_push_has_no_log_tail(tmp_path):
+    write_log(['server line'])                                     # 主进程没登记实例名：logger.log_file 是服务的日志
+    session = ok_session()
+    assert make_notifier(session).push('t', 'c') is True
+    assert texts(message(session)) == ['c']
 
 
 def test_post_body_stays_under_size_cap(tmp_path):
