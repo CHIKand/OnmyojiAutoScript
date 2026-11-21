@@ -586,8 +586,8 @@ class FeishuAppNotifier:
 
         1. 没开就返回 False。接收方配置不对、凭证缺失：记一条错误，返回 False，不写发件箱。
         2. 登记过截图来源的进程先过合并：窗口内的同类错误只计数，记一行 INFO，返回 True。
-        3. 拼消息、选截图，写进发件箱，再发送：成功删掉条目；飞书拒收改名为 .failed；网络错误、暂时性错误、凭证错误
-           和意外异常留着条目，由主进程补发。写不进发件箱就不发，返回 False。
+        3. 拼消息、选截图，写进发件箱，再发送：成功删掉条目；飞书拒收这条消息改名为 .failed（只拒收截图时文字照发，
+           见 _deliver）；网络错误、暂时性错误、凭证错误和意外异常留着条目，由主进程补发。写不进发件箱就不发，返回 False。
         """
         try:
             return self._push(title, content)
@@ -669,9 +669,27 @@ def _entry_fields(entry: dict) -> tuple | None:
 
 def _deliver(client: FeishuClient, path: Path, target: tuple[str, str], title: str, lines: list[str],
              png: bytes | None) -> None:
-    """发一条发件箱条目：有图先上传，再发富文本。条目的 id（文件名去掉 .json）作 uuid，重发不会重复。"""
-    image_key = client.upload_image(png) if png else None
+    """发一条发件箱条目，push 的立即发送和 flush_outbox 的补发都走这里：有图先上传，再发富文本。
+    条目的 id（文件名去掉 .json）作 uuid，重发不会重复。
+
+    飞书拒收这张图（rejected，比如缺 im:resource 权限、图超过 10 MB）时，不附图，末尾加一行说明（带 code），文字照发，
+    拒收的 code 和 msg 记一行错误。传图的其他失败（网络错误、暂时性错误、凭证错误）照常抛出，条目原样留着。
+    """
+    image_key = None
+    if png:
+        try:
+            image_key = client.upload_image(png)
+        except FeishuError as exc:
+            if exc.kind != 'rejected':
+                raise
+            logger.error(f'飞书拒收了截图，这条只发文字：{exc}')
+            lines = [*lines, _image_rejected_line(exc.code)]
     client.send_post(target[0], target[1], title, lines, image_key, uuid=path.stem[:UUID_MAX_LENGTH])
+
+
+def _image_rejected_line(code: int | None) -> str:
+    """飞书拒收截图时，代替图片段的那一行。"""
+    return '截图没能附上：飞书拒收了这张图' + (f'（code={code}）' if code is not None else '')
 
 
 def _sent_ok() -> None:
@@ -763,9 +781,11 @@ def _fit(title: str, fixed: list[str], log_lines: list[str]) -> list[str]:
 def _content_cost(title: str, lines: list[str]) -> int:
     """content 在发消息的请求体里实际占的字节数。send_post 用 json.dumps(ensure_ascii=False) 把它转成字符串，requests
     再用 json= 序列化整个请求体（非 ASCII 字符转成 \\uXXXX，一个汉字占 6 个字节），所以按两层 json.dumps 算。
-    拼法与 send_post 相同；有没有图都按预留的 image_key 算上图片段。"""
+    拼法与 send_post 相同。末尾有没有图都预留两段：按预留 image_key 算的图片段，和截图被拒收时换上的那行说明
+    （按 10 位的 code 算），实际只会有其中一段，所以算出来的不会比真发的小。"""
     paragraphs = [[{'tag': 'text', 'text': line}] for line in lines]
     paragraphs.append([{'tag': 'img', 'image_key': IMAGE_KEY_ALLOWANCE}])
+    paragraphs.append([{'tag': 'text', 'text': _image_rejected_line(9_999_999_999)}])
     return len(json.dumps(json.dumps({'zh_cn': {'title': title, 'content': paragraphs}}, ensure_ascii=False)))
 
 
@@ -880,7 +900,8 @@ def flush_outbox(*, root: Path | None = None, session=requests) -> int:
     - 发件箱是空的、也没有合并状态文件：返回 0，不联网，也不读 .env。
     - 凭证缺失：每个进程只记一次错误，返回 0，发件箱和合并状态都不动。
     - 到期的汇总：发给窗口里第一条消息的接收方，标题相同，只有一行"{标题}：过去 {窗口} 分钟同类错误又出现 {n} 次"，不附图。
-    - 逐条发送：成功删掉条目；飞书拒收改名为 .failed，记一条错误，接着发下一条；字段不全的条目改名为 .bad；
+    - 逐条发送（与 push 同一条路径 _deliver，只拒收截图时文字照发）：成功删掉条目；飞书拒收这条消息改名为 .failed，
+      记一条错误，接着发下一条；字段不全的条目改名为 .bad；
       网络错误、暂时性错误、凭证错误和意外异常留着这一条和后面的，这一轮到此为止。
       同一类失败在下一次发送成功之前只记一次，免得每 60 秒记一遍。
     """

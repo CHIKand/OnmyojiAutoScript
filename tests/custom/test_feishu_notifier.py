@@ -570,6 +570,49 @@ def test_stale_error_screenshot_falls_back_to_the_masked_frame(tmp_path, monkeyp
     assert decoded.shape == FRAME.shape and (decoded == FRAME).all()   # 按 RGB 原样编码成 PNG
 
 
+# ---- 传图失败 ------------------------------------------------------------------------------------------------
+
+UPLOAD_REJECTED = FakeResponse(400, {'code': 99991672,
+                                     'msg': 'Access denied. One of the following scopes is required: [im:resource]'})
+
+
+def send_with_screenshot(how: str, root: Path, session: FakeSession):
+    """带截图发一条：how 为 push 时立即发；为 flush 时先断网写进发件箱，再由 flush_outbox 补发。两处走同一条发送路径。"""
+    start_instance(frame=FRAME)
+    if how == 'push':
+        return make_notifier(session).push('t', 'c')
+    make_notifier(down_session()).push('t', 'c')
+    return flush_outbox(root=root, session=session)
+
+
+@pytest.mark.parametrize('how, sent', [('push', True), ('flush', 1)])
+def test_a_rejected_screenshot_upload_still_sends_the_text(tmp_path, caplog, how, sent):
+    session = ok_session().on(IMAGES, UPLOAD_REJECTED)
+    assert send_with_screenshot(how, tmp_path, session) == sent
+    assert len(session.to(IMAGES)) == 1
+    assert len(session.to(MESSAGES)) == 1
+    post = message(session)
+    assert images(post) == []
+    assert texts(post) == ['c', '截图没能附上：飞书拒收了这张图（code=99991672）']
+    assert entries(tmp_path) == []                                  # 文字发出去了，条目删掉
+    assert not list((tmp_path / 'log' / 'feishu_outbox').glob('*.failed'))
+    rejected = [line for line in logged(caplog, logging.ERROR) if '99991672' in line]
+    assert len(rejected) == 1 and 'im:resource' in rejected[0]     # 拒收的 code 和 msg 记一行
+    assert not [r for r in caplog.records if r.exc_info]
+
+
+@pytest.mark.parametrize('reply', [FakeResponse(503, {'code': 1, 'msg': 'busy'}), requests.ConnectionError('offline')],
+                         ids=['transient', 'network'])
+@pytest.mark.parametrize('how, sent', [('push', False), ('flush', 0)])
+def test_a_screenshot_upload_that_may_work_later_keeps_the_entry(tmp_path, how, sent, reply):
+    session = ok_session().on(IMAGES, reply)
+    assert send_with_screenshot(how, tmp_path, session) == sent
+    assert len(session.to(IMAGES)) == 1
+    assert session.to(MESSAGES) == []
+    entry, = [json.loads(p.read_text(encoding='utf-8')) for p in entries(tmp_path)]
+    assert entry['png_base64'] and entry['lines'] == ['c']          # 条目原样留着，截图也在，下次连图一起发
+
+
 # ---- 补发 ----------------------------------------------------------------------------------------------------
 
 def test_flush_with_nothing_to_do_makes_no_request(tmp_path, monkeypatch, caplog):
