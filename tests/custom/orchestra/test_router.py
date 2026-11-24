@@ -2,8 +2,9 @@
 
 处理函数用 asyncio.run 直接调，不起 FastAPI 的 TestClient（它依赖的 httpx 没装）。
 每个用例都先 chdir 到 tmp_path，里面有 config/template.json 与 config/t.json，不碰仓库自己的 config/ 和 log/。
-上游的 MainManager 在导入时就会扫 config/、建进程对象、起推送线程，所以本文件不导入 module.server.main_manager，
-重启相关的用例把 instance_control._manager 换成假的。
+上游的 MainManager 在导入时就会扫 config/、建进程对象、起推送线程，所以本文件不导入 module.server.main_manager。
+编排命令会停、启实例，每个用例默认用一张假的进程表（fake_instances），建真的进程对象会直接报错；
+重启相关的用例再换上自己的假进程表。命令启停实例的流程见 test_router_commands.py。
 """
 import asyncio
 import logging
@@ -95,6 +96,16 @@ class SlowProcess(FakeProcess):
 def use_fake_manager(monkeypatch, **processes: FakeProcess) -> None:
     manager = SimpleNamespace(script_process=dict(processes))
     monkeypatch.setattr(instance_control, '_manager', lambda: manager)
+
+
+@pytest.fixture(autouse=True)
+def fake_instances(monkeypatch) -> None:
+    """默认的假进程表：实例 t 停着。命令接口会停、启实例，真的进程表会导入上游 MainManager、真的启动实例进程。"""
+    use_fake_manager(monkeypatch, t=FakeProcess(ScriptState.INACTIVE))
+
+    def no_real_process(name: str):
+        raise AssertionError(f'测试里不该建真的进程对象：{name}')
+    monkeypatch.setattr(instance_control, 'ScriptProcess', no_real_process)
 
 
 def resting(**kwargs) -> None:
@@ -313,7 +324,7 @@ def test_a_command_waits_for_a_put_that_is_writing(instance_dir, monkeypatch):
     put = threading.Thread(name='put', target=lambda: results.update(
         put=orchestra_router._write_settings('t', {'rows': [{'task': 'Orochi'}]})))
     command = threading.Thread(name='command', target=lambda: results.update(
-        command=orchestra_router._apply_command('t', 'start')))
+        command=asyncio.run(post_command('t', {'action': 'start'}))))
     put.start()
     try:
         assert reread.wait(5)
@@ -481,6 +492,7 @@ def test_blocking_io_runs_off_the_event_loop(instance_dir, monkeypatch):
     spy(config_model, 'read_file')
     spy(config_model, 'write_file')
     spy(orchestra_router, 'load_progress')
+    spy(orchestra_router, 'save_progress')
     spy(orchestra_router, 'instance_names')
     spy(instance_control, 'instance_names')
 
@@ -491,12 +503,12 @@ def test_blocking_io_runs_off_the_event_loop(instance_dir, monkeypatch):
         await put_orchestra('t', {'rows': []})
         await post_command('t', {'action': 'skip_rest'})   # 先读进度文件看是不是在休息
         await post_command('t', {'action': 'start'})
-        await post_restart('t')   # 进程表里没有 t：只走名字核对
+        await post_command('t', {'action': 'pause'})   # 读进度、改配置、写进度
+        await post_restart('t')   # 进程表里的 t 是替身：碰文件的只有名字核对
         return threading.get_ident()
 
-    use_fake_manager(monkeypatch)
     loop_thread = asyncio.run(scenario())
-    assert set(seen) == {'read_file', 'write_file', 'load_progress', 'instance_names'}
+    assert set(seen) == {'read_file', 'write_file', 'load_progress', 'save_progress', 'instance_names'}
     assert all(loop_thread not in threads for threads in seen.values())
 
 
