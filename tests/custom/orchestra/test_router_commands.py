@@ -17,10 +17,10 @@ import pytest
 
 from module.config import config_model
 from module.config.config_model import ConfigModel
-from module.orchestra.engine import sync_controls
+from module.orchestra.engine import recover, row_limits, sync_controls
 from module.orchestra.mapping import apply_row, serialize_value
 from module.orchestra.model import OrchestraRow
-from module.orchestra.progress import Progress, load_progress, progress_path, save_progress
+from module.orchestra.progress import Progress, load_progress, progress_path, progress_to_dict, save_progress
 from module.server import instance_control, orchestra_router
 from module.server.instance_control import restart_instance
 from module.server.orchestra_router import post_command
@@ -200,6 +200,28 @@ def test_pause_during_rest_keeps_remaining(journal, monkeypatch):
     later = datetime.now() + timedelta(hours=1)
     resumed = sync_controls(stored(), progress(), later)
     assert not resumed.paused and resumed.rest_until == later + timedelta(seconds=p.rest_remaining)
+
+
+def test_pause_before_first_heartbeat_freezes_row_elapsed(journal, monkeypatch):
+    table(monkeypatch, journal, t=Instance(journal))
+    mid_row()
+    # 本行刚开始 10 秒，第一次心跳还没来（on_row_start 清掉了 heartbeat_at）；这一行此前中断过，累计 90 秒
+    before = progress()
+    before.row_started_at = datetime.now().replace(microsecond=0) - timedelta(seconds=10)
+    before.heartbeat_at, before.row_elapsed_before = None, 90.0
+    save_progress(progress_path('t'), before)
+    assert send(journal, 'pause') == {'ok': True}
+    paused_at, paused = datetime.now(), progress()
+    later = paused_at + timedelta(hours=1)
+    # 暂停期间面板上本行的已用（全程也加上它）不再增长
+    frozen = progress_to_dict(paused, paused_at)['row_elapsed_seconds']
+    assert progress_to_dict(paused, later)['row_elapsed_seconds'] == frozen
+    # 继续后实例的 recover 截止到最近一次心跳，没有心跳截止到行开始：记下的已用与按暂停前的进度算的一样
+    # （即补心跳之前的结果），剩余也就不变；面板冻结的正是这个已用
+    recovered, baseline = recover(paused, later), recover(before, later)
+    assert recovered.row_elapsed_before == baseline.row_elapsed_before == frozen
+    row = OrchestraRow(task='Orochi', max_count=12, max_minutes=20)
+    assert row_limits(row, recovered, 'remaining') == row_limits(row, baseline, 'remaining')
 
 
 # ---------- 继续 ----------

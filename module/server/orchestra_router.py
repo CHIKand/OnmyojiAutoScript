@@ -122,7 +122,8 @@ def _skip_rest(name: str) -> bool:
 
 def _halt(name: str, state: str) -> bool:
     """暂停（state 为 paused）、停止（idle）在实例停下之后做的事：配置写入 state，并还原本行临时写入的参数；
-    进度按 sync_controls 同步（暂停时记下剩余休息，停止时阶段回到 idle），清掉 saved_params。
+    进度按 sync_controls 同步（暂停时记下剩余休息，停止时阶段回到 idle），清掉 saved_params；
+    暂停在本行第一次心跳之前的，心跳记为行开始时刻。
 
     先存配置、后存进度，同 OrchestraRuntime._restore_originals；个别字段还原不了只记错误，其余照常还原，
     同 OrchestraRuntime._restore。进度读不了（裁定 R2）或配置存不进去返回 False，配置与进度都不动，
@@ -141,6 +142,9 @@ def _halt(name: str, state: str) -> bool:
             live = cfg.orchestra
             live.state = state
             p = sync_controls(live, p, datetime.now())
+            if p.phase == 'row_running' and p.heartbeat_at is None:
+                # 本行还没有心跳：已用截止到行开始，同引擎的 recover；不补的话面板按当前时刻算，暂停多久就涨多久
+                p.heartbeat_at = p.row_started_at
             if p.saved_params:
                 try:
                     restore_params(cfg, p.saved_params)
