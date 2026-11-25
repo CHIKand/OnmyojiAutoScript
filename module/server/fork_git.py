@@ -2,30 +2,41 @@
 
 每个函数显式接收 GitRunner（git 可执行文件加仓库目录），不碰全局状态，所以能拿临时仓库测试。
 上层 ForkUpdater 负责读部署配置、渲染提示文案、接入真实的 assets.py 生成和导入自检；
-M3b 的素材页复用 commit_paths 和 push。只用标准库。
+M3b 的素材页复用 commit_paths 和 push。只用标准库（入口清单来自同样只用标准库的 upstream_hooks）。
 
 合并之前先拉取 fork（origin 的部署分支）：fork 上有运行目录还没有的提交（开发克隆部署了新代码、服务还没重启）就不合并，
 返回 fork_ahead，两边各有对方没有的提交返回 diverged，免得在旧基点上做出推不上去的本地合并。
-合并先做成"待提交"状态（merge --no-commit --no-ff）：在工作区里按顺序处理素材冲突、重新生成 assets.py、
-跑调用方传入的自检，全部通过才提交并推送。代码冲突、自检不过、处理途中的任何异常，都会 merge --abort，
-分支和工作区回到合并之前，不留合并到一半的仓库。唯一的例外是自检只因为上游新增的第三方依赖还没装而导入失败
-（needs_install）：照常提交推送，由用户重启服务时启动器装依赖。每次 git 调用都不等待输入（GIT_TERMINAL_PROMPT=0、
-GIT_EDITOR=true、GCM_INTERACTIVE=Never、stdin 接空设备），不弹控制台窗口（Windows 上加 CREATE_NO_WINDOW：
-服务由 pythonw 起，没有控制台），也从不加 --force。
+合并先做成"待提交"状态（merge --no-commit --no-ff）：在工作区里按顺序处理代码冲突（只落在入口文件里时自动处理，
+见文末）、素材冲突、重新生成 assets.py、跑调用方传入的自检，全部通过才提交并推送。处理不了的代码冲突、自检不过、
+处理途中的任何异常，都会 merge --abort，分支和工作区回到合并之前，不留合并到一半的仓库。唯一的例外是自检只因为
+上游新增的第三方依赖还没装而导入失败（needs_install）：照常提交推送，由用户重启服务时启动器装依赖。每次 git 调用都
+不等待输入（GIT_TERMINAL_PROMPT=0、GIT_EDITOR=true、GCM_INTERACTIVE=Never、stdin 接空设备），不弹控制台窗口
+（Windows 上加 CREATE_NO_WINDOW：服务由 pythonw 起，没有控制台），也从不加 --force。
 联网的命令（fetch、push、ls-remote）另有 NETWORK_TIMEOUT 秒的超时，超时就杀掉 git 并按该步骤失败处理，
 免得网络卡死时整个更新流程（以及等着它的服务接口和后台线程）一直挂着。
 上游没有新提交时，merge_upstream 还会把留在本地、没推到 fork 的提交补推上去（比如上次推送失败留下的合并提交），
 结果是 pushed。进程在合并途中被杀留下的合并状态，下次调用开头会清理，但只清理上游那一侧改动的文件：别的已跟踪文件
 被改过（暂存的或没暂存的），本次调用就停下来返回 dirty，一个文件都不动，合并状态原样留着；清理本身没成功也返回
 dirty，从不抛异常。
+入口文件是定制分支改过的那几个官方文件，由 upstream_hooks 的入口清单推出来。代码冲突只落在这些文件里时自动处理：
+先把它们合并前的版本备份到 log/merge_backup/<时间>（附说明.txt），核对"共同祖先接上清单 = 我们的版本"这个前提，
+再取官方版本、按清单重接入口；官方改过、被我们整段覆盖的函数体，官方的改动另存进备份。冲突里有入口文件以外的
+代码文件就照旧中止，不备份；备份写不成、前提不成立、定位行找不到，也整体中止，已写好的备份留着。
 """
+import itertools
 import os
 import re
+import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections import Counter
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path, PurePosixPath
+
+from module.server.upstream_hooks import (HOOKS, Hook, HookError, OverriddenBody, apply_hooks, hook_files,
+                                          overridden_bodies)
 
 UPSTREAM_REMOTE = 'upstream'
 FORK_REMOTE = 'origin'
@@ -35,6 +46,8 @@ NETWORK_COMMANDS = frozenset({'fetch', 'push', 'ls-remote'})
 _REAP_TIMEOUT = 10          # 秒，杀掉进程后等它收尾的上限
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0   # 子进程的 creationflags：不弹控制台窗口
 _MISSING_MODULE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
+BACKUP_ROOT = 'log/merge_backup'    # 自动处理入口文件冲突前的备份，相对仓库根。log 被 git 忽略，启动器只 reset 不 clean
+BACKUP_NOTE = '说明.txt'
 
 
 def _git_env() -> dict[str, str]:
@@ -134,6 +147,11 @@ class MergeResult:
     pushed 和补推失败的 push_failed 比的是推送前的 origin/<分支>，该引用不存在时都记 False。
     merged_locally 表示这次调用造出了合并提交（merged、needs_install，以及它们推送失败变成的 push_failed）：
     磁盘上的代码变了，与"补推失败、这次什么都没合并"的 push_failed 区分开。
+    代码冲突只落在入口文件里时会自动处理：rehooked 是取了官方版本、重接了入口的入口文件（排序），overridden 是官方
+    改过、被我们的版本整段覆盖的函数体（每项是"<文件> 的 <函数名>"），backup 是处理前的备份目录（相对仓库根、正斜杠）。
+    处理完成后这三项不管最终是什么状态都带着（之后自检失败的 smoke_failed、推送失败的 push_failed 也是）。处理不了时
+    是 conflict_aborted，rehook_error 写明原因；处理途中出了意外（git 命令失败等）是 smoke_failed。这两种 rehooked、
+    overridden 为空，backup 是已写好的备份（备份本身没写成时为空串）。没做自动处理时这四项都是空的。
     """
     status: str
     commits: int
@@ -145,6 +163,10 @@ class MergeResult:
     server_code_changed: bool = False
     missing_module: str = ''
     fetch_remote: str = ''          # fetch_failed 时拉取失败的远端：origin（fork）或 upstream（上游）
+    rehooked: list[str] = field(default_factory=list)
+    overridden: list[str] = field(default_factory=list)
+    backup: str = ''
+    rehook_error: str = ''
 
 
 def ensure_remote(r: GitRunner, name: str, url: str) -> None:
@@ -208,15 +230,19 @@ def push(r: GitRunner, branch: str) -> tuple[bool, str]:
 
 def merge_upstream(r: GitRunner, upstream: str, upstream_branch: str, push_branch: str,
                    regenerate: Callable[[str], None],
-                   verify: Callable[[Path], tuple[bool, str]] | None = None) -> MergeResult:
+                   verify: Callable[[Path], tuple[bool, str]] | None = None,
+                   hooks: Sequence[Hook] | None = None) -> MergeResult:
     """把上游的 upstream_branch 合并进当前分支并推送到 origin 的 push_branch。
 
     顺序：清理上次留下的合并 → 查已跟踪文件的改动 → 拉取 fork 并比较 → 拉取上游 → 合并或补推。
     合并之前先 fetch origin <push_branch>（NETWORK_TIMEOUT 内）：失败返回 fetch_failed（fetch_remote 为 origin，
     仓库没动过）。fork 上有 HEAD 没有的提交时不合并：HEAD 没有 fork 之外的提交是 fork_ahead（commits 是 fork 多出的
     提交数，等用户重启服务、启动器把运行目录对齐到 fork），两边各有对方没有的提交是 diverged（不合并也不推送）。
+    代码冲突只落在入口文件里（hooks 里的文件，None 时用 upstream_hooks.HOOKS）时先自动处理：备份、核对前提、
+    取官方版本重接入口，见 _rehook；全部做完才处理素材。冲突里有入口文件以外的代码文件，或者自动处理不了，就整体
+    中止，返回 conflict_aborted（后者 rehook_error 写明原因）。
     素材冲突取上游版本，之后对受影响的任务目录调用 regenerate(任务目录)：普通任务是 tasks/ 下的目录名，
-    组件是 Component/<组件>，各取各的 assets.py。有代码冲突就整体中止。
+    组件是 Component/<组件>，各取各的 assets.py。
     verify 在提交之前收到仓库路径，返回 (是否通过, 原因)，None 表示不做自检。自检不通过，或者 verify、regenerate
     抛异常，或者处理合并结果时 git 命令失败，都 merge --abort 并返回 smoke_failed，message 里是原因。例外：
     原因里有 ModuleNotFoundError: No module named 'X'、X 不是仓库自己的包或模块、这次合并又改了 requirements.txt，
@@ -252,7 +278,7 @@ def merge_upstream(r: GitRunner, upstream: str, upstream_branch: str, push_branc
     behind = count_behind(r, ref)
     if behind == 0:
         return _push_unpushed_commits(r, push_branch)
-    result = _merge_and_commit(r, ref, upstream_branch, behind, regenerate, verify)
+    result = _merge_and_commit(r, ref, upstream_branch, behind, regenerate, verify, HOOKS if hooks is None else hooks)
     if not result.merged_locally:
         return result
     ok, error = push(r, push_branch)
@@ -405,19 +431,31 @@ def _one_line(text: str) -> str:
 
 
 def _merge_and_commit(r: GitRunner, ref: str, branch: str, behind: int, regenerate: Callable[[str], None],
-                      verify: Callable[[Path], tuple[bool, str]] | None) -> MergeResult:
-    """合并、处理素材冲突、自检、提交，返回 merged、needs_install、conflict_aborted 或 smoke_failed。
-    前两种已经提交（merged_locally 为真），其余都已 abort。requirements.txt 和服务端代码有没有变化在自检之前就比好：
-    自检失败时要靠前者判断是不是上游新增了依赖。"""
+                      verify: Callable[[Path], tuple[bool, str]] | None, hooks: Sequence[Hook]) -> MergeResult:
+    """合并、处理代码冲突和素材冲突、自检、提交，返回 merged、needs_install、conflict_aborted 或 smoke_failed。
+    前两种已经提交（merged_locally 为真），其余都已 abort。代码冲突只落在入口文件（hook_files(hooks)）里时先自动处理
+    （_rehook），全部做完才处理素材；处理不了就 abort，返回 conflict_aborted 和原因。做了自动处理的，不管最终是哪个状态，
+    结果里都带上 rehooked、overridden、backup，说明.txt 的结果一栏也改写成最终结果。
+    requirements.txt 和服务端代码有没有变化在自检之前就比好：自检失败时要靠前者判断是不是上游新增了依赖。"""
     merge = r.run('merge', '--no-commit', '--no-ff', ref, check=False)
+    rehook = _Rehook()
     try:
         unmerged = _unmerged_paths(r)
         code = sorted(path for path in unmerged if not is_asset_path(path))
-        if code or (merge.returncode != 0 and not unmerged):
-            # 有代码冲突，或合并根本没开始（比如有未跟踪文件会被覆盖）
+        if merge.returncode != 0 and not unmerged:          # 合并根本没开始（比如有未跟踪文件会被覆盖）
             _abort_merge(r)
             return MergeResult('conflict_aborted', 0, [], code, merge.stderr.strip())
-        resolved = _take_upstream(r, unmerged)
+        if not set(code) <= set(hook_files(hooks)):         # 有入口文件以外的代码冲突：照旧中止，不备份
+            _abort_merge(r)
+            return MergeResult('conflict_aborted', 0, [], code, merge.stderr.strip())
+        reason = _rehook(r, code, unmerged, hooks, rehook) if code else ''
+        if reason:
+            _abort_merge(r, stage_edits=True)
+            result = MergeResult('conflict_aborted', 0, [], code, merge.stderr.strip(), rehook_error=reason,
+                                 backup=rehook.backup)
+            _finish_note(r, rehook, result)
+            return result
+        resolved = _take_upstream(r, {path: stages for path, stages in unmerged.items() if is_asset_path(path)})
         _regenerate(r, resolved, regenerate)
         changed = _changed_paths(r, '--cached', 'HEAD')          # 这次合并相对合并前的 HEAD 改了哪些文件
         if changed is None:
@@ -428,12 +466,168 @@ def _merge_and_commit(r: GitRunner, ref: str, branch: str, behind: int, regenera
         missing = '' if ok or not requirements_changed else _missing_dependency(r.repo, error)
         if ok or missing:
             r.run('commit', '--no-edit', '-m', f'合并上游 {branch} 分支（{behind} 个提交）')
-            return MergeResult('merged' if ok else 'needs_install', behind, resolved, [], error, requirements_changed,
-                               merged_locally=True, server_code_changed=server_code_changed, missing_module=missing)
+            result = MergeResult('merged' if ok else 'needs_install', behind, resolved, [], error,
+                                 requirements_changed, merged_locally=True, server_code_changed=server_code_changed,
+                                 missing_module=missing, **rehook.fields())
+            _finish_note(r, rehook, result)
+            return result
     except Exception as exc:
         error = _describe(exc)
     _abort_merge(r, stage_edits=True)
-    return MergeResult('smoke_failed', 0, [], [], error)
+    result = MergeResult('smoke_failed', 0, [], [], error, **rehook.fields())
+    _finish_note(r, rehook, result)
+    return result
+
+
+@dataclass
+class _Rehook:
+    """一次合并里自动处理入口文件冲突的进展，合并结束时带进 MergeResult、写进说明.txt。
+    backup：备份目录（相对仓库根、正斜杠），还没备份或备份没写成时为空串；note：说明.txt 里结果一栏之前的几行；
+    files：取了官方版本、重接了入口的文件；overridden：被我们整段覆盖的官方函数体，每项是（"文件 的 函数名"，存官方
+    改动的差异文件名）。"""
+    backup: str = ''
+    note: list[str] = field(default_factory=list)
+    files: list[str] = field(default_factory=list)
+    overridden: list[tuple[str, str]] = field(default_factory=list)
+
+    def fields(self) -> dict:
+        """MergeResult 里自动处理的三项：rehooked、overridden、backup。"""
+        return {'rehooked': list(self.files), 'overridden': [label for label, _ in self.overridden],
+                'backup': self.backup}
+
+
+def _rehook(r: GitRunner, code: list[str], unmerged: dict[str, set[str]], hooks: Sequence[Hook],
+            state: _Rehook) -> str:
+    """代码冲突只落在入口文件里时的自动处理。处理好了返回空串；处理不了返回原因（面向用户，进 MergeResult.rehook_error），
+    这时已跟踪的文件一个都没动过，调用方 abort 合并即可。进展记在 state 里。按顺序做三步：
+
+    1. 备份（_write_backup）：全部入口文件合并前 HEAD 的版本，加一份说明.txt。写不成就不处理：没有备份时不改文件。
+    2. 逐个核对 code 里的文件，内容取索引里的共同祖先（:1:）、我们（:2:）、官方（:3:）：要有共同祖先；官方没删掉
+       这个文件；共同祖先接上清单要等于我们的版本（换行统一成 \\n 再比），否则说明有人绕开清单改过它，自动处理会把
+       那处改动弄丢；官方版本接得上清单。一个不过就停下。
+    3. 写回：每个文件 checkout --theirs，让 git 按工作区的换行风格写出官方版本；读回来接上入口，按原来的换行风格
+       写回去，再 git add。官方改过、被我们整段覆盖的函数体，各存一份官方改动（共同祖先到官方的差异）到备份目录。
+    清单本身自相矛盾时 apply_hooks 抛 ValueError，和 git 命令失败一样往外抛，由调用方当作处理途中出错，abort 合并。
+    """
+    try:
+        state.backup, state.note = _write_backup(r, hooks, code)
+    except Exception as exc:
+        return f'备份没写成（{type(exc).__name__}: {exc}）'
+    texts = {}
+    for path in code:
+        stages = unmerged[path]
+        if '1' not in stages:
+            return f'{path} 没有共同祖先版本'
+        if '3' not in stages:
+            return f'官方删掉了 {path}'
+        base, theirs = _staged(r, '1', path), _staged(r, '3', path)
+        ours = _staged(r, '2', path) if '2' in stages else None      # 没有 :2: 是我们删掉了这个文件
+        try:
+            rebuilt = apply_hooks(path, base, hooks)
+        except HookError as exc:
+            return str(exc)
+        if ours is None or rebuilt.replace('\r\n', '\n') != ours.replace('\r\n', '\n'):
+            return f'{path} 里有入口清单以外的改动，自动处理会把它弄丢'
+        try:
+            apply_hooks(path, theirs, hooks)
+        except HookError as exc:
+            return str(exc)
+        texts[path] = base, theirs
+    for path in code:
+        r.run('checkout', '--theirs', '--', path)
+        file = r.repo / path
+        file.write_bytes(apply_hooks(path, file.read_bytes().decode('utf-8'), hooks).encode('utf-8'))
+        r.run('add', '--', path)
+    found = [body for path in code for body in overridden_bodies(path, *texts[path], hooks)]
+    for body, name in zip(found, _diff_names(found)):
+        (r.repo / state.backup / name).write_bytes(body.diff.encode('utf-8'))
+        state.overridden.append((f'{body.path} 的 {body.function}', name))
+    state.files = list(code)
+    return ''
+
+
+def _staged(r: GitRunner, stage: str, path: str) -> str:
+    """索引里 path 第 stage 阶段的内容（1 共同祖先、2 我们、3 官方）。GitRunner 按文本读，换行已统一成 \\n。"""
+    return r.run('show', f':{stage}:{path}').stdout
+
+
+def _write_backup(r: GitRunner, hooks: Sequence[Hook], code: list[str]) -> tuple[str, list[str]]:
+    """新建备份目录 log/merge_backup/<本地时间 YYYY-MM-DD_HHMMSS>（同名目录已存在时依次加 _2、_3……），写入全部入口文件
+    合并前 HEAD 的版本（保持原来的目录结构，HEAD 里没有的跳过）和说明.txt（结果一栏是"处理中"）。
+    返回 (备份目录，相对仓库根、正斜杠；说明.txt 里结果一栏之前的几行)。哪一步出错都先删掉这次建的目录，再把异常往外抛。
+    文件按 git show 给出的 UTF-8 文本写出：入口文件都是 UTF-8、按 LF 入库（.gitattributes 里 *.py eol=lf）。"""
+    now = datetime.now()
+    root = r.repo / BACKUP_ROOT
+    root.mkdir(parents=True, exist_ok=True)
+    name = _new_directory(root, now.strftime('%Y-%m-%d_%H%M%S'))
+    directory = root / name
+    try:
+        listed = r.run('ls-tree', '-r', '-z', '--name-only', 'HEAD', '--', *hook_files(hooks)).stdout
+        files = [path for path in listed.split('\0') if path]
+        for path in files:
+            target = directory / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(r.run('show', f'HEAD:{path}').stdout.encode('utf-8'))
+        note = ['合并上游时自动处理代码冲突，这里是处理前的备份。', '',
+                f'时间：{now:%Y-%m-%d %H:%M:%S}',
+                f'合并前的 HEAD：{r.run("rev-parse", "HEAD").stdout.strip()}',
+                f'上游提交：{r.run("rev-parse", "MERGE_HEAD").stdout.strip()}',
+                f'冲突的入口文件：{"、".join(code)}',
+                f'备份的文件（合并前 HEAD 的版本，保持原来的目录结构）：{"、".join(files) or "无"}']
+        _write_note(directory, note, '处理中')
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    return f'{BACKUP_ROOT}/{name}', note
+
+
+def _new_directory(root: Path, stamp: str) -> str:
+    """在 root 下新建名为 stamp 的目录，已存在时依次试 stamp_2、stamp_3……，返回建成的目录名。"""
+    for number in itertools.count(1):
+        name = stamp if number == 1 else f'{stamp}_{number}'
+        try:
+            (root / name).mkdir()
+        except FileExistsError:
+            continue
+        return name
+
+
+def _write_note(directory: Path, note: list[str], outcome: str,
+                overridden: list[tuple[str, str]] | None = None) -> None:
+    """写说明.txt：note 的几行，被覆盖的函数体（overridden 为 None 时还不知道，不写这一行），最后是结果一栏。"""
+    lines = list(note)
+    if overridden is not None:
+        shown = '、'.join(f'{label}（官方的改动见 {name}）' for label, name in overridden)
+        lines.append(f'官方改过、已用我们的版本覆盖的函数体：{shown or "无"}')
+    lines.append(f'结果：{outcome}')
+    (directory / BACKUP_NOTE).write_bytes(('\n'.join(lines) + '\n').encode('utf-8'))
+
+
+def _finish_note(r: GitRunner, state: _Rehook, result: MergeResult) -> None:
+    """把说明.txt 的结果一栏改写成合并的最终结果；没有备份时什么也不做。写不成就算了，结果一栏停在"处理中"：
+    合并可能已经提交了，不能因为一份说明把结果报错。"""
+    if not state.backup:
+        return
+    if result.status == 'merged':
+        outcome = '成功，合并已提交'
+    elif result.status == 'needs_install':
+        outcome = f'成功，合并已提交；上游新增了第三方依赖 {result.missing_module}，要在 OASX 重启服务安装'
+    elif result.rehook_error:
+        outcome = f'失败：{result.rehook_error}。合并已中止，分支未改动'
+    else:
+        outcome = '合并没有完成，已中止，分支未改动：处理途中出错或自检没通过，原因见服务日志'
+    try:
+        _write_note(r.repo / state.backup, state.note, outcome, state.overridden)
+    except OSError:
+        pass
+
+
+def _diff_names(found: list[OverriddenBody]) -> list[str]:
+    """每个被覆盖的函数体存官方改动用的文件名：官方改动-<函数名>.diff；同一次合并里函数名有重复时，在函数名前加
+    文件名（不含扩展名）和 -。"""
+    counts = Counter(body.function for body in found)
+    return [f'官方改动-{PurePosixPath(body.path).stem}-{body.function}.diff' if counts[body.function] > 1
+            else f'官方改动-{body.function}.diff' for body in found]
 
 
 def _missing_dependency(repo: Path, reason: str) -> str:

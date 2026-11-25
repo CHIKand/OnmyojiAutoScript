@@ -4,6 +4,7 @@
 每个临时仓库都设了本地身份并关掉 autocrlf 和提交签名，结果不依赖本机的全局 git 配置。
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import pytest
 from module.server import fork_git
 from module.server.fork_git import (NETWORK_TIMEOUT, GitRunner, commit_paths, count_behind, ensure_remote,
                                     is_asset_path, is_server_code_path, merge_upstream, push, upstream_commits)
+from module.server.upstream_hooks import Hook, OverriddenBody
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 STATUS_CALL = ('-c', 'core.quotepath=off', 'status', '--porcelain', '--untracked-files=no')
@@ -129,9 +131,9 @@ class Trio:
     def fork_commit(self, files, message='fork change'):
         commit(self.work, files, message)
 
-    def merge(self, regenerate=None, verify=None, upstream=None):
+    def merge(self, regenerate=None, verify=None, upstream=None, hooks=None):
         return merge_upstream(self.runner, upstream or str(self.upstream), 'dev', 'custom',
-                              regenerate or Regen(self.work), verify)
+                              regenerate or Regen(self.work), verify, hooks)
 
 
 class Regen:
@@ -372,6 +374,235 @@ def test_mixed_conflicts_abort(trio):
     assert is_clean(trio.work)
     # 素材那一半没有被单独取用
     assert (trio.work / 'tasks/Foo/as/image.json').read_bytes() == b'[{"v": 2}]\n'
+
+
+# ---- 代码冲突只落在入口文件里：备份、核对前提、取官方版本重接入口 ----------------------------------------------------
+# 用假清单：BASE 的 script.py 是 'base\n'，fork 一侧提交"共同祖先 + 清单"，官方在同一处加了别的行，两边就冲突。
+# 上面两个用例用的是真清单：合成的 script.py 里找不到真清单的定位行，核对前提不过，所以仍然整体中止。
+
+HOOKED = (Hook('script.py', 'base', 'after', ('hooked',)),)
+TWO_HOOK_FILES = HOOKED + (Hook('new.py', 'base', 'after', ('hooked',)),)      # new.py 不在 BASE 里
+STAMP = re.compile(r'log/merge_backup/\d{4}-\d{2}-\d{2}_\d{6}')
+
+
+def raw_show(repo, spec):
+    """git show 的原始字节。sh 走文本模式，\\r\\n 会被换成 \\n，看不出提交进去的换行。"""
+    return subprocess.run(['git', 'show', spec], cwd=repo, capture_output=True, check=True).stdout
+
+
+def backup_note(trio, result):
+    return (trio.work / result.backup / '说明.txt').read_bytes().decode('utf-8')
+
+
+def test_a_hook_file_conflict_is_rehooked_and_keeps_upstream_changes(trio):
+    trio.fork_commit({'script.py': 'base\nhooked\n', 'tasks/Foo/as/image.json': '[{"v": 2}]\n'})
+    trio.upstream_commit({'script.py': 'base\nupstream\n', 'tasks/Foo/as/image.json': '[{"v": 1}]\n'})
+    before, upstream = trio.head, sh(trio.seed, 'rev-parse', 'HEAD')
+    regen = Regen(trio.work)
+    result = trio.merge(regen, hooks=HOOKED)
+    assert (result.status, result.rehooked, result.overridden, result.rehook_error) == (
+        'merged', ['script.py'], [], '')
+    assert (result.conflicts, result.resolved, regen.calls) == ([], ['tasks/Foo/as/image.json'], ['Foo'])   # 素材照常
+    assert raw_show(trio.work, 'HEAD:script.py') == b'base\nhooked\nupstream\n'     # 我们的入口和官方的改动都在
+    assert (trio.work / 'script.py').read_bytes() == b'base\nhooked\nupstream\n'
+    assert before in parents(trio.work) and trio.fork_tip == trio.head
+    assert is_clean(trio.work) and not merging(trio.work)
+    # 备份：合并前 HEAD 版本的入口文件，加一份说明
+    assert STAMP.fullmatch(result.backup)
+    backup = trio.work / result.backup
+    assert sorted(path.name for path in backup.iterdir()) == ['script.py', '说明.txt']
+    assert (backup / 'script.py').read_bytes() == b'base\nhooked\n'
+    note = backup_note(trio, result)
+    assert f'合并前的 HEAD：{before}\n' in note and f'上游提交：{upstream}\n' in note
+    assert '冲突的入口文件：script.py\n' in note
+    assert note.endswith('官方改过、已用我们的版本覆盖的函数体：无\n结果：成功，合并已提交\n')
+
+
+def test_a_replaced_body_is_overridden_and_recorded(trio):
+    def router(body):
+        return f'import x\n\n\ndef update_info():\n    {body}\n'
+
+    name = 'module/server/router.py'
+    trio.upstream_commit({name: router('return 1')})
+    assert trio.merge().status == 'merged'                  # 官方新加的文件，干净地合进来
+    hooks = (Hook(name, 'def update_info():', 'replace_body', ('    return ours()',)),)
+    trio.fork_commit({name: router('return ours()')})      # 共同祖先 + 清单
+    trio.upstream_commit({name: router('return 2')})       # 官方也改了这个函数体
+    result = trio.merge(hooks=hooks)
+    assert (result.status, result.rehooked, result.rehook_error) == ('merged', [name], '')
+    assert result.overridden == [f'{name} 的 update_info']
+    assert raw_show(trio.work, f'HEAD:{name}') == router('return ours()').encode()       # 用我们的版本覆盖
+    backup = trio.work / result.backup
+    assert (backup / name).read_bytes() == router('return ours()').encode()              # 保持原来的目录结构
+    assert (backup / '官方改动-update_info.diff').read_bytes().decode('utf-8') == (
+        '--- 共同祖先\n+++ 官方\n@@ -1 +1 @@\n-    return 1\n+    return 2\n')
+    assert (f'官方改过、已用我们的版本覆盖的函数体：{name} 的 update_info（官方的改动见 官方改动-update_info.diff）\n'
+            in backup_note(trio, result))
+
+
+def fail_backup(*args, **kwargs):
+    raise OSError('disk full')
+
+
+# (fork 改的入口文件, 官方的改动, 换掉写备份的函数, 原因)
+REHOOK_FAILURES = [
+    pytest.param({'script.py': 'base\nhooked\n'}, {'script.py': 'rebased\n'}, None,
+                 'script.py 的第 1 条入口找不到这一行：base', id='anchor-gone'),
+    pytest.param({'script.py': 'base\nhooked\n'}, {'script.py': 'base\nupstream\nbase\n'}, None,
+                 'script.py 的第 1 条入口这一行出现了 2 次：base', id='anchor-twice'),
+    pytest.param({'script.py': 'base\nhooked\n'}, {'script.py': None}, None,
+                 '官方删掉了 script.py', id='deleted-upstream'),
+    pytest.param({'script.py': 'base\nhooked\nmine\n'}, {'script.py': 'base\nupstream\n'}, None,
+                 'script.py 里有入口清单以外的改动，自动处理会把它弄丢', id='edited-beyond-the-list'),
+    pytest.param({'new.py': 'base\nhooked\n'}, {'new.py': 'base\nupstream\n'}, None,
+                 'new.py 没有共同祖先版本', id='added-on-both-sides'),
+    pytest.param({'script.py': 'base\nhooked\n'}, {'script.py': 'base\nupstream\n'}, fail_backup,
+                 '备份没写成（OSError: disk full）', id='backup-fails'),
+]
+
+
+@pytest.mark.parametrize('fork_files, upstream_files, backup_writer, reason', REHOOK_FAILURES)
+def test_rehook_failures_abort_cleanly(trio, monkeypatch, fork_files, upstream_files, backup_writer, reason):
+    # 都带一处素材冲突：合并要是往下走了，regenerate 就会被调用
+    trio.fork_commit({**fork_files, 'tasks/Foo/as/image.json': '[{"v": 2}]\n'})
+    trio.upstream_commit({**upstream_files, 'tasks/Foo/as/image.json': '[{"v": 1}]\n'})
+    if backup_writer:
+        monkeypatch.setattr(fork_git, '_write_backup', backup_writer)
+    before, fork_before = trio.head, trio.fork_tip
+    regen = Regen(trio.work)
+    result = trio.merge(regen, hooks=TWO_HOOK_FILES)
+    assert (result.status, result.conflicts, result.rehook_error) == ('conflict_aborted', sorted(fork_files), reason)
+    assert (result.rehooked, result.overridden, result.resolved, regen.calls) == ([], [], [], [])
+    assert trio.head == before and trio.fork_tip == fork_before
+    assert is_clean(trio.work) and not merging(trio.work)
+    for name, content in fork_files.items():
+        assert (trio.work / name).read_bytes() == content.encode()                       # fork 的版本原样留着
+    if backup_writer:
+        assert result.backup == ''
+        return
+    assert STAMP.fullmatch(result.backup)
+    backup = trio.work / result.backup
+    for name in ('new.py', 'script.py'):                   # 清单里的入口文件都备份，HEAD 里没有的跳过
+        in_head = sh(trio.work, 'ls-tree', '--name-only', 'HEAD', name) == name
+        assert (backup / name).exists() is in_head
+        if in_head:
+            assert (backup / name).read_bytes() == raw_show(trio.work, f'HEAD:{name}')
+    assert backup_note(trio, result).endswith(f'结果：失败：{reason}。合并已中止，分支未改动\n')
+
+
+def test_a_conflict_beyond_the_hook_files_aborts_without_backup(trio):
+    trio.fork_commit({'script.py': 'base\nhooked\n', 'other.py': 'fork\n'})
+    trio.upstream_commit({'script.py': 'base\nupstream\n', 'other.py': 'upstream\n'})
+    before = trio.head
+    result = trio.merge(hooks=HOOKED)
+    assert (result.status, result.conflicts) == ('conflict_aborted', ['other.py', 'script.py'])
+    assert (result.rehook_error, result.backup, result.rehooked) == ('', '', [])
+    assert not (trio.work / 'log' / 'merge_backup').exists()
+    assert trio.head == before and is_clean(trio.work) and not merging(trio.work)
+    assert (trio.work / 'script.py').read_bytes() == b'base\nhooked\n'
+
+
+def test_rehook_in_a_crlf_worktree(trio):
+    trio.fork_commit({'script.py': 'base\nhooked\n'})
+    trio.upstream_commit({'script.py': 'base\nupstream\n'})
+    sh(trio.work, 'config', 'core.autocrlf', 'true')       # Windows 上运行目录的样子：仓库里是 LF，工作区里是 CRLF
+    sh(trio.work, 'rm', '-q', '-r', '--cached', '.')       # 重新检出，工作区换成 CRLF
+    sh(trio.work, 'reset', '-q', '--hard')
+    assert (trio.work / 'script.py').read_bytes() == b'base\r\nhooked\r\n'
+    result = trio.merge(hooks=HOOKED)
+    assert (result.status, result.rehooked) == ('merged', ['script.py'])
+    assert is_clean(trio.work) and not merging(trio.work)
+    assert raw_show(trio.work, 'HEAD:script.py') == b'base\nhooked\nupstream\n'          # 提交进去的是 LF
+    assert (trio.work / 'script.py').read_bytes() == b'base\r\nhooked\r\nupstream\r\n'   # 工作区保持 CRLF
+
+
+def test_a_rehooked_merge_that_fails_the_self_check_aborts_and_keeps_the_backup(trio):
+    trio.fork_commit({'script.py': 'base\nhooked\n'})
+    trio.upstream_commit({'script.py': 'base\nupstream\n'})
+    before = trio.head
+    seen = []
+
+    def verify(repo):
+        seen.append((repo / 'script.py').read_bytes())
+        return False, 'import boom'
+
+    result = trio.merge(verify=verify, hooks=HOOKED)
+    assert (result.status, result.message, result.rehook_error) == ('smoke_failed', 'import boom', '')
+    assert seen == [b'base\nhooked\nupstream\n']            # 自检看到的是重接之后的文件
+    assert result.rehooked == ['script.py'] and STAMP.fullmatch(result.backup)      # 不管什么状态都带着
+    assert trio.head == before and is_clean(trio.work) and not merging(trio.work)
+    assert (trio.work / 'script.py').read_bytes() == b'base\nhooked\n'
+    assert backup_note(trio, result).endswith(
+        '结果：合并没有完成，已中止，分支未改动：处理途中出错或自检没通过，原因见服务日志\n')
+
+
+def test_a_rehook_that_fails_during_the_write_back_aborts_cleanly(trio, broken_git):
+    trio.fork_commit({'script.py': 'base\nhooked\n'})
+    trio.upstream_commit({'script.py': 'base\nupstream\n'})
+    before = trio.head
+    broken_git('add', '--', 'script.py')                   # 重接好的文件已经写回工作区，登记进索引时失败
+    result = trio.merge(hooks=HOOKED)
+    assert (result.status, result.message, result.rehooked) == ('smoke_failed', 'fatal: simulated failure', [])
+    assert STAMP.fullmatch(result.backup)
+    assert trio.head == before and is_clean(trio.work) and not merging(trio.work)
+    assert (trio.work / 'script.py').read_bytes() == b'base\nhooked\n'                # 写回的文件也还原了
+    assert backup_note(trio, result).endswith(
+        '结果：合并没有完成，已中止，分支未改动：处理途中出错或自检没通过，原因见服务日志\n')
+
+
+def test_a_rehooked_merge_that_needs_a_new_dependency_is_still_a_success(trio):
+    trio.fork_commit({'script.py': 'base\nhooked\n'})
+    trio.upstream_commit({'script.py': 'base\nupstream\n', 'requirements.txt': 'pkg==1\nbrandnew==1.0\n'})
+    result = trio.merge(verify=missing_module('brandnew'), hooks=HOOKED)
+    assert (result.status, result.rehooked, result.missing_module) == ('needs_install', ['script.py'], 'brandnew')
+    assert trio.fork_tip == trio.head
+    assert backup_note(trio, result).endswith(
+        '结果：成功，合并已提交；上游新增了第三方依赖 brandnew，要在 OASX 重启服务安装\n')
+
+
+def test_a_rehooked_merge_whose_push_fails_keeps_the_rehook_fields(trio, tmp_path):
+    trio.fork_commit({'script.py': 'base\nhooked\n'})
+    trio.upstream_commit({'script.py': 'base\nupstream\n'})
+    push_fails(trio, tmp_path)
+    result = trio.merge(hooks=HOOKED)
+    assert (result.status, result.merged_locally, result.rehooked) == ('push_failed', True, ['script.py'])
+    assert STAMP.fullmatch(result.backup)
+    assert backup_note(trio, result).endswith('结果：成功，合并已提交\n')         # 合并本身已经提交，推送另说
+
+
+def test_a_rehook_backup_that_fails_midway_is_removed(trio, broken_git):
+    trio.fork_commit({'script.py': 'base\nhooked\n'})
+    trio.upstream_commit({'script.py': 'base\nupstream\n'})
+    before = trio.head
+    broken_git('show')                                     # 备份目录建好之后，读 HEAD 版本失败
+    result = trio.merge(hooks=HOOKED)
+    assert (result.status, result.backup) == ('conflict_aborted', '')
+    assert result.rehook_error == ("备份没写成（CalledProcessError: Command '['git', 'show', 'HEAD:script.py']' "
+                                   "returned non-zero exit status 128.）")
+    assert list((trio.work / 'log' / 'merge_backup').iterdir()) == []                 # 写了一半的目录删掉了
+    assert trio.head == before and is_clean(trio.work) and not merging(trio.work)
+
+
+def test_rehook_backups_in_the_same_second_get_a_suffix(trio, monkeypatch):
+    class Clock:
+        @staticmethod
+        def now():
+            return datetime(2026, 11, 26, 10, 15, 0)
+
+    monkeypatch.setattr(fork_git, 'datetime', Clock)
+    for taken in ('2026-11-26_101500', '2026-11-26_101500_2'):
+        (trio.work / 'log' / 'merge_backup' / taken).mkdir(parents=True)
+    trio.fork_commit({'script.py': 'base\nhooked\n'})
+    trio.upstream_commit({'script.py': 'base\nupstream\n'})
+    result = trio.merge(hooks=HOOKED)
+    assert (result.status, result.backup) == ('merged', 'log/merge_backup/2026-11-26_101500_3')
+    assert '时间：2026-11-26 10:15:00\n' in backup_note(trio, result)
+
+
+def test_rehook_diff_names_carry_the_file_name_when_functions_share_a_name():
+    found = [OverriddenBody('module/a/x.py', 'f', ''), OverriddenBody('module/b/y.py', 'f', ''),
+             OverriddenBody('module/b/y.py', 'g', '')]
+    assert fork_git._diff_names(found) == ['官方改动-x-f.diff', '官方改动-y-f.diff', '官方改动-g.diff']
 
 
 def test_push_failure_keeps_local_merge(trio, tmp_path):
