@@ -552,7 +552,7 @@ def test_a_daily_merge_conflict_reaches_feishu(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize('body', ['x' * 1_000, '御' * 1_000], ids=['ascii', 'cjk'])
 def test_a_server_event_caps_each_line_and_the_whole_message(tmp_path, body):
-    # 自检失败、意外错误的文案带着最多 20 行 stderr：每行最多 300 个字符，整条照 requests 的 json= 算不超过 28,000 字节
+    # 导入自检失败的文案带着 stderr 的最后 20 行：每行最多 300 个字符，整条照 requests 的 json= 算不超过 28,000 字节
     write_instance(tmp_path, 'a.json', notify_config=feishu_yaml('open_id', 'ou_1'))
     stderr = [f'{i:02d} {body}' for i in range(20)]
     text = '\n'.join([CONFLICT_HEADLINE, '合并上游后自检失败，已中止，分支未改动：' + body, *stderr])

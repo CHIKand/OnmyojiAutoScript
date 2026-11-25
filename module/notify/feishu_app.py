@@ -858,7 +858,7 @@ def _fit(title: str, fixed: list[str], log_lines: list[str]) -> list[str]:
 
 
 def _shrink(title: str, lines: list[str]) -> list[str]:
-    """日志行删光后 content 仍超过上限：第一行（错误摘要或事件的结论）原样留着，截短其余最长的行，直到放得下。
+    """日志行删光后 content 仍超过上限：第一行（错误摘要的第一行，或事件的结论）原样留着，截短其余最长的行，直到放得下。
     在第一行占掉的之外，找出最大的 n，使其余每行最多留 n 个字符时放得下，只截比 n 长的行，所以最长的行先截，其余不动。
     其余每行只留一个字符也放不下（行数太多）时，先从最后一行删起，可以一行不留。
     第一行单独放不下时（标题和第一行各不超过 FIXED_LINE_MAX 个字符时不会这样），所有行一起这样截，至少留一行：
@@ -1182,8 +1182,9 @@ def notify_server_event(title: str, text: str, *, root: Path | None = None, sess
     （script.error.notify_enable）、推送配置写 provider: feishu_app 的，取 (receive_id_type, receive_id)，去掉重复的。
     - 一个接收方都没有：不发，记一行 INFO。凭证缺失：记一条错误，什么都不写。
     - 每个接收方写一条发件箱条目：标题 title，正文是 text 的各行（空行不要），不附图，不合并。每行最多 LOG_LINE_MAX 个
-      字符（自检失败、意外错误带着最多 20 行 stderr），整条超过上限时截短最长的行，第一行（结论和"需人工处理"）不截
-      （见 _fit）。写完立即补发一轮（flush_outbox，与补发同一条路径，发件箱里早先的条目先发），没发出去的留给下一轮补发。
+      字符（导入自检失败只带 stderr 的最后 20 行；意外错误和合并处理中的失败，出自 git 命令的带着 git 的全部 stderr，
+      可能几百行），整条超过上限时截短最长的行，第一行（结论和"需人工处理"）不截（见 _fit）。写完立即补发一轮
+      （flush_outbox，与补发同一条路径，发件箱里早先的条目先发），没发出去的留给下一轮补发。
     """
     try:
         _notify_server_event(Path(root) if root is not None else Path.cwd(), title, text, session)
