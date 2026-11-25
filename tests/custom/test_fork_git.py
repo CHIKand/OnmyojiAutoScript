@@ -1,6 +1,8 @@
 """合并上游的 git 操作层。
 
 全部在 tmp_path 下的本地裸仓库里跑：不联网，不读写本仓库的远端、config/ 和 log/。
+test_the_real_hooks_rehook_the_real_seven_files_twice 另外只读本仓库的 git 历史和工作区里的 7 个入口文件，拿它们
+搭临时仓库，同样不碰本仓库的远端、config/ 和 log/。
 每个临时仓库都设了本地身份并关掉 autocrlf 和提交签名，结果不依赖本机的全局 git 配置。
 """
 import os
@@ -11,6 +13,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +21,7 @@ import pytest
 from module.server import fork_git
 from module.server.fork_git import (NETWORK_TIMEOUT, GitRunner, commit_paths, count_behind, ensure_remote,
                                     is_asset_path, is_server_code_path, merge_upstream, push, upstream_commits)
-from module.server.upstream_hooks import Hook, OverriddenBody
+from module.server.upstream_hooks import Hook, OverriddenBody, apply_hooks, hook_files
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 STATUS_CALL = ('-c', 'core.quotepath=off', 'status', '--porcelain', '--untracked-files=no')
@@ -603,6 +606,67 @@ def test_rehook_diff_names_carry_the_file_name_when_functions_share_a_name():
     found = [OverriddenBody('module/a/x.py', 'f', ''), OverriddenBody('module/b/y.py', 'f', ''),
              OverriddenBody('module/b/y.py', 'g', '')]
     assert fork_git._diff_names(found) == ['官方改动-x-f.diff', '官方改动-y-f.diff', '官方改动-g.diff']
+
+
+# ---- 真清单、真文件：本仓库最近一次合进来的官方版本，和工作区里我们的版本，连着合两轮 --------------------------------
+# 以后每改一处定制都要改清单，这个用例防的是清单和真文件对不上、自动处理在真文件上走不通。
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BUDOKAI = '    budokai_tournament: BudokaiTournament = Field(default_factory=BudokaiTournament)\n'
+ORCHESTRA = '    orchestra: Orchestra = Field(default_factory=Orchestra)\n'
+OCR_IMPORT = 'from module.ocr.rpc import ensure_ocr_server_started\n'
+
+
+def repo_git(*args):
+    """在本仓库里跑只读的 git 命令，返回 stdout 原文（文本模式，\\r\\n 已统一成 \\n；末尾的换行不去掉）。"""
+    return subprocess.run(['git', *args], cwd=REPO_ROOT, capture_output=True, encoding='utf-8', check=True).stdout
+
+
+def test_the_real_hooks_rehook_the_real_seven_files_twice(trio):
+    cm, hr, sc = 'module/config/config_model.py', 'module/server/home_router.py', 'script.py'
+    # 官方一侧：最近一次"合并上游"合并提交的第二个父提交里的 7 个文件（和一致性测试同一个来源），先干净地合进来
+    upstream = repo_git('log', '--merges', '--grep=^合并上游', '-1', '--format=%P').split()[1]
+    base = {path: repo_git('show', f'{upstream}:{path}') for path in hook_files()}
+    trio.upstream_commit(base, 'real upstream files')
+    assert trio.merge().status == 'merged'
+    # 我们一侧：工作区里的 7 个文件（和一致性测试同一个来源）
+    trio.fork_commit({path: (REPO_ROOT / path).read_text(encoding='utf-8') for path in hook_files()},
+                     'our customizations')
+    before = trio.head
+    # 第一轮：官方一次改了 3 个入口文件，每个都和我们的入口冲突
+    commit_line = next(line for line in base[hr].split('\n') if 'updater.get_commit(n=15)' in line)
+    theirs = dict(base)
+    theirs[cm] = base[cm].replace(BUDOKAI, BUDOKAI + '    new_task: NewTask = Field(default_factory=NewTask)\n')
+    theirs[hr] = base[hr].replace(commit_line, commit_line.replace('n=15', 'n=20'))      # update_info 函数体里的一行
+    theirs[sc] = base[sc].replace(OCR_IMPORT, OCR_IMPORT + 'from module.base.new import thing\n')
+    assert all(theirs[path] != base[path] for path in (cm, hr, sc))
+    trio.upstream_commit({path: theirs[path] for path in (cm, hr, sc)}, 'upstream round 1')
+    result = trio.merge()
+    assert (result.status, result.rehook_error) == ('merged', '')
+    assert result.rehooked == sorted([cm, hr, sc])
+    assert result.overridden == ['module/server/home_router.py 的 update_info']
+    assert is_clean(trio.work) and not merging(trio.work) and trio.fork_tip == trio.head
+    for path in hook_files():                              # 7 个文件都等于"本轮官方版本接上清单"
+        assert raw_show(trio.work, f'HEAD:{path}').decode('utf-8') == apply_hooks(path, theirs[path]), path
+    assert (BUDOKAI + ORCHESTRA + '    new_task: NewTask = Field(default_factory=NewTask)\n'
+            in raw_show(trio.work, f'HEAD:{cm}').decode('utf-8'))                  # 我们的字段和官方的新字段都在
+    # 备份：7 个文件合并前 HEAD 的版本、说明，和被覆盖的 update_info 的官方改动
+    backup = trio.work / result.backup
+    assert sorted(path.relative_to(backup).as_posix() for path in backup.rglob('*') if path.is_file()) == sorted(
+        hook_files() + ['说明.txt', '官方改动-update_info.diff'])
+    for path in hook_files():
+        assert (backup / path).read_bytes() == raw_show(trio.work, f'{before}:{path}'), path
+    diff = (backup / '官方改动-update_info.diff').read_bytes().decode('utf-8')
+    assert [line for line in diff.split('\n') if line[:1] in ('-', '+') and line[:3] not in ('---', '+++')] == [
+        f'-{commit_line}', f'+{commit_line.replace("n=15", "n=20")}']
+    # 第二轮：官方在 budokai 后面再加一个字段。共同祖先成了上一轮的官方版本，前提照样成立，又一次自动处理成功
+    theirs[cm] = theirs[cm].replace(BUDOKAI, BUDOKAI + '    field2: F2 = Field(default_factory=F2)\n')
+    trio.upstream_commit({cm: theirs[cm]}, 'upstream round 2')
+    result = trio.merge()
+    assert (result.status, result.rehooked, result.overridden, result.rehook_error) == ('merged', [cm], [], '')
+    assert is_clean(trio.work) and not merging(trio.work) and trio.fork_tip == trio.head
+    assert raw_show(trio.work, f'HEAD:{cm}').decode('utf-8') == apply_hooks(cm, theirs[cm])
+    assert BUDOKAI + ORCHESTRA + '    field2: F2 = Field(default_factory=F2)\n' in apply_hooks(cm, theirs[cm])
 
 
 def test_push_failure_keeps_local_merge(trio, tmp_path):
