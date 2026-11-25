@@ -8,6 +8,7 @@ config/t.json，不碰仓库自己的 config/ 和 log/。
 import asyncio
 import logging
 import shutil
+import sys
 import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -155,7 +156,10 @@ def errors(caplog) -> list[str]:
 
 # ---------- 护栏 ----------
 
-def test_the_real_process_table_is_guarded_by_default():
+def test_the_real_process_table_is_guarded_by_default(monkeypatch, tmp_path):
+    # 护栏失效时以 ImportError 失败，不导入真的 MainManager；ScriptProcess 查 config/ 也落在 tmp_path，不碰仓库
+    monkeypatch.setitem(sys.modules, 'module.server.main_manager', None)
+    monkeypatch.chdir(tmp_path)
     with pytest.raises(AssertionError):
         instance_control._manager()
     with pytest.raises(AssertionError):
@@ -407,14 +411,24 @@ def test_a_merge_restart_queued_behind_a_pause_leaves_the_instance_stopped(journ
     process = GatedInstance(journal)
     table(monkeypatch, journal, t=process)
     mid_row()   # 序列在跑：state running，进度 row_running
+    seen: list[str] = []
+    real_restart = instance_control.restart_instance
+
+    async def queued_restart(*args, **kwargs):
+        seen.append('queued')   # 过了快照的预过滤，进了 restart_instance
+        return await real_restart(*args, **kwargs)
+    monkeypatch.setattr(instance_control, 'restart_instance', queued_restart)
 
     async def merge_restart_during_pause():
         pause = asyncio.create_task(post_command('t', {'action': 'pause'}))
         while 'stop:begin' not in journal and not pause.done():   # 暂停拿着锁，正在停实例
             await asyncio.sleep(0.01)
-        restart = asyncio.create_task(restart_running_instances())   # 合并上游后的重启：t 这时还在跑
+        # 合并上游后的重启读到 t 还在跑。真的 stop() 第一句就置 INACTIVE，替身放闸后才置：
+        # 模拟前面还有一项操作持锁、重启读到的状态已过时
+        restart = asyncio.create_task(restart_running_instances())
         for _ in range(3):
             await asyncio.sleep(0)
+        assert seen == ['queued']   # 重启过了预过滤，进了 restart_instance
         assert not restart.done()   # 重启排在暂停后面等锁
         process.release.set()
         return await pause, await restart

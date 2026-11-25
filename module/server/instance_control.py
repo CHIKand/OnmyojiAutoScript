@@ -9,9 +9,13 @@ M3a 合并上游代码后用 restart_running_instances 让在跑的实例换上�
 
 排队只覆盖重启和编排命令。总览页的启停走上游的 websocket（script_router.py 的 websocket_endpoint 收到 start、stop
 直接 await 进程的 start()、stop()），不拿 instance_lock，可能与一条编排命令交错：
-- 总览页的启动落在命令的停与启之间：start_instance 看到进程没停，先停再启，不留下没人管的进程；
-- 总览页的停止落在中间，不兜：上游先把状态标成 INACTIVE 再结束进程，命令的 stop_instance 落在这两步之间就会跳过，
-  命令可能在旧进程退出前的几毫秒里写配置。
+- 总览页的启动在命令启动之前已经走完：start_instance 看到进程没停，先停再启，不留下没人管的进程。
+  总览页的 start() 若卡在广播里、跨过了命令的启动，恢复后仍会另起一个进程，命令起的那个没人管
+  （上游 start() 里的 self.stop() 没 await）；
+- 总览页的停止落在中间，不兜：上游先把状态标成 INACTIVE、广播之后才结束进程，
+  命令的 stop_instance 落在这两步之间就会跳过，命令会在旧进程退出前写配置；广播挂起得久时，继续、开始还会留下
+  一个停不掉的旧进程（状态 RUNNING、_process 为 None），要重启服务才能清掉。
+  两种残留都要上游的广播真的挂起（写缓冲满、连接正在关闭），本机少见。
 
 不在模块顶层导入 module.server.main_manager：它一导入就扫描 config/、给每个实例建进程对象并启动推送线程。
 需要进程表时经 _manager() 现取，测试里把它换成假的。

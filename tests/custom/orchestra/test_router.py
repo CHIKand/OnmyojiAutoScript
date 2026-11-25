@@ -447,6 +447,11 @@ def test_restart_endpoint(instance_dir, monkeypatch):
     assert asyncio.run(post_restart('t')) == {'ok': True}
     assert process.calls == ['stop', 'start']
 
+    stopped = FakeProcess(ScriptState.INACTIVE)   # 停着的实例照旧重启：端点不传 running_only
+    use_fake_manager(monkeypatch, t=stopped)
+    assert asyncio.run(post_restart('t')) == {'ok': True}
+    assert stopped.calls == ['stop', 'start']
+
     use_fake_manager(monkeypatch)   # 配置在，进程表里没有（比如服务启动后才新建、还没启动过的实例）
     assert asyncio.run(post_restart('t')) == {'ok': False}
 
@@ -455,12 +460,20 @@ def test_restart_running_instances_skips_an_instance_stopped_while_it_waited(mon
     # 另一项操作持着 instance_lock('t')；重启在 t 为 RUNNING 时排上锁；那项操作把 t 改成 INACTIVE 后放锁
     process = FakeProcess(ScriptState.RUNNING)
     use_fake_manager(monkeypatch, t=process)
+    seen: list[str] = []
+    real_restart = instance_control.restart_instance
+
+    async def queued_restart(*args, **kwargs):
+        seen.append('queued')   # 过了快照的预过滤，进了 restart_instance
+        return await real_restart(*args, **kwargs)
+    monkeypatch.setattr(instance_control, 'restart_instance', queued_restart)
 
     async def queued_behind_a_stop() -> list[str]:
-        async with instance_lock('t'):   # 比如一条暂停命令
+        async with instance_lock('t'):   # 模拟前面还有一项操作持锁、重启读到的状态已过时
             restart = asyncio.create_task(restart_running_instances())
             for _ in range(3):
                 await asyncio.sleep(0)
+            assert seen == ['queued']   # 重启过了预过滤，进了 restart_instance
             assert not restart.done()   # 重启看到 t 在跑，排在锁上
             process.state = ScriptState.INACTIVE   # 暂停把实例停下了
         return await restart
