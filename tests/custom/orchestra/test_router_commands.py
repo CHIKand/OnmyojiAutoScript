@@ -153,6 +153,15 @@ def errors(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
 
 
+# ---------- 护栏 ----------
+
+def test_the_real_process_table_is_guarded_by_default():
+    with pytest.raises(AssertionError):
+        instance_control._manager()
+    with pytest.raises(AssertionError):
+        instance_control.ScriptProcess('t')
+
+
 # ---------- 暂停 ----------
 
 @pytest.mark.parametrize('present, state, stops', [
