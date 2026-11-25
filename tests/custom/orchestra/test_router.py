@@ -29,7 +29,8 @@ from module.orchestra.engine import sync_controls
 from module.orchestra.progress import Progress, progress_path, save_progress
 from module.server import instance_control, orchestra_router
 from module.server.custom_routes import register_custom
-from module.server.instance_control import instance_names, post_restart, restart_instance, restart_running_instances
+from module.server.instance_control import (instance_lock, instance_names, post_restart, restart_instance,
+                                            restart_running_instances, start_instance)
 from module.server.orchestra_router import get_orchestra, post_command, put_orchestra
 from module.server.script_process import ScriptState
 
@@ -448,6 +449,57 @@ def test_restart_endpoint(instance_dir, monkeypatch):
 
     use_fake_manager(monkeypatch)   # 配置在，进程表里没有（比如服务启动后才新建、还没启动过的实例）
     assert asyncio.run(post_restart('t')) == {'ok': False}
+
+
+def test_restart_running_instances_skips_an_instance_stopped_while_it_waited(monkeypatch):
+    # 另一项操作持着 instance_lock('t')；重启在 t 为 RUNNING 时排上锁；那项操作把 t 改成 INACTIVE 后放锁
+    process = FakeProcess(ScriptState.RUNNING)
+    use_fake_manager(monkeypatch, t=process)
+
+    async def queued_behind_a_stop() -> list[str]:
+        async with instance_lock('t'):   # 比如一条暂停命令
+            restart = asyncio.create_task(restart_running_instances())
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert not restart.done()   # 重启看到 t 在跑，排在锁上
+            process.state = ScriptState.INACTIVE   # 暂停把实例停下了
+        return await restart
+
+    restarted = asyncio.run(queued_behind_a_stop())
+    assert restarted == []
+    assert process.calls == []
+
+
+@pytest.mark.parametrize('present', [True, False])
+def test_restart_instance_running_only_skips_a_stopped_or_missing_instance(monkeypatch, present):
+    # present 时表里有 INACTIVE 的 t，否则表是空的
+    processes = {'t': FakeProcess(ScriptState.INACTIVE)} if present else {}
+    use_fake_manager(monkeypatch, **processes)
+    assert asyncio.run(restart_instance('t', running_only=True)) is False
+    if present:
+        assert processes['t'].calls == []   # 不停、不启
+
+
+def test_restart_instance_still_restarts_a_stopped_instance_by_default(monkeypatch):
+    process = FakeProcess(ScriptState.INACTIVE)
+    use_fake_manager(monkeypatch, t=process)
+    assert asyncio.run(restart_instance('t')) is True
+    assert process.calls == ['stop', 'start']
+
+
+@pytest.mark.parametrize('state', [ScriptState.RUNNING, ScriptState.WARNING, ScriptState.UPDATING])
+def test_start_instance_stops_a_live_process_first(monkeypatch, state):
+    process = FakeProcess(state)
+    use_fake_manager(monkeypatch, t=process)
+    asyncio.run(start_instance('t'))
+    assert process.calls == ['stop', 'start']
+
+
+def test_start_instance_starts_a_stopped_process_directly(monkeypatch):
+    process = FakeProcess(ScriptState.INACTIVE)
+    use_fake_manager(monkeypatch, t=process)
+    asyncio.run(start_instance('t'))
+    assert process.calls == ['start']
 
 
 # ---------- 注册与导入 ----------

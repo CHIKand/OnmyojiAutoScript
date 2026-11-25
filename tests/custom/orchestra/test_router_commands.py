@@ -22,7 +22,7 @@ from module.orchestra.mapping import apply_row, serialize_value
 from module.orchestra.model import OrchestraRow
 from module.orchestra.progress import Progress, load_progress, progress_path, progress_to_dict, save_progress
 from module.server import instance_control, orchestra_router
-from module.server.instance_control import restart_instance
+from module.server.instance_control import restart_instance, restart_running_instances
 from module.server.orchestra_router import post_command
 from module.server.script_process import ScriptState
 from tasks.Orochi.config import Layer
@@ -252,6 +252,22 @@ def test_resume_starts_instance_after_writing(journal, monkeypatch, state, expec
     assert process.state == ScriptState.RUNNING
 
 
+def test_resume_stops_an_instance_started_elsewhere_before_starting_it(journal, monkeypatch):
+    process = Instance(journal, ScriptState.INACTIVE)
+    table(monkeypatch, journal, t=process)
+    set_orchestra(state='paused', command='start', command_seq=1)
+    save_progress(progress_path('t'), Progress(phase='row_running', paused=True, last_command_seq=1))
+    journal_write = config_model.write_file
+
+    def write_then_started_elsewhere(path, data):
+        journal_write(path, data)
+        process.state = ScriptState.RUNNING   # 总览页的启动落在命令写完配置之后、启动实例之前
+
+    monkeypatch.setattr(config_model, 'write_file', write_then_started_elsewhere)
+    assert send(journal, 'resume') == {'ok': True}
+    assert journal == [('config', 'running'), 'stop', 'start']   # 先停下别处起的进程，再启动
+
+
 # ---------- 停止 ----------
 
 def test_stop_resets_progress_and_restores(journal, monkeypatch):
@@ -372,6 +388,44 @@ def test_a_command_waits_for_a_restart_of_the_same_instance(journal, monkeypatch
     assert asyncio.run(both()) == [True, {'ok': True}]
     assert journal == ['stop:begin', 'stop:end', 'start',   # 重启先拿到锁
                        'stop:begin', 'stop:end', ('config', 'paused'), ('progress', 'row_running')]
+
+
+def test_a_merge_restart_queued_behind_a_pause_leaves_the_instance_stopped(journal, monkeypatch):
+    class GatedInstance(Instance):
+        """stop 记下 stop:begin 就等测试放行，放行后才停下、记 stop:end。"""
+
+        def __init__(self, journal: list, state: ScriptState = ScriptState.RUNNING):
+            super().__init__(journal, state)
+            self.release = asyncio.Event()
+
+        async def stop(self) -> None:
+            self.journal.append('stop:begin')
+            await self.release.wait()
+            self.state = ScriptState.INACTIVE
+            self.journal.append('stop:end')
+
+    process = GatedInstance(journal)
+    table(monkeypatch, journal, t=process)
+    mid_row()   # 序列在跑：state running，进度 row_running
+
+    async def merge_restart_during_pause():
+        pause = asyncio.create_task(post_command('t', {'action': 'pause'}))
+        while 'stop:begin' not in journal and not pause.done():   # 暂停拿着锁，正在停实例
+            await asyncio.sleep(0.01)
+        restart = asyncio.create_task(restart_running_instances())   # 合并上游后的重启：t 这时还在跑
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not restart.done()   # 重启排在暂停后面等锁
+        process.release.set()
+        return await pause, await restart
+
+    journal.clear()
+    paused, restarted = asyncio.run(merge_restart_during_pause())
+    assert paused == {'ok': True}
+    assert 'start' not in journal[journal.index('stop:end'):]   # 暂停把实例停下之后，没有谁再启动它
+    assert restarted == []
+    assert ConfigModel('t').orchestra.state == 'paused'
+    assert process.state == ScriptState.INACTIVE
 
 
 # ---------- 出错 ----------

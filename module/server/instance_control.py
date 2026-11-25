@@ -7,6 +7,12 @@
 M3a 合并上游代码后用 restart_running_instances 让在跑的实例换上新代码，单个实例用 POST /custom/instance/{name}/restart；
 编排的开始、暂停、继续、停止经 stop_instance、start_instance 停启实例。
 
+排队只覆盖重启和编排命令。总览页的启停走上游的 websocket（script_router.py 的 websocket_endpoint 收到 start、stop
+直接 await 进程的 start()、stop()），不拿 instance_lock，可能与一条编排命令交错：
+- 总览页的启动落在命令的停与启之间：start_instance 看到进程没停，先停再启，不留下没人管的进程；
+- 总览页的停止落在中间，不兜：上游先把状态标成 INACTIVE 再结束进程，命令的 stop_instance 落在这两步之间就会跳过，
+  命令可能在旧进程退出前的几毫秒里写配置。
+
 不在模块顶层导入 module.server.main_manager：它一导入就扫描 config/、给每个实例建进程对象并启动推送线程。
 需要进程表时经 _manager() 现取，测试里把它换成假的。
 """
@@ -59,20 +65,26 @@ async def stop_instance(name: str) -> None:
 
 
 async def start_instance(name: str) -> None:
-    """启动实例进程，await 到 start() 返回。进程表里没有这个实例时，照上游 /{name}/start 的做法先建进程对象。
-    调用方持 instance_lock，并已用 stop_instance 停下它：start() 遇到还活着的旧进程时停不掉它，见文件开头。"""
+    """启动实例进程，await 到 start() 返回。进程表里没有这个实例时，照上游 /{name}/start 的做法先建进程对象，不用停。
+    进程没停（状态不是 INACTIVE，比如总览页刚把它启动）时先 await stop() 再启动：start() 遇到还活着的旧进程时停不掉它，
+    见文件开头。调用方持 instance_lock。"""
     processes = _manager().script_process
     process = processes.get(name)
     if process is None:
         process = processes[name] = ScriptProcess(name)
+    elif process.state != ScriptState.INACTIVE:
+        await process.stop()
     await process.start()
 
 
-async def restart_instance(name: str) -> bool:
-    """重启一个实例：先 stop() 再 start()，都 await；同一个实例的重启与编排命令按先后排队。进程表里没有这个实例返回 False。"""
+async def restart_instance(name: str, running_only: bool = False) -> bool:
+    """重启一个实例：先 stop() 再 start()，都 await；同一个实例的重启与编排命令按先后排队。进程表里没有这个实例返回 False。
+    running_only 为 True 时只重启没停的实例：拿到锁之后再看状态，已停着（INACTIVE）的返回 False，不停也不启。
+    排队期间前面的暂停、停止可能刚把它停下，拿锁之前看到的状态已经过时。只有 restart_running_instances 传它；
+    POST /custom/instance/{name}/restart 不传，停着的实例照旧重启。"""
     async with instance_lock(name):
         process = _manager().script_process.get(name)
-        if process is None:
+        if process is None or (running_only and process.state == ScriptState.INACTIVE):
             return False
         await process.stop()
         await process.start()
@@ -81,12 +93,13 @@ async def restart_instance(name: str) -> bool:
 
 
 async def restart_running_instances() -> list[str]:
-    """重启所有没停的实例（状态不是 INACTIVE），返回重启成了的名字。停着的不动，不替用户启动。
+    """重启所有没停的实例（状态不是 INACTIVE），返回重启成了的名字。停着的不动，不替用户启动：是否停着在拿到实例锁之后
+    判断，排在暂停、停止后面、等锁期间被停下的实例也不动。快照里已停着的不去排队。
     一个实例出错只记日志（带调用栈），不挡着其余的，也不列进返回值。"""
     restarted: list[str] = []
     for name, process in list(_manager().script_process.items()):   # 重启中途进程表可能被别的请求改动，先取快照
         try:
-            if process.state != ScriptState.INACTIVE and await restart_instance(name):
+            if process.state != ScriptState.INACTIVE and await restart_instance(name, running_only=True):
                 restarted.append(name)
         except Exception:
             logger.exception(f'[{name}] 实例重启失败')
