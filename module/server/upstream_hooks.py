@@ -29,7 +29,8 @@ class Hook:
 
     path：相对仓库根，正斜杠。anchor：定位行整行原文，含缩进，不含换行符。
     action：after / before 在定位行之后 / 之前插入 lines；replace 用 lines 换掉定位行；replace_body 保留定位行
-    （顶格的 def 行），把它下面的函数体换成 lines，函数体怎么算见 _body。
+    （顶格的 def 行），把它下面的函数体换成 lines。函数体到下一处顶格、且不是 # 注释的非空行之前为止，末尾的空行和
+    顶格注释不算，细节见 _body。
     lines：要放进去的行，每项一行，含缩进，不含换行符。
     """
     path: str
@@ -151,8 +152,7 @@ def apply_hooks(path: str, text: str, hooks: Sequence[Hook] = HOOKS) -> str:
     先在原始 text 上按清单顺序逐条找定位行，不是恰好出现 1 次就抛 HookError（报第一条不合格的）；全部找到才动手，
     所以每条入口的位置都按原始 text 算，互不影响。共用一行定位行的 before 和 after 分别落在这一行的前后。
     换行符：text 里有 \\r\\n 就用 \\r\\n，否则用 \\n；末尾有没有换行，保持原样。
-    两条入口改到同一处（同一行替换两次，或者定位行落在另一条 replace_body 的函数体里），或者动作不认识，是清单本身
-    写错了，不是官方改动造成的：抛 ValueError。
+    两条入口换掉的行有重叠，或者动作不认识，是清单本身写错了，不是官方改动造成的：抛 ValueError。
     """
     mine = [hook for hook in hooks if hook.path == path]
     if not mine:
@@ -225,12 +225,15 @@ def _span(hook: Hook, lines: list[str], at: int) -> tuple[int, int]:
 
 
 def _body(lines: list[str], at: int) -> tuple[int, int]:
-    """第 at 行（def 行）下面的函数体范围 [start, end)：从下一行开始，到下一处非空、且不以空白开头的行之前为止。
-    末尾的空行（含只有空白的行）不算函数体，原样留着。只适用于顶格的函数：方法的 def 行有缩进，这样算会越过函数末尾。"""
+    """第 at 行（def 行）下面的函数体范围 [start, end)。只看文本，不解析语法：
+    从下一行开始往下，越过空行、以空白开头的行和顶格的 # 注释行，停在第一处非空、既不以空白开头也不以 # 开头的行之前；
+    再从末尾往回，末尾的空行（含只有空白的行）和顶格的 # 注释行不算函数体，它们属于下一段代码，原样留着。
+    所以函数体中间按第一列注释掉的代码算函数体，随函数体一起换掉。函数体里的多行字符串或括号续行如果有顶格、
+    不以 # 开头的行，范围会在那里提前结束。只适用于顶格的函数：方法的 def 行有缩进，这样算会越过函数末尾。"""
     start = end = at + 1
-    while end < len(lines) and (not lines[end] or lines[end][0].isspace()):
+    while end < len(lines) and (not lines[end] or lines[end][0].isspace() or lines[end][0] == '#'):
         end += 1
-    while end > start and not lines[end - 1].strip():
+    while end > start and (not lines[end - 1].strip() or lines[end - 1][0] == '#'):
         end -= 1
     return start, end
 

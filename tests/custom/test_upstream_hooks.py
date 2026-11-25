@@ -37,6 +37,20 @@ def test_replace_body_keeps_the_def_line_and_the_trailing_blank_lines():
         'import a\n\ndef f():\n    return 0\n\n\ndef g():\n    pass\n')
 
 
+def test_replace_body_takes_a_column_0_comment_inside_the_body_along():
+    # 函数体中间按第一列注释掉的代码（PyCharm 默认这样注释）算函数体：随函数体一起换掉，注释下面的官方代码不留下
+    text = 'def f():\n    x = 1\n#    y = 2\n    return x\n\n\ndef g():\n    pass\n'
+    assert apply_hooks('m.py', text, (hk('replace_body', 'def f():', '    return 0'),)) == (
+        'def f():\n    return 0\n\n\ndef g():\n    pass\n')
+
+
+def test_replace_body_leaves_a_column_0_comment_between_functions_in_place():
+    # 函数体后面的顶格注释，紧跟着的也好、隔着空行的分节注释也好，都属于下一段代码，原样留着
+    text = 'def f():\n    x = 1\n# end of f\n\n# ---- section ----\n\n@d\ndef g():\n    pass\n'
+    assert apply_hooks('m.py', text, (hk('replace_body', 'def f():', '    return 0'),)) == (
+        'def f():\n    return 0\n# end of f\n\n# ---- section ----\n\n@d\ndef g():\n    pass\n')
+
+
 @pytest.mark.parametrize('text, needle', [
     (SAMPLE.replace('import a', 'import z'), '找不到这一行：import a'),
     (SAMPLE + 'import a\n', '这一行出现了 2 次：import a'),
@@ -45,6 +59,17 @@ def test_an_anchor_must_appear_exactly_once(text, needle):
     with pytest.raises(HookError) as caught:
         apply_hooks('m.py', text, (hk('after', 'import a', 'import b'),))
     assert str(caught.value) == f'm.py 的第 1 条入口{needle}'
+
+
+def test_the_reason_numbers_hooks_per_file_and_cuts_the_anchor_at_60_characters():
+    # "第 n 条"只数同一文件的入口，排在前面的别的文件的入口不算；定位行去掉首尾空白后只留前 60 个字符
+    anchor = '    budokai_tournament: BudokaiTournament = Field(default_factory=BudokaiTournament)'     # 去掉缩进 80 个字符
+    hooks = (Hook('other.py', 'import a', 'after', ('import b',)), hk('after', 'import a', 'import b'),
+             hk('after', anchor, '    orchestra = 1'))
+    with pytest.raises(HookError) as caught:
+        apply_hooks('m.py', SAMPLE, hooks)
+    assert str(caught.value) == ('m.py 的第 2 条入口找不到这一行：'
+                                 'budokai_tournament: BudokaiTournament = Field(default_factor')
 
 
 def test_indentation_must_match():
@@ -78,6 +103,16 @@ def test_overridden_bodies_reports_only_a_changed_body():
     assert (found.path, found.function) == ('m.py', 'f')
     assert '-    x = 1' in found.diff and '+    x = 3' in found.diff
     assert overridden_bodies('m.py', SAMPLE, SAMPLE, hooks) == []
+
+
+def test_overridden_bodies_sees_a_change_below_a_column_0_comment():
+    # 共同祖先和官方都有那行顶格注释：注释下面的改动也是函数体的改动，要报出来
+    hooks = (hk('replace_body', 'def f():', '    return 0'),)
+    base = 'def f():\n    x = 1\n#    y = 2\n    return x\n\n\ndef g():\n    pass\n'
+    (found,) = overridden_bodies('m.py', base, base.replace('    return x', '    return x + 1'), hooks)
+    assert (found.path, found.function) == ('m.py', 'f')
+    assert found.diff == ('--- 共同祖先\n+++ 官方\n@@ -1,3 +1,3 @@\n     x = 1\n #    y = 2\n'
+                          '-    return x\n+    return x + 1\n')
 
 
 def test_hooks_reproduce_the_seven_files():
