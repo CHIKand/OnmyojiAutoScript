@@ -31,6 +31,7 @@ HISTORY_LIMIT = 15                     # 更新页列出的上游提交数，与
 ERROR_STATUS = 'error'                 # 不是 merge_upstream 给的状态：合并过程中出了意外，没有来得及得出结果
 RESTART_STATUSES = frozenset({'merged', 'pushed'})     # 另外还有本地合并了、推送失败的 push_failed，见 _restarts
 CHECKOUT_CHANGED = frozenset({'merged', 'pushed', 'needs_install'})   # 同上，见 _changed_checkout
+MERGED_THIS_CALL = frozenset({'merged', 'needs_install'})             # 同上，见 _merged_this_call
 DEPENDENCY_NOTE = '；依赖有变化，请在 OASX 重启服务以安装新依赖'
 SERVER_CODE_NOTE = '；服务端代码有变化，请在 OASX 重启服务以完整生效'
 RESTART_FAILED_NOTE = '；重启实例失败，请在总览页手动重启'
@@ -263,19 +264,28 @@ def _changed_checkout(result: MergeResult) -> bool:
     return result.status in CHECKOUT_CHANGED or (result.status == 'push_failed' and result.merged_locally)
 
 
+def _merged_this_call(result: MergeResult) -> bool:
+    """这次调用做成了合并、造出了合并提交：merged、needs_install，以及本地合并了但推送失败的 push_failed。
+    自动处理之后自检没过的 smoke_failed 也带着 rehooked，但合并已经中止，不算。"""
+    return result.status in MERGED_THIS_CALL or (result.status == 'push_failed' and result.merged_locally)
+
+
 def message_of(result: MergeResult, restarted: list[str] | None) -> str:
     """合并结果的提示文案，OASX 更新页和日志里都显示它。restarted 是实际重启了的实例名，None 表示重启时出错。
 
-    几个固定文案（已是最新、合并成功、代码冲突、推送失败）出自计划，不要改字；其余状态的文案与它们同风格。
+    几个固定文案（已是最新、合并成功、代码冲突、推送失败，以及代码冲突自动处理的几句）出自计划，不要改字；其余状态的
+    文案与它们同风格。
     推送失败分两种：这次合并了、没推上去（merged_locally）用计划的文案，末尾接重启结果；补推之前的本地提交又失败了，
     说还有几个提交没推上去，不重启。推送失败的原因归成一句（push_reason）。
     重启了实例的状态，末尾写"已重启实例：<名字>"（一个都没有写"无"），重启出错时改写"重启实例失败……"。
     缺上游新增的依赖时（needs_install，或者它推送失败）末尾改说依赖的事，实例没有重启。
-    之后按顺序追加：服务端代码有变化的提示（只在这次改了运行目录代码的状态上）、依赖有变化的提示（requirements_changed
-    为真时，不管什么状态，都在最末尾）。
+    之后按顺序追加：代码冲突自动处理过的说明（rehooked 非空、并且这次做成了合并时，见 _merged_this_call：处理了几个
+    文件、备份在哪，再给每个官方改过、被我们覆盖的函数体一句）、服务端代码有变化的提示（只在这次改了运行目录代码的
+    状态上）、依赖有变化的提示（requirements_changed 为真时，不管什么状态，都在最末尾）。
     dirty 的说明只列前 LIST_LIMIT 行，多出来的行数记在末尾（"等 N 项"），再接一句怎么处理这些改动；代码冲突的文件
-    最多列 LIST_LIMIT 个；fetch_failed 只留最后一个非空行（git 的最终报错），并说清拉取的是 fork 还是上游；
-    conflict_aborted 没有冲突文件时合并根本没开始，不说成代码冲突。
+    最多列 LIST_LIMIT 个，自动处理没成功时（rehook_error）接着写原因，有备份时再写备份在哪；fetch_failed 只留最后
+    一个非空行（git 的最终报错），并说清拉取的是 fork 还是上游；conflict_aborted 没有冲突文件时合并根本没开始，
+    不说成代码冲突。
     """
     status, commits, detail = result.status, result.commits, result.message.strip()
     if restarted is None:
@@ -294,6 +304,10 @@ def message_of(result: MergeResult, restarted: list[str] | None) -> str:
         text = f'{pushed}{restart}'
     elif status == 'conflict_aborted' and result.conflicts:
         text = f'合并上游遇到代码冲突，已中止，分支未改动：{_capped(result.conflicts)}'
+        if result.rehook_error:             # 冲突都在入口文件里，自动处理没成功
+            text += f'；自动处理没成功：{result.rehook_error}'
+            if result.backup:
+                text += f'；处理前的原文件备份在 {result.backup}'
     elif status == 'conflict_aborted':      # 合并根本没开始（有未跟踪的文件挡着、index.lock……）
         text = f'合并未能开始，分支未改动：{_summary(detail)}'
     elif status == 'push_failed' and result.merged_locally:
@@ -319,6 +333,10 @@ def message_of(result: MergeResult, restarted: list[str] | None) -> str:
         text = f'合并上游后自检失败，已中止，分支未改动：{detail}'
     else:                       # ERROR_STATUS，以及 fork_git 以后新增、这里还不认识的状态
         text = f'合并上游时出现意外错误，请查看服务日志：{detail or status}'
+    if result.rehooked and _merged_this_call(result):
+        text += (f'；{len(result.rehooked)} 个文件的代码冲突已自动处理（重接了定制入口），'
+                 f'处理前的原文件备份在 {result.backup}')
+        text += ''.join(f'；官方改过 {item}，已用我们的版本覆盖，官方的改动存在备份里' for item in result.overridden)
     if result.server_code_changed and _changed_checkout(result):
         text += SERVER_CODE_NOTE
     return text + (DEPENDENCY_NOTE if result.requirements_changed else '')

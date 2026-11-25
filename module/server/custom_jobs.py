@@ -8,9 +8,10 @@ app.py 的 on_startup 经 custom_routes 调 start_custom_jobs()，起一个名�
 每次检查都重新读，改了不用重启。当天已过这个时刻、当天的合并还没用掉，就让服务的事件循环跑 fork_updater.run_update_result：
 与更新页的按钮同一条路径（同一把锁，代码变了同样重启实例，同样的文案），线程在这里等它做完，把文案记进日志（只在这里记一次）。
 时刻错过了（电脑休眠，或服务当时没开）不要紧：之后第一次检查发现"过了时刻、今天的还没用掉"就补跑，线程一启动就先查一次。
-结果需要人处理时，再发一条飞书通知（feishu_app.notify_server_event，发给各实例配置里开着飞书推送的接收方）：第一行点明结果、
-说需人工处理，下面是这条文案。用排除法（merge_notice），只有这三种不发：已是最新；合并或补推成功，重启实例没出错，依赖也没变
-（文案里没有 DEPENDENCY_NOTE）；还会重试的拉取失败。其余结果都发，包括合并没给出结果和以后新增的状态。更新页的按钮不发。
+结果需要人处理，或者合并时自动处理了代码冲突（重接了定制入口），再发一条飞书通知（feishu_app.notify_server_event，发给各实例
+配置里开着飞书推送的接收方）：第一行点明结果（要人处理的说需人工处理），下面是这条文案。用排除法（merge_notice），只有这三种
+不发：已是最新；合并或补推成功，重启实例没出错，依赖也没变（文案里没有 DEPENDENCY_NOTE），也没有自动处理代码冲突；还会重试的
+拉取失败。其余结果都发，包括合并没给出结果和以后新增的状态。更新页的按钮不发。
 
 一天只合并一次：每次试之前先把今天记成用掉了，不论结果好坏。唯一的例外是拉取失败（fetch_failed，比如电脑刚醒、网络还没通）：
 拿到这个结果后把今天退回去，RETRY_DELAY 之后再试，一天最多试 MAX_ATTEMPTS 次，最后一次也失败就用掉今天。出错、等不到结果、
@@ -51,7 +52,7 @@ MERGE_TIME_KEY = 'OAS_UPSTREAM_MERGE_TIME'
 STATE_KEY = 'upstream_merge_last_run'
 ATTEMPTS_KEY = 'upstream_merge_attempts'
 LAST_ATTEMPT_KEY = 'upstream_merge_last_attempt'
-FEISHU_MERGE_TITLE = 'OAS 合并上游'                  # 每日定时合并需要人处理时飞书通知的标题
+FEISHU_MERGE_TITLE = 'OAS 合并上游'                  # 每日定时合并飞书通知的标题
 FEISHU_MERGE_HEADLINES = {                          # 飞书通知的第一行：点明结果，说要人处理；下面接更新页的同一句文案
     'conflict_aborted': '合并上游有代码冲突，需人工处理',                # 计划书 §6.3 的原话
     'push_failed': '合并上游时推送到 fork 失败，需人工处理',
@@ -66,6 +67,7 @@ FEISHU_MERGE_HEADLINES = {                          # 飞书通知的第一行�
 FEISHU_MERGE_NOT_STARTED = '合并上游未能开始，需人工处理'          # conflict_aborted 却没有冲突文件：合并根本没开始
 FEISHU_MERGE_RESTART_FAILED = '合并上游后重启实例失败，需人工处理'   # merged、pushed 的文案里有 RESTART_FAILED_NOTE
 FEISHU_MERGE_DEPENDENCIES_CHANGED = '合并上游后依赖有变化，需人工处理'   # merged、pushed 的文案里有 DEPENDENCY_NOTE
+FEISHU_MERGE_REHOOKED = '合并上游时自动处理了代码冲突'      # merged、pushed 的 rehooked 非空，文案里没有上面那两条提示：只是告知
 _HHMM = re.compile(r'([01][0-9]|2[0-3]):([0-5][0-9])')
 
 
@@ -88,12 +90,13 @@ def merge_due(now: datetime, hhmm: str | None, last_run: date | None) -> bool:
 
 
 def merge_notice(result: MergeResult | None, message: str, last_attempt: bool) -> str | None:
-    """每日定时合并的这个结果要不要发飞书通知：要发时返回通知正文，第一行点明结果、说要人处理，下面是 message（更新页的
-    同一句文案，一字不改）；不发时返回 None。last_attempt：这是不是今天最后一次尝试。纯函数。
+    """每日定时合并的这个结果要不要发飞书通知：要发时返回通知正文，第一行点明结果（要人处理的说需人工处理），下面是 message
+    （更新页的同一句文案，一字不改）；不发时返回 None。last_attempt：这是不是今天最后一次尝试。纯函数。
 
     用排除法，fork_git 以后新增的状态也会通知。不发的只有：已是最新（up_to_date）；合并或补推成功（merged、pushed），
-    文案里也没有重启实例失败（RESTART_FAILED_NOTE），依赖也没变（文案里没有 DEPENDENCY_NOTE）；不是今天最后一次的
-    拉取失败（fetch_failed，过 RETRY_DELAY 再试）。重启失败和依赖有变化都有时，第一行说重启失败：实例可能已经停着。
+    文案里也没有重启实例失败（RESTART_FAILED_NOTE），依赖也没变（文案里没有 DEPENDENCY_NOTE），也没有自动处理代码冲突
+    （rehooked 为空）；不是今天最后一次的拉取失败（fetch_failed，过 RETRY_DELAY 再试）。merged、pushed 发通知时，第一行
+    取最紧急的一条：重启失败（实例可能已经停着）> 依赖有变化 > 自动处理了代码冲突（只是告知，不写需人工处理）。
     合并没给出结果（result 为 None）按意外错误通知。conflict_aborted 没有冲突文件时合并根本没开始，同 message_of，不说成代码冲突。
     """
     status = fork_updater.ERROR_STATUS if result is None else result.status
@@ -104,6 +107,8 @@ def merge_notice(result: MergeResult | None, message: str, last_attempt: bool) -
             headline = FEISHU_MERGE_RESTART_FAILED
         elif fork_updater.DEPENDENCY_NOTE in message:
             headline = FEISHU_MERGE_DEPENDENCIES_CHANGED
+        elif result.rehooked:
+            headline = FEISHU_MERGE_REHOOKED
         else:
             return None
     elif status == 'conflict_aborted' and not result.conflicts:

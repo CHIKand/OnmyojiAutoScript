@@ -445,14 +445,16 @@ def test_the_immediate_send_is_a_flush_round(tmp_path):
 CONFLICT_HEADLINE = '合并上游有代码冲突，需人工处理'                      # 计划书 §6.3 的原话
 RESTARTED = '已合并上游 3 个提交并推送到 fork；已重启实例：oas1'
 RESTART_FAILED = '已合并上游 3 个提交并推送到 fork' + fork_updater.RESTART_FAILED_NOTE
+REHOOKED_NOTE = '；1 个文件的代码冲突已自动处理（重接了定制入口），处理前的原文件备份在 log/merge_backup/2026-11-26_101500'
 
 
 def run_daily_merge(monkeypatch, status: str | None, *, message: str = MERGE_MESSAGE, conflicts: tuple = (),
-                    attempts_before: int = 0) -> None:
+                    attempts_before: int = 0, rehooked: tuple = ()) -> None:
     """跑一轮每日定时合并的检查，合并结果的状态为 status（None 表示合并没给出结果），文案为 message。
-    attempts_before：今天已经试过几次（都是拉取失败，上一次在 RETRY_DELAY 之前），这一次就是第 attempts_before + 1 次。"""
+    attempts_before：今天已经试过几次（都是拉取失败，上一次在 RETRY_DELAY 之前），这一次就是第 attempts_before + 1 次。
+    rehooked：合并时自动处理了代码冲突的入口文件。"""
     monkeypatch.setenv('OAS_UPSTREAM_MERGE_TIME', '04:30')
-    result = None if status is None else MergeResult(status, 0, [], list(conflicts), '')
+    result = None if status is None else MergeResult(status, 0, [], list(conflicts), '', rehooked=list(rehooked))
     monkeypatch.setattr(custom_jobs, '_merge_on_loop', lambda loop: (result, message))
     jobs = custom_jobs.CustomJobs(now=lambda: MERGE_TIME)
     if attempts_before:
@@ -537,6 +539,24 @@ def test_a_failed_restart_outranks_changed_dependencies(monkeypatch, merge_notic
     run_daily_merge(monkeypatch, 'merged', message=RESTART_FAILED + fork_updater.DEPENDENCY_NOTE)
     (_, text), _ = merge_notices[0]
     assert text.split('\n')[0] == '合并上游后重启实例失败，需人工处理'
+
+
+def test_a_rehooked_merge_sends_an_informational_notice(monkeypatch, merge_notices):
+    # 别的都顺利、只是自动处理了代码冲突：也发一条，告知而已，第一行不写"需人工处理"
+    message = RESTARTED + REHOOKED_NOTE
+    run_daily_merge(monkeypatch, 'merged', message=message, rehooked=('script.py',))
+    assert merge_notices == [((MERGE_TITLE, f'合并上游时自动处理了代码冲突\n{message}'), {})]
+
+
+@pytest.mark.parametrize('message, headline', [
+    (RESTART_FAILED + REHOOKED_NOTE, '合并上游后重启实例失败，需人工处理'),
+    (RESTARTED + REHOOKED_NOTE + fork_updater.DEPENDENCY_NOTE, '合并上游后依赖有变化，需人工处理'),
+    (RESTARTED + REHOOKED_NOTE, '合并上游时自动处理了代码冲突'),
+], ids=['restart-failed', 'dependencies-changed', 'rehooked-only'])
+def test_a_rehooked_merge_headline_priority(monkeypatch, merge_notices, message, headline):
+    # 第一行取最紧急的一条：重启失败 > 依赖变化 > 自动处理；正文照旧是更新页的同一句文案
+    run_daily_merge(monkeypatch, 'merged', message=message, rehooked=('script.py',))
+    assert merge_notices == [((MERGE_TITLE, f'{headline}\n{message}'), {})]
 
 
 def test_a_daily_merge_conflict_reaches_feishu(tmp_path, monkeypatch):

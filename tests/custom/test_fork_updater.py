@@ -765,6 +765,65 @@ def test_message_for_an_unexpected_error():
     assert message_of(result('error', message='OSError: boom'), []) == '合并上游时出现意外错误，请查看服务日志：OSError: boom'
 
 
+REHOOKED_TEXT = ('已合并上游 3 个提交并推送到 fork；已重启实例：oas1；2 个文件的代码冲突已自动处理（重接了定制入口），'
+                 '处理前的原文件备份在 log/merge_backup/2026-11-26_101500')
+OVERRIDDEN_TEXT = '；官方改过 module/server/home_router.py 的 update_info，已用我们的版本覆盖，官方的改动存在备份里'
+
+
+def rehooked_merge(**flags) -> MergeResult:
+    """代码冲突只在两个入口文件里、自动处理之后合并并推送成功的结果。"""
+    return result('merged', 3, rehooked=['script.py', 'module/server/app.py'],
+                  backup='log/merge_backup/2026-11-26_101500', **flags)
+
+
+def test_message_of_a_rehooked_merge():
+    assert message_of(rehooked_merge(), ['oas1']) == REHOOKED_TEXT
+
+
+def test_message_of_an_overridden_body():
+    outcome = rehooked_merge(overridden=['module/server/home_router.py 的 update_info'])
+    assert message_of(outcome, ['oas1']) == REHOOKED_TEXT + OVERRIDDEN_TEXT      # 每个被覆盖的函数体一句
+
+
+@pytest.mark.parametrize('flags, notes', [
+    ({'requirements': True}, DEPENDENCY_NOTE),
+    ({'requirements': True, 'server_code_changed': True}, SERVER_CODE_NOTE + DEPENDENCY_NOTE),
+], ids=['dependencies', 'server-code-and-dependencies'])
+def test_the_dependency_note_stays_last_after_rehook_notes(flags, notes):
+    outcome = rehooked_merge(overridden=['module/server/home_router.py 的 update_info'], **flags)
+    # 自动处理的几句在服务端代码和依赖的提示之前，依赖的提示仍在最末尾
+    assert message_of(outcome, ['oas1']) == REHOOKED_TEXT + OVERRIDDEN_TEXT + notes
+
+
+@pytest.mark.parametrize('outcome, expected', [
+    (result('needs_install', 3, merged_locally=True, missing_module='brandnew', rehooked=['script.py'],
+            backup='log/merge_backup/x'),
+     '已合并上游 3 个提交并推送到 fork；上游新增依赖 brandnew，请在 OASX 重启服务（启动器会先安装依赖），实例暂未重启'
+     '；1 个文件的代码冲突已自动处理（重接了定制入口），处理前的原文件备份在 log/merge_backup/x'),
+    (result('push_failed', 3, message='git push timed out after 300s', merged_locally=True, rehooked=['script.py'],
+            backup='log/merge_backup/x'),
+     '已在本地合并上游 3 个提交，但推送失败：网络不通或超时。启动器守卫会保护本地提交，请检查网络或令牌后重试；已重启实例：oas1'
+     '；1 个文件的代码冲突已自动处理（重接了定制入口），处理前的原文件备份在 log/merge_backup/x'),
+    # 自动处理之后自检没过，合并已中止：不说已自动处理
+    (result('smoke_failed', message='ImportError: x', rehooked=['script.py'], backup='log/merge_backup/x'),
+     '合并上游后自检失败，已中止，分支未改动：ImportError: x'),
+], ids=['needs-install', 'push-failed-after-merge', 'smoke-failed-after-rehook'])
+def test_only_the_statuses_that_merged_report_the_rehook(outcome, expected):
+    assert message_of(outcome, ['oas1']) == expected
+
+
+@pytest.mark.parametrize('error, backup, expected', [
+    ('script.py 里有入口清单以外的改动，自动处理会把它弄丢', 'log/merge_backup/x',
+     '合并上游遇到代码冲突，已中止，分支未改动：script.py；自动处理没成功：script.py 里有入口清单以外的改动，自动处理会把它弄丢'
+     '；处理前的原文件备份在 log/merge_backup/x'),
+    ('备份没写成（OSError: disk full）', '',                                    # 没有备份，不说备份在哪
+     '合并上游遇到代码冲突，已中止，分支未改动：script.py；自动处理没成功：备份没写成（OSError: disk full）'),
+], ids=['with-backup', 'backup-not-written'])
+def test_message_of_a_failed_rehook(error, backup, expected):
+    outcome = result('conflict_aborted', conflicts=['script.py'], rehook_error=error, backup=backup)
+    assert message_of(outcome, []) == expected
+
+
 # ---- git 可执行文件 --------------------------------------------------------------------------------------------
 
 def test_no_argument_construction_reads_the_deploy_config(tmp_path, monkeypatch):
