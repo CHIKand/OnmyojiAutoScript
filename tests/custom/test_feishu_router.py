@@ -566,6 +566,20 @@ def test_a_server_event_caps_each_line_and_the_whole_message(tmp_path, body):
     assert all(0 < len(line) <= 300 for line in lines)
 
 
+def test_a_huge_merge_error_keeps_its_headline_whole(tmp_path):
+    # 几百行长 stderr 的意外错误：整条超过上限要截短，第一行（结论和"需人工处理"）一个字不截
+    write_instance(tmp_path, 'oas1.json', notify_config=feishu_yaml('open_id', 'ou_1'))
+    headline = '合并上游出现意外错误，需人工处理'
+    stderr = [f'{i:03d} ' + 'x' * 296 for i in range(600)]
+    session = ok_session()
+    notify_server_event(MERGE_TITLE, '\n'.join([headline, '合并上游时出现意外错误，请查看服务日志：', *stderr]),
+                        root=tmp_path, session=session)
+    assert len(json.dumps(session.to(MESSAGES)[-1]['json']['content'])) <= 28_000
+    lines = texts(message(session))
+    assert lines[0] == headline
+    assert len(lines) > 1 and all(len(line) <= 1_000 for line in lines)
+
+
 def test_the_update_button_sends_nothing(monkeypatch):
     sent = []
     monkeypatch.setattr(feishu_app, 'notify_server_event', lambda *args, **kwargs: sent.append(args))

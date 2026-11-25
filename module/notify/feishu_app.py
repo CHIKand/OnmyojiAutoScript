@@ -47,7 +47,8 @@
 - 实例进程（on_script_loop_start 登记过截图来源的进程）合并同类错误：同一实例、标题和内容相同的报错在 aggregate_minutes
   分钟内只发第一条，窗口结束后由 flush_outbox 补发一条汇总，发给窗口里第一条的接收方。主进程的测试推送不合并。
 - 一条消息：标题，然后每行一段：错误摘要、正在跑的编排行、日志最后 30 行（脱敏），最后是截图。富文本请求体不超过
-  30 KB：标题和固定的行各截到 1,000 个字符，日志每行截到 300 个字符；超了从最早的日志行删起，还超就截短最长的固定行。
+  30 KB：标题和固定的行各截到 1,000 个字符，日志每行截到 300 个字符；超了从最早的日志行删起，还超就截短最长的固定行，
+  第一行不截。
   主进程的测试推送（/home/notify_test）没有截图，附一张生成的测试图，也不带日志尾（主进程的日志是服务的日志）。
 - 主进程自己的事件（每日定时合并上游需要人处理的结果）没有对应的推送配置：notify_server_event 发给各实例配置里
   开着飞书推送的接收方，只有文字（每行最多 300 个字符），不附图，不合并。
@@ -843,7 +844,8 @@ def _log_tail() -> list[str]:
 def _fit(title: str, fixed: list[str], log_lines: list[str]) -> list[str]:
     """拼出全部行，把富文本请求体控制在 30 KB 以内：固定的行（摘要、编排行、汇总行、主进程事件的各行）每行截到
     FIXED_LINE_MAX 个字符，日志每行截到 LOG_LINE_MAX 个字符；content 仍超过 POST_CONTENT_LIMIT 就从最早的日志行删起，
-    日志一行不剩时小标题也不要；还超就截短最长的固定行（_shrink）。标题由调用方先截到 FIXED_LINE_MAX 个字符。"""
+    日志一行不剩时小标题也不要；还超就截短最长的固定行（_shrink），第一行不截。
+    标题由调用方先截到 FIXED_LINE_MAX 个字符。"""
     fixed = [line[:FIXED_LINE_MAX] for line in fixed]
     log_lines = [line[:LOG_LINE_MAX] for line in log_lines]
     while True:
@@ -856,12 +858,11 @@ def _fit(title: str, fixed: list[str], log_lines: list[str]) -> list[str]:
 
 
 def _shrink(title: str, lines: list[str]) -> list[str]:
-    """日志行删光后 content 仍超过上限：截短最长的行，直到放得下。找出最大的 n，使每行最多留 n 个字符时放得下，
-    只截比 n 长的行，所以最长的行先截，其余不动。每行只留一个字符也放不下（行数太多）时，先从最后一行删起，至少留一行。
-    截完只剩空白的行不要；一行都不剩时放一行 NO_TEXT_LINE。标题不超过 FIXED_LINE_MAX 个字符时，一行总放得下。"""
-    def cut(width: int, count: int) -> list[str]:
-        return [line[:width] for line in lines[:count]]
-
+    """日志行删光后 content 仍超过上限：第一行（错误摘要或事件的结论）原样留着，截短其余最长的行，直到放得下。
+    在第一行占掉的之外，找出最大的 n，使其余每行最多留 n 个字符时放得下，只截比 n 长的行，所以最长的行先截，其余不动。
+    其余每行只留一个字符也放不下（行数太多）时，先从最后一行删起，可以一行不留。
+    第一行单独放不下时（标题和第一行各不超过 FIXED_LINE_MAX 个字符时不会这样），所有行一起这样截，至少留一行：
+    标题不超过 FIXED_LINE_MAX 个字符时，一行总放得下。截完只剩空白的行不要；一行都不剩时放一行 NO_TEXT_LINE。"""
     def fits(candidate: list[str]) -> bool:
         return _content_cost(title, candidate) <= POST_CONTENT_LIMIT
 
@@ -872,8 +873,14 @@ def _shrink(title: str, lines: list[str]) -> list[str]:
             low, high = (middle, high) if ok(middle) else (low, middle - 1)
         return low
 
-    count = largest(1, len(lines), lambda n: fits(cut(1, n))) if lines else 0
-    width = largest(1, max((len(line) for line in lines[:count]), default=1), lambda n: fits(cut(n, count)))
+    # head 原样放在最前面，只截 rest，rest 至少留 least 行
+    head, rest, least = (lines[:1], lines[1:], 0) if lines and fits(lines[:1]) else ([], lines, 1)
+
+    def cut(width: int, count: int) -> list[str]:
+        return head + [line[:width] for line in rest[:count]]
+
+    count = largest(least, len(rest), lambda n: fits(cut(1, n))) if rest else 0
+    width = largest(1, max((len(line) for line in rest[:count]), default=1), lambda n: fits(cut(n, count)))
     return [line for line in cut(width, count) if line.strip()] or [NO_TEXT_LINE]
 
 
@@ -1175,8 +1182,8 @@ def notify_server_event(title: str, text: str, *, root: Path | None = None, sess
     （script.error.notify_enable）、推送配置写 provider: feishu_app 的，取 (receive_id_type, receive_id)，去掉重复的。
     - 一个接收方都没有：不发，记一行 INFO。凭证缺失：记一条错误，什么都不写。
     - 每个接收方写一条发件箱条目：标题 title，正文是 text 的各行（空行不要），不附图，不合并。每行最多 LOG_LINE_MAX 个
-      字符（自检失败、意外错误带着最多 20 行 stderr），整条超过上限时截短最长的行（见 _fit）。写完立即补发一轮
-      （flush_outbox，与补发同一条路径，发件箱里早先的条目先发），没发出去的留给下一轮补发。
+      字符（自检失败、意外错误带着最多 20 行 stderr），整条超过上限时截短最长的行，第一行（结论和"需人工处理"）不截
+      （见 _fit）。写完立即补发一轮（flush_outbox，与补发同一条路径，发件箱里早先的条目先发），没发出去的留给下一轮补发。
     """
     try:
         _notify_server_event(Path(root) if root is not None else Path.cwd(), title, text, session)
