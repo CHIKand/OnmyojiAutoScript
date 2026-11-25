@@ -1,7 +1,7 @@
 """合并上游用的入口清单与接入函数（module.server.upstream_hooks）。
 
-接入函数的用例都用造出来的 m.py 文本，不碰仓库。test_hooks_reproduce_the_seven_files 只读本仓库的 git 历史：
-最近一次"合并上游"合进来的官方版本接上清单，必须逐字等于当前 HEAD 的版本（换行符差异除外）。
+接入函数的用例都用造出来的 m.py 文本，不碰仓库。test_hooks_reproduce_the_seven_files 只读本仓库的 git 历史和工作区：
+最近一次"合并上游"合进来的官方版本接上清单，必须逐字等于工作区里的版本（提交后就是 HEAD；换行符差异除外）。
 """
 import subprocess
 from pathlib import Path
@@ -120,4 +120,6 @@ def test_hooks_reproduce_the_seven_files():
     upstream = git('log', '--merges', '--grep=^合并上游', '-1', '--format=%P').split()[1]
     assert hook_files() == sorted(SEVEN)
     for path in hook_files():
-        assert apply_hooks(path, git('show', f'{upstream}:{path}')) == git('show', f'HEAD:{path}'), path
+        # 比工作区而不是 HEAD：绕开清单直接改文件，提交之前就失败。两边都按文本模式读，\r\n 已统一成 \n
+        ours = (REPO_ROOT / path).read_text(encoding='utf-8')
+        assert apply_hooks(path, git('show', f'{upstream}:{path}')) == ours, path
