@@ -9,11 +9,9 @@
 import asyncio
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import threading
-import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,24 +34,6 @@ from module.server.script_process import ScriptState
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MESSAGE_OUT_OF_RANGE = '次数需在 1–30 之间'   # 破折号是 en dash，同 module.orchestra.model 里的文案
-
-
-@pytest.fixture(scope='module')
-def default_config() -> dict:
-    """一份默认实例配置的字典。上游默认值里有写成字符串的整数字段，dump 时 pydantic 会警告，与本文件无关，只在这里放行。"""
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', message='Pydantic serializer warnings', category=UserWarning)
-        return ConfigModel().model_dump()
-
-
-@pytest.fixture
-def instance_dir(tmp_path, monkeypatch, default_config) -> Path:
-    """cwd 切到 tmp_path，里面是 config/template.json（仓库模板的副本）和实例配置 config/t.json。"""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / 'config').mkdir()
-    shutil.copy(REPO_ROOT / 'config' / 'template.json', tmp_path / 'config' / 'template.json')
-    ConfigModel.write_json('t', default_config)
-    return tmp_path
 
 
 def config_bytes(name: str = 't') -> bytes:
@@ -101,12 +81,9 @@ def use_fake_manager(monkeypatch, **processes: FakeProcess) -> None:
 
 @pytest.fixture(autouse=True)
 def fake_instances(monkeypatch) -> None:
-    """默认的假进程表：实例 t 停着。命令接口会停、启实例，真的进程表会导入上游 MainManager、真的启动实例进程。"""
+    """默认的假进程表：实例 t 停着。命令接口会停、启实例，真的进程表会导入上游 MainManager、真的启动实例进程。
+    建真的进程对象由 conftest 的护栏拦住。"""
     use_fake_manager(monkeypatch, t=FakeProcess(ScriptState.INACTIVE))
-
-    def no_real_process(name: str):
-        raise AssertionError(f'测试里不该建真的进程对象：{name}')
-    monkeypatch.setattr(instance_control, 'ScriptProcess', no_real_process)
 
 
 def resting(**kwargs) -> None:

@@ -7,9 +7,7 @@ config/t.json，不碰仓库自己的 config/ 和 log/。
 """
 import asyncio
 import logging
-import shutil
 import sys
-import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,27 +26,14 @@ from module.server.orchestra_router import post_command
 from module.server.script_process import ScriptState
 from tasks.Orochi.config import Layer
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_FILE = Path('config') / 't.json'   # 相对当前目录，用例里是 tmp_path
 NEXT_RUN = 'orochi.scheduler.next_run'
 
 
-@pytest.fixture(scope='module')
-def default_config() -> dict:
-    """一份默认实例配置的字典。上游默认值里有写成字符串的整数字段，dump 时 pydantic 会警告，与本文件无关，只在这里放行。"""
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', message='Pydantic serializer warnings', category=UserWarning)
-        return ConfigModel().model_dump()
-
-
 @pytest.fixture
-def journal(tmp_path, monkeypatch, default_config) -> list:
-    """cwd 切到 tmp_path，建好实例 t 的配置。返回账本：配置每写一次记 ('config', state)，进度每写一次记
-    ('progress', phase)，进程替身的 stop、start 也记在这里。"""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / 'config').mkdir()
-    shutil.copy(REPO_ROOT / 'config' / 'template.json', tmp_path / 'config' / 'template.json')
-    ConfigModel.write_json('t', default_config)
+def journal(instance_dir, monkeypatch) -> list:
+    """经 instance_dir 把 cwd 切到 tmp_path、建好实例 t 的配置。返回账本：配置每写一次记 ('config', state)，
+    进度每写一次记 ('progress', phase)，进程替身的 stop、start 也记在这里。"""
     entries: list = []
     real_write, real_save = config_model.write_file, orchestra_router.save_progress
 
