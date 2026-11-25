@@ -507,6 +507,7 @@ def _rehook(r: GitRunner, code: list[str], unmerged: dict[str, set[str]], hooks:
        那处改动弄丢；官方版本接得上清单。一个不过就停下。
     3. 写回：每个文件 checkout --theirs，让 git 按工作区的换行风格写出官方版本；读回来接上入口，按原来的换行风格
        写回去，再 git add。官方改过、被我们整段覆盖的函数体，各存一份官方改动（共同祖先到官方的差异）到备份目录。
+       差异文件全部写好之后，才把这些文件和被覆盖的函数体一起记进 state。
     清单本身自相矛盾时 apply_hooks 抛 ValueError，和 git 命令失败一样往外抛，由调用方当作处理途中出错，abort 合并。
     """
     try:
@@ -539,10 +540,12 @@ def _rehook(r: GitRunner, code: list[str], unmerged: dict[str, set[str]], hooks:
         file.write_bytes(apply_hooks(path, file.read_bytes().decode('utf-8'), hooks).encode('utf-8'))
         r.run('add', '--', path)
     found = [body for path in code for body in overridden_bodies(path, *texts[path], hooks)]
-    for body, name in zip(found, _diff_names(found)):
+    names = _diff_names(found)
+    for body, name in zip(found, names):
         (r.repo / state.backup / name).write_bytes(body.diff.encode('utf-8'))
-        state.overridden.append((f'{body.path} 的 {body.function}', name))
+    # 差异文件全部写好才一起记下：中途写不成时 files、overridden 都还是空的，结果里不会只带着半份
     state.files = list(code)
+    state.overridden = [(f'{body.path} 的 {body.function}', name) for body, name in zip(found, names)]
     return ''
 
 
@@ -593,18 +596,21 @@ def _new_directory(root: Path, stamp: str) -> str:
 
 
 def _write_note(directory: Path, note: list[str], outcome: str,
-                overridden: list[tuple[str, str]] | None = None) -> None:
-    """写说明.txt：note 的几行，被覆盖的函数体（overridden 为 None 时还不知道，不写这一行），最后是结果一栏。"""
+                overridden: list[tuple[str, str]] | None = None, finished: bool = True) -> None:
+    """写说明.txt：note 的几行，被覆盖的函数体（overridden 为 None 时还不知道，不写这一行），最后是结果一栏。
+    finished 为假表示合并没有做完：这些函数体并没有被覆盖，那一行写成"官方改过的函数体（这次合并没有完成，没有覆盖）"。"""
     lines = list(note)
     if overridden is not None:
         shown = '、'.join(f'{label}（官方的改动见 {name}）' for label, name in overridden)
-        lines.append(f'官方改过、已用我们的版本覆盖的函数体：{shown or "无"}')
+        heading = '官方改过、已用我们的版本覆盖的函数体' if finished else '官方改过的函数体（这次合并没有完成，没有覆盖）'
+        lines.append(f'{heading}：{shown or "无"}')
     lines.append(f'结果：{outcome}')
     (directory / BACKUP_NOTE).write_bytes(('\n'.join(lines) + '\n').encode('utf-8'))
 
 
 def _finish_note(r: GitRunner, state: _Rehook, result: MergeResult) -> None:
-    """把说明.txt 的结果一栏改写成合并的最终结果；没有备份时什么也不做。写不成就算了，结果一栏停在"处理中"：
+    """把说明.txt 的结果一栏改写成合并的最终结果；没有备份时什么也不做。结果不是 merged、needs_install 时合并没有
+    做完，被覆盖的函数体那一行照实写成没有覆盖。写不成（出了任何异常）就算了，结果一栏停在"处理中"：
     合并可能已经提交了，不能因为一份说明把结果报错。"""
     if not state.backup:
         return
@@ -617,8 +623,9 @@ def _finish_note(r: GitRunner, state: _Rehook, result: MergeResult) -> None:
     else:
         outcome = '合并没有完成，已中止，分支未改动：处理途中出错或自检没通过，原因见服务日志'
     try:
-        _write_note(r.repo / state.backup, state.note, outcome, state.overridden)
-    except OSError:
+        _write_note(r.repo / state.backup, state.note, outcome, state.overridden,
+                    finished=result.status in ('merged', 'needs_install'))
+    except Exception:
         pass
 
 

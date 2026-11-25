@@ -539,6 +539,25 @@ def test_a_rehooked_merge_that_fails_the_self_check_aborts_and_keeps_the_backup(
         '结果：合并没有完成，已中止，分支未改动：处理途中出错或自检没通过，原因见服务日志\n')
 
 
+def test_a_rehook_that_replaced_a_body_then_failed_the_self_check_says_the_body_was_not_overridden(trio):
+    def router(body):
+        return f'import x\n\n\ndef update_info():\n    {body}\n'
+
+    name = 'module/server/router.py'
+    trio.upstream_commit({name: router('return 1')})
+    assert trio.merge().status == 'merged'                  # 官方新加的文件，干净地合进来
+    hooks = (Hook(name, 'def update_info():', 'replace_body', ('    return ours()',)),)
+    trio.fork_commit({name: router('return ours()')})      # 共同祖先 + 清单
+    trio.upstream_commit({name: router('return 2')})       # 官方也改了这个函数体
+    result = trio.merge(verify=lambda repo: (False, 'import boom'), hooks=hooks)
+    assert (result.status, result.message) == ('smoke_failed', 'import boom')
+    assert result.overridden == [f'{name} 的 update_info']                         # 处理已经完成，这一项照样带着
+    assert raw_show(trio.work, f'HEAD:{name}') == router('return ours()').encode()  # 合并中止了，分支没动
+    assert backup_note(trio, result).endswith(                                      # 不能再写"已用我们的版本覆盖"
+        f'官方改过的函数体（这次合并没有完成，没有覆盖）：{name} 的 update_info（官方的改动见 官方改动-update_info.diff）\n'
+        '结果：合并没有完成，已中止，分支未改动：处理途中出错或自检没通过，原因见服务日志\n')
+
+
 def test_a_rehook_that_fails_during_the_write_back_aborts_cleanly(trio, broken_git):
     trio.fork_commit({'script.py': 'base\nhooked\n'})
     trio.upstream_commit({'script.py': 'base\nupstream\n'})
@@ -549,6 +568,34 @@ def test_a_rehook_that_fails_during_the_write_back_aborts_cleanly(trio, broken_g
     assert STAMP.fullmatch(result.backup)
     assert trio.head == before and is_clean(trio.work) and not merging(trio.work)
     assert (trio.work / 'script.py').read_bytes() == b'base\nhooked\n'                # 写回的文件也还原了
+    assert backup_note(trio, result).endswith(
+        '结果：合并没有完成，已中止，分支未改动：处理途中出错或自检没通过，原因见服务日志\n')
+
+
+def test_a_failure_writing_the_second_diff_leaves_overridden_empty(trio, monkeypatch):
+    def router(f_body, g_body):
+        return f'import x\n\n\ndef f():\n    {f_body}\n\n\ndef g():\n    {g_body}\n'
+
+    name = 'module/server/router.py'
+    trio.upstream_commit({name: router('return 1', 'return 1')})
+    assert trio.merge().status == 'merged'                  # 官方新加的文件，干净地合进来
+    hooks = (Hook(name, 'def f():', 'replace_body', ('    return ours()',)),
+             Hook(name, 'def g():', 'replace_body', ('    return ours()',)))
+    trio.fork_commit({name: router('return ours()', 'return ours()')})      # 共同祖先 + 清单
+    trio.upstream_commit({name: router('return 2', 'return 2')})            # 官方两个函数体都改了
+    before, real = trio.head, Path.write_bytes
+
+    def write_bytes(self, data):                           # 第二份官方改动写不成，比如磁盘满了
+        if self.name == '官方改动-g.diff':
+            raise OSError('disk full')
+        return real(self, data)
+
+    monkeypatch.setattr(Path, 'write_bytes', write_bytes)
+    result = trio.merge(hooks=hooks)
+    assert (result.status, result.message) == ('smoke_failed', 'OSError: disk full')
+    assert (result.rehooked, result.overridden) == ([], [])      # 第一份已经写进备份，也不记：处理没有完成
+    assert STAMP.fullmatch(result.backup) and (trio.work / result.backup / '官方改动-f.diff').is_file()
+    assert trio.head == before and is_clean(trio.work) and not merging(trio.work)
     assert backup_note(trio, result).endswith(
         '结果：合并没有完成，已中止，分支未改动：处理途中出错或自检没通过，原因见服务日志\n')
 
