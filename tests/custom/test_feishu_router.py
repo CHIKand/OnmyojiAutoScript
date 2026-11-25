@@ -472,10 +472,12 @@ def merge_notices(monkeypatch) -> list[tuple]:
 @pytest.mark.parametrize('status, message, attempts_before', [
     ('up_to_date', '已是最新，无需合并', 0),
     ('merged', RESTARTED, 0),
+    ('merged', RESTARTED + fork_updater.SERVER_CODE_NOTE, 0),
     ('pushed', '已把之前未推送的 1 个提交推送到 fork；已重启实例：无', 0),
     ('fetch_failed', MERGE_MESSAGE, 0),                                     # 第 1 次：10 分钟后重试
     ('fetch_failed', MERGE_MESSAGE, custom_jobs.MAX_ATTEMPTS - 2),           # 倒数第 2 次：还会重试
-], ids=['up-to-date', 'merged', 'pushed', 'fetch-failed-first', 'fetch-failed-before-last'])
+], ids=['up-to-date', 'merged', 'merged-server-code-changed', 'pushed', 'fetch-failed-first',
+        'fetch-failed-before-last'])
 def test_a_daily_merge_that_needs_nobody_sends_nothing(monkeypatch, merge_notices, status, message, attempts_before):
     run_daily_merge(monkeypatch, status, message=message, attempts_before=attempts_before)
     assert merge_notices == []
@@ -488,6 +490,8 @@ def test_a_daily_merge_that_needs_nobody_sends_nothing(monkeypatch, merge_notice
     ('needs_install', (), '已合并上游 2 个提交并推送到 fork；上游新增依赖 foo，请在 OASX 重启服务（启动器会先安装依赖），实例暂未重启', 0),
     ('merged', (), RESTART_FAILED, 0),
     ('pushed', (), '已把之前未推送的 1 个提交推送到 fork' + fork_updater.RESTART_FAILED_NOTE, 0),
+    ('merged', (), RESTARTED + fork_updater.DEPENDENCY_NOTE, 0),
+    ('pushed', (), '已把之前未推送的 1 个提交推送到 fork；已重启实例：无' + fork_updater.DEPENDENCY_NOTE, 0),
     ('fork_ahead', (), 'fork 上有运行目录还没有的 1 个新提交，已暂停合并', 0),
     ('diverged', (), '运行目录和 fork 各有对方没有的提交，已停止，需要人工处理', 0),
     ('dirty', (), '运行目录有未提交的改动，已跳过合并：M tasks/a.py', 0),
@@ -497,8 +501,8 @@ def test_a_daily_merge_that_needs_nobody_sends_nothing(monkeypatch, merge_notice
     ('fetch_failed', (), '拉取上游失败，未改动任何文件：fatal: unable to access', custom_jobs.MAX_ATTEMPTS - 1),
     ('a_status_fork_git_adds_later', (), '合并上游时出现意外错误，请查看服务日志：a_status_fork_git_adds_later', 0),
 ], ids=['conflict', 'conflict-not-started', 'push-failed', 'needs-install', 'merged-restart-failed',
-        'pushed-restart-failed', 'fork-ahead', 'diverged', 'dirty', 'smoke-failed', 'error', 'no-result',
-        'fetch-failed-last-attempt', 'unknown-status'])
+        'pushed-restart-failed', 'merged-dependencies-changed', 'pushed-dependencies-changed', 'fork-ahead',
+        'diverged', 'dirty', 'smoke-failed', 'error', 'no-result', 'fetch-failed-last-attempt', 'unknown-status'])
 def test_a_daily_merge_that_needs_a_person_notifies_and_says_so_first(monkeypatch, merge_notices, status, conflicts,
                                                                       message, attempts_before):
     run_daily_merge(monkeypatch, status, message=message, conflicts=conflicts, attempts_before=attempts_before)
@@ -521,6 +525,18 @@ def test_a_merge_that_never_started_is_not_called_a_code_conflict(monkeypatch, m
     run_daily_merge(monkeypatch, 'conflict_aborted', message='合并未能开始，分支未改动：x')
     (_, text), _ = merge_notices[0]
     assert text.split('\n')[0] == '合并上游未能开始，需人工处理'
+
+
+def test_a_merge_that_changed_dependencies_asks_for_a_service_restart(monkeypatch, merge_notices):
+    message = RESTARTED + fork_updater.SERVER_CODE_NOTE + fork_updater.DEPENDENCY_NOTE
+    run_daily_merge(monkeypatch, 'merged', message=message)
+    assert merge_notices == [((MERGE_TITLE, f'合并上游后依赖有变化，需人工处理\n{message}'), {})]
+
+
+def test_a_failed_restart_outranks_changed_dependencies(monkeypatch, merge_notices):
+    run_daily_merge(monkeypatch, 'merged', message=RESTART_FAILED + fork_updater.DEPENDENCY_NOTE)
+    (_, text), _ = merge_notices[0]
+    assert text.split('\n')[0] == '合并上游后重启实例失败，需人工处理'
 
 
 def test_a_daily_merge_conflict_reaches_feishu(tmp_path, monkeypatch):
