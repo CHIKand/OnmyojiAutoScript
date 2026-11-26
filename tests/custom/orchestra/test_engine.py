@@ -767,3 +767,24 @@ def test_finish_interrupted_row_ends_like_a_completed_row():
                                     random.Random(0))
     assert capped.phase == 'done'   # 此前累计的 5 分钟计入总时长，到了上限
     assert p == before and done.history is not p.history
+
+
+# 审查前的裁定：离开等待时清掉等待记录，会合记录不动
+
+def test_on_row_start_clears_the_wait_record():
+    met = T0 - timedelta(minutes=1)
+    p = Progress(phase='ready', team_wait_since=T0, team_wait_ordinal=1, team_wait_task='Orochi', team_alive_at=T0,
+                 team_met_at=met, team_met_ordinal=1, team_met_task='Orochi')
+    out = on_row_start(p, 0, at(1), {}, 'RealmRaid')   # 等着的时候表被改了，改跑一个单刷行
+    assert (out.team_wait_since, out.team_wait_ordinal, out.team_wait_task, out.team_alive_at) == (None,) * 4
+    assert (out.team_met_at, out.team_met_ordinal, out.team_met_task) == (met, 1, 'Orochi')
+    assert p.team_wait_since == T0   # 不改传入的对象
+
+
+def test_finish_interrupted_row_clears_the_wait_record():
+    p = Progress(phase='interrupted', row_index=0, row_task='Orochi', row_started_at=T0, team_row_ordinal=1,
+                 team_wait_since=T0, team_wait_ordinal=1, team_wait_task='Orochi', team_alive_at=at(1),
+                 team_met_at=T0, team_met_ordinal=1, team_met_task='Orochi')
+    out = finish_interrupted_row(p, running(SIX), at(2), random.Random(0))
+    assert (out.team_wait_since, out.team_wait_ordinal, out.team_wait_task, out.team_alive_at) == (None,) * 4
+    assert (out.team_met_at, out.team_met_ordinal, out.team_met_task) == (T0, 1, 'Orochi')

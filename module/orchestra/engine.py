@@ -7,7 +7,7 @@
 运行时在调度循环里的调用顺序：
     选任务前：本进程第一次先 recover，再 sync_controls，最后 decide；选中的是组队行、又设了搭档时先过 team.gate，
         续跑时搭档已离开（skip）就用 finish_interrupted_row 把这一行按已打完记账，再 decide 一次；
-    行运行前：row_limits 求本次上限，on_row_start 记下开始、这一行的任务和组队序号；
+    行运行前：row_limits 求本次上限，on_row_start 记下开始、这一行的任务和组队序号，清掉等待记录；
     行运行后：先还原行参数，再 on_row_end。
 row_limits 按剩余量算的前提是接着跑同一个中断行：只有 decide 选中的行号等于进度里的 row_index、
 该行的任务也等于进度里的 row_task 时，运行时才用它，否则用该行自己的上限。on_row_start 判断续跑用的是同一个条件。
@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from module.orchestra.model import Orchestra, OrchestraRow, validate_rows
-from module.orchestra.progress import HISTORY_LIMIT, Progress
+from module.orchestra.progress import HISTORY_LIMIT, Progress, clear_team_wait
 
 ALWAYS_THROUGH = ('Restart', 'SoulsTidy')   # 上游的重启与御魂溢出自愈，永远放行，按此优先级
 _LIVE_PHASES = ('ready', 'resting', 'interrupted')   # 序列还在进行、此刻没有行在跑的阶段
@@ -212,6 +212,8 @@ def on_row_start(p: Progress, row_index: int, now: datetime, saved_params: dict,
 
     接着同一个中断行续跑（阶段为 interrupted，行号相同，任务也相同）时，保留累计的用时和次数；
     其余情况都是新的一行，从零算：表在运行中被改过、同一个行号换成了别的任务，也是新的一行。
+    开打就不再等：等待记录清掉，会合记录不动。组队行在会合时已经清过；等着的时候表被改了、改跑别的行时靠这里清，
+    否则之后同序号同任务的组队行会接着旧的开始时间算，一到就超时。
     """
     p = copy.deepcopy(p)
     if not (p.phase == 'interrupted' and p.row_index == row_index and p.row_task == task):
@@ -220,6 +222,7 @@ def on_row_start(p: Progress, row_index: int, now: datetime, saved_params: dict,
     p.row_index = row_index
     p.row_task = task
     p.team_row_ordinal = team_ordinal
+    clear_team_wait(p)
     p.phase = 'row_running'
     p.row_started_at = now
     p.heartbeat_at = None
@@ -275,10 +278,12 @@ def finish_interrupted_row(p: Progress, settings: Orchestra, now: datetime, rng:
     不再加新的运行时间：总时长只加此前各次中断累计的 row_elapsed_before。历史的开始时间取原来的 row_started_at
     （没有时为 None），次数取进度里的累计 done_count。之后找下一行、循环、总时长上限、休息，以及清空这一行的
     运行状态（saved_params、heartbeat_at、累计用时与次数、row_task、team_row_ordinal），都与 on_row_end 的完成分支相同。
+    续跑时可能已经等过几轮，等待记录也清掉，会合记录不动，理由同 on_row_start。
     """
     p = copy.deepcopy(p)
     p.saved_params = {}
     p.heartbeat_at = None
+    clear_team_wait(p)
     _complete_row(p, settings, now, 0.0, p.done_count, rng)
     return p
 

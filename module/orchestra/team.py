@@ -106,13 +106,19 @@ def resume_partner_state(partner: Progress | None, ordinal: int, task: str, now:
 
 
 def partner_situation(me: str, partner: Progress | None, ordinal: int, task: str, now: datetime) -> str:
-    """面板与通知里的搭档情况，按顺序取第一条成立的。ordinal、task 是我这一行的组队序号和任务，任务写显示名。"""
+    """面板与通知里的搭档情况，按顺序取第一条成立的。ordinal、task 是我这一行的组队序号和任务，任务写显示名。
+
+    暂停、编排没在跑（idle、done）先于"搭档设的搭档不是我"判断：team_partner 只在搭档的编排进行中才刷新，
+    没开始的搭档进度里是旧值或空的。搭档没开始是等不到最常见的原因，不能在面板和通知里说成配错了搭档。
+    """
     if partner is None:
         return '读不到搭档的进度'
-    if partner.team_partner != me:
-        return '搭档设的搭档不是我'
     if partner.paused:
         return '搭档已暂停'
+    if partner.phase in ('idle', 'done'):
+        return '搭档的编排没在跑'
+    if partner.team_partner != me:
+        return '搭档设的搭档不是我'
     if partner.team_wait_since is not None:
         if not _fresh(partner.team_alive_at, now):
             return _SILENT
@@ -129,8 +135,6 @@ def partner_situation(me: str, partner: Progress | None, ordinal: int, task: str
         return '搭档在休息'
     if partner.phase == 'interrupted':
         return f'搭档第 {partner.row_index + 1} 行中断了'
-    if partner.phase in ('idle', 'done'):
-        return '搭档的编排没在跑'
     return '搭档还没到'
 
 

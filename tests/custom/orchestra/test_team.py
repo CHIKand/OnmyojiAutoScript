@@ -1,13 +1,15 @@
 """等搭档的会合判断（module.orchestra.team）：组队行序号、会合规则 a 与 b、超时与最后一读、续跑时搭档在哪、面板上的搭档情况。
 
-前半部分照简报原样，补充用例放在文件末尾。
+前半部分照简报原样，只有 test_partner_situation 按审查前的裁定改了一条、加了一条；补充用例放在文件末尾。
 """
 import copy
+import random
 from datetime import datetime, timedelta
 
 import pytest
 
-from module.orchestra.model import OrchestraRow
+from module.orchestra.engine import finish_interrupted_row
+from module.orchestra.model import Orchestra, OrchestraRow
 from module.orchestra.progress import Progress
 from module.orchestra.team import (gate, partner_met, partner_situation, partner_waiting, rescue_after_timeout,
                                    resume_partner_state, team_ordinal)
@@ -128,7 +130,8 @@ def test_resuming_gate_branches():
 
 @pytest.mark.parametrize('partner, text', [
     (None, '读不到搭档的进度'),
-    (Progress(team_partner='x'), '搭档设的搭档不是我'),
+    (Progress(team_partner='x', phase='resting'), '搭档设的搭档不是我'),
+    (Progress(phase='idle'), '搭档的编排没在跑'),
     (Progress(team_partner='t', paused=True), '搭档已暂停'),
     (waiting(team_alive_at=T0 - timedelta(seconds=91)), '搭档 90 秒没有动静'),
     (waiting(), '搭档在等第 1 个组队行，我在第 2 个'),
@@ -196,3 +199,21 @@ def test_gate_and_rescue_do_not_touch_their_inputs():
     met = Progress(team_met_at=T0, team_met_ordinal=2, team_met_task='Orochi')
     rescued = rescue_after_timeout(p, met, 2, 'Orochi', since=T0)
     assert rescued is not p and p.team_met_at is None
+
+
+# ---------- 审查前的裁定 ----------
+
+def test_a_wait_left_by_a_skipped_row_does_not_carry_over_to_the_next_same_team_row():
+    """续跑时等过、搭档离开后按已打完记账，旧的等待记录不能留给下一个同序号同任务的组队行，否则一到就超时。"""
+    p = Progress(phase='interrupted', row_index=0, row_task='Orochi', row_started_at=T0, team_row_ordinal=1,
+                 team_wait_since=T0, team_wait_ordinal=1, team_wait_task='Orochi', team_alive_at=T0)
+    settings = Orchestra(rows=[OrchestraRow(task='Orochi')], state='running', after_finish='loop')
+    booked = finish_interrupted_row(p, settings, T0 + timedelta(seconds=30), random.Random(0))
+    later = T0 + timedelta(minutes=40)
+    g = gate(booked, 't', None, 1, 'Orochi', later, 30, resuming=False)
+    assert (g.kind, g.progress.team_wait_since) == ('wait', later)
+
+
+def test_paused_or_stopped_partner_is_reported_before_the_pairing_check():
+    assert partner_situation('t', Progress(team_partner='x', paused=True), 2, 'Orochi', T0) == '搭档已暂停'
+    assert partner_situation('t', Progress(team_partner='x', phase='done'), 2, 'Orochi', T0) == '搭档的编排没在跑'
