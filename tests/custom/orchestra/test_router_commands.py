@@ -503,3 +503,28 @@ def test_progress_write_failure_after_the_config_is_logged(journal, monkeypatch,
     assert_originals_restored(original_next_run)
     assert progress().saved_params == saved   # 原值留着，实例下次启动时引擎再还原一次，同样的值
     assert any(message.startswith('[t] ') and 'PermissionError' in message for message in errors(caplog))
+
+
+# ---------- 等搭档的等待记录 ----------
+
+T0 = datetime(2026, 11, 26, 10, 0)
+WAIT = dict(team_wait_since=T0, team_wait_ordinal=1, team_wait_task='Orochi', team_alive_at=T0, team_met_at=T0)
+
+
+@pytest.mark.parametrize('action', ['pause', 'stop', 'resume', 'start'])
+def test_commands_clear_the_wait_record(journal, monkeypatch, action):
+    save_progress(progress_path('t'), Progress(phase='ready', **WAIT))
+    table(monkeypatch, journal, t=Instance(journal))
+    assert send(journal, action)['ok'] is True
+    p = progress()
+    assert (p.team_wait_since, p.team_wait_ordinal, p.team_wait_task, p.team_alive_at) == (None,) * 4
+    assert p.team_met_at == T0   # 会合记录不动
+
+
+def test_resume_survives_a_locked_progress_file_when_clearing(journal, monkeypatch, caplog):
+    save_progress(progress_path('t'), Progress(phase='ready', **WAIT))
+    table(monkeypatch, journal, t=Instance(journal))
+    monkeypatch.setattr(orchestra_router, 'load_progress', _locked)
+    assert send(journal, 'resume')['ok'] is True
+    assert journal[-1] == 'start'   # 清不掉也照常启动实例，它第一次选任务时自己会清
+    assert any(r.levelno == logging.WARNING and '清等待记录时进度文件读写失败' in r.getMessage() for r in caplog.records)

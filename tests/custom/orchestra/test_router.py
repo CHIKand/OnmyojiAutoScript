@@ -477,6 +477,38 @@ def test_restart_instance_still_restarts_a_stopped_instance_by_default(monkeypat
     assert process.calls == ['stop', 'start']
 
 
+def test_restart_running_instances_leaves_a_timed_out_instance_stopped(instance_dir, monkeypatch, caplog):
+    # 等搭档超时：实例把编排写成暂停后自己退出，上游标 WARNING；a 没有配置文件，按没暂停处理
+    cfg = ConfigModel('t')
+    cfg.orchestra.state = 'paused'
+    cfg.save()
+    processes = {'t': FakeProcess(ScriptState.WARNING), 'a': FakeProcess(ScriptState.WARNING)}
+    use_fake_manager(monkeypatch, **processes)
+    assert asyncio.run(restart_running_instances()) == ['a']
+    assert processes['t'].calls == []   # 不停、不启
+    assert any(r.levelno == logging.INFO and r.getMessage() == '[t] 编排已暂停、实例已退出，不随更新重启'
+               for r in caplog.records)
+
+
+def test_a_running_instance_with_paused_orchestra_is_still_restarted(instance_dir, monkeypatch):
+    cfg = ConfigModel('t')
+    cfg.orchestra.state = 'paused'
+    cfg.save()
+    processes = {'t': FakeProcess(ScriptState.RUNNING)}
+    use_fake_manager(monkeypatch, **processes)
+    assert asyncio.run(restart_running_instances()) == ['t']
+
+
+def test_restart_running_instances_restarts_when_the_config_cannot_be_read(instance_dir, monkeypatch, caplog):
+    (instance_dir / 'config' / 't.json').write_text('{', encoding='utf-8')   # 配置损坏：读不出编排是否已暂停
+    process = FakeProcess(ScriptState.WARNING)
+    use_fake_manager(monkeypatch, t=process)
+    assert asyncio.run(restart_running_instances()) == ['t']   # 按没暂停处理，同以前一样重启
+    assert process.calls == ['stop', 'start']
+    assert any(r.levelno == logging.WARNING and r.getMessage().startswith('[t] ') and 'JSONDecodeError' in r.getMessage()
+               for r in caplog.records)
+
+
 @pytest.mark.parametrize('state', [ScriptState.RUNNING, ScriptState.WARNING, ScriptState.UPDATING])
 def test_start_instance_stops_a_live_process_first(monkeypatch, state):
     process = FakeProcess(state)

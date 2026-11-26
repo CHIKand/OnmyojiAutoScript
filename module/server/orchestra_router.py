@@ -10,7 +10,9 @@
 开始、暂停、继续、停止直接启停实例进程（规格 §8.3，2026-11-25 修订）：先停下实例，再写配置和进度，state 是 running 的
 写完再启动实例。实例跑任务期间不重读配置文件，任务结束时的自动存盘（上游 ConfigModel.__setattr__）会把内存里的旧副本
 整份写回，实例在跑时写进去的运行控制字段就被冲掉了；实例停下之后再写，没有第二个写者。进度文件平时只由实例写，
-暂停、停止时实例已经停下，由本接口经 module.orchestra.progress 写。同一实例的命令与重启共用 instance_lock，按先后排队。
+暂停、停止时实例已经停下，由本接口经 module.orchestra.progress 写。这四条命令都在实例停下之后、再次启动之前清掉进度里
+等搭档的等待记录（会合记录不动，组队编排等搭档设计 §7.7）：留着的话，搭档在新进程第一次选任务之前读到它，
+会当成这边还在等。同一实例的命令与重启共用 instance_lock，按先后排队。
 跳过休息照旧只改配置、不启停实例：实例等待下一个任务时每 5 秒查一次配置文件的修改时间（上游 Script.wait_until），
 发现变化就重新选任务。
 """
@@ -27,7 +29,8 @@ from module.logger import logger
 from module.orchestra.engine import sync_controls
 from module.orchestra.mapping import catalog, restore_params
 from module.orchestra.model import Orchestra, validate_settings
-from module.orchestra.progress import Progress, load_progress, progress_path, progress_to_dict, save_progress
+from module.orchestra.progress import (Progress, clear_team_wait, load_progress, progress_path, progress_to_dict,
+                                       save_progress)
 from module.server.instance_control import instance_lock, instance_names, start_instance, stop_instance
 
 orchestra_app = APIRouter(prefix='/custom/orchestra')
@@ -125,8 +128,8 @@ def _skip_rest(name: str) -> bool:
 
 def _halt(name: str, state: str) -> bool:
     """暂停（state 为 paused）、停止（idle）在实例停下之后做的事：配置写入 state，并还原本行临时写入的参数；
-    进度按 sync_controls 同步（暂停时记下剩余休息，停止时阶段回到 idle），清掉 saved_params；
-    暂停在本行第一次心跳之前的，心跳记为行开始时刻。
+    进度按 sync_controls 同步（暂停时记下剩余休息，停止时阶段回到 idle），清掉 saved_params 和等搭档的等待记录
+    （会合记录不动）；暂停在本行第一次心跳之前的，心跳记为行开始时刻。
 
     先存配置、后存进度，同 OrchestraRuntime._restore_originals；个别字段还原不了只记错误，其余照常还原，
     同 OrchestraRuntime._restore。进度读不了（裁定 R2）或配置存不进去返回 False，配置与进度都不动，
@@ -145,6 +148,7 @@ def _halt(name: str, state: str) -> bool:
             live = cfg.orchestra
             live.state = state
             p = sync_controls(live, p, datetime.now())
+            clear_team_wait(p)   # 实例停下了，不再等搭档；停止时 sync_controls 已清过，再清一次无妨
             if p.phase == 'row_running' and p.heartbeat_at is None:
                 # 本行还没有心跳：已用截止到行开始，同引擎的 recover；不补的话面板按当前时刻算，暂停多久就涨多久
                 p.heartbeat_at = p.row_started_at
@@ -167,7 +171,10 @@ def _halt(name: str, state: str) -> bool:
 
 def _mark_running(name: str, start: bool) -> bool:
     """继续、开始在实例停下之后、启动之前做的事：state 写成 running；开始另记一条 start 命令（command_seq 加 1）。
-    进度不动：继续时实例的引擎接着原来的进度跑，开始时凭新命令重置。配置读写失败返回 False，调用方不启动实例。"""
+    配置读写失败返回 False，调用方不启动实例。
+
+    配置存成之后，尽力清掉进度里等搭档的等待记录（会合记录不动），进度的其余部分不动：继续时实例的引擎接着原来的进度跑，
+    开始时凭新命令重置。进度文件读写失败只记警告，照常返回 True：实例启动后第一次选任务时自己会清。"""
     with _CONFIG_LOCK:
         try:
             cfg = ConfigModel(name)
@@ -181,6 +188,14 @@ def _mark_running(name: str, start: bool) -> bool:
         except OSError as exc:
             logger.error(f'[{name}] 编排配置读写失败：{exc!r}，实例已停下，没有启动')
             return False
+    path = progress_path(name)
+    try:
+        if path.exists():
+            p = load_progress(path)
+            if clear_team_wait(p):   # 没有等待记录就不写，进度文件原样留着
+                save_progress(path, p)
+    except OSError as exc:
+        logger.warning(f'[{name}] 编排：清等待记录时进度文件读写失败：{exc!r}，实例启动后自己会清')
     return True
 
 
@@ -213,8 +228,9 @@ async def put_orchestra(script_name: str, body: dict) -> dict:
 @orchestra_app.post('/{script_name}/command')
 async def post_command(script_name: str, body: dict) -> dict:
     """控制命令，不接受或没做成返回 ok 为 False。实例名或动作不认识时什么都不碰。
-    start、pause、resume、stop 先停实例：pause 写 state=paused、stop 写 state=idle，都还原本行参数、同步进度，不再启动实例；
-    resume 写 state=running，start 另记一条 start 命令（command_seq 加 1），都不动进度，写完启动实例。
+    start、pause、resume、stop 先停实例，都清掉进度里等搭档的等待记录（会合记录不动）：pause 写 state=paused、
+    stop 写 state=idle，都还原本行参数、同步进度，不再启动实例；resume 写 state=running，start 另记一条 start 命令
+    （command_seq 加 1），进度的其余部分不动，写完启动实例。
     skip_rest 不启停实例，只在实例的进度处于休息中、且没有还没处理的开始命令时接受，记一条 skip_rest 命令。"""
     action = body.get('action')
     if action not in _ACTIONS or script_name not in await asyncio.to_thread(instance_names):
