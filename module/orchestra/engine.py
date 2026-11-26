@@ -21,6 +21,7 @@ saved_params（被行参数覆盖前的用户原值）由 on_row_start 写入，
 Restart 和 SoulsTidy（上游的重启与御魂溢出自愈，ALWAYS_THROUGH，按此优先级）编排进行中永远放行，
 插队名单里的任务次之。
 status_note 只由运行时写，引擎在序列跑完（done）和停止时把它清空，面板上不会留着上一次的提示。
+这两处也清掉等待记录（会合记录不动）：停了或跑完的实例，不会被搭档当成还在等。
 
 done_count 的约定：它是"本行累计已打次数"，跨中断累加。on_row_start 接着同一个中断行续跑时保留此前的累计，
 所以运行时在 on_row_start 之后读到的 (p.done_count or 0) 就是这一段的底数；心跳写进进度的值、传给 on_row_end
@@ -76,12 +77,13 @@ def next_row_index(rows: list[OrchestraRow], start: int) -> int | None:
 
 
 def _finish(p: Progress) -> None:
-    """就地把序列标为跑完：没有休息，也没有等着的行，不再暂停，提示清空。"""
+    """就地把序列标为跑完：没有休息，也没有等着的行，不再暂停，提示和等待记录清空（会合记录不动）。"""
     p.phase = 'done'
     p.rest_until = None
     p.rest_remaining = None
     p.paused = False
     p.status_note = ''
+    clear_team_wait(p)
 
 
 def sync_controls(settings: Orchestra, p: Progress, now: datetime) -> Progress:
@@ -90,7 +92,7 @@ def sync_controls(settings: Orchestra, p: Progress, now: datetime) -> Progress:
     开始：新的 start 命令不论阶段，或 state 为 running 而阶段为 idle、done。进度全部重置，只留下 saved_params
     （可能是崩溃遗留的、还没还原的用户原值）；命令序号对齐配置，开始之前发出的跳过休息不会在这次编排里重放。
     开始先于暂停、停止处理：点了开始又点暂停（或停止），实例读到配置时，结果是从头开始并暂停（或停下）。
-    停止：阶段回到 idle，休息作废，提示清空，saved_params 留给运行时还原。
+    停止：阶段回到 idle，休息作废，提示和等待记录清空（会合记录不动），saved_params 留给运行时还原。
     命令：序号大于已处理的才生效，不管认不认识都记为已处理；跳过休息只在休息中生效，暂停时改写剩余秒数，继续后才起作用。
     改表：运行中把表改短或改坏，当前序号之后已没有可运行的行时，视为这一遍跑完，之后按"跑完后"设置处理：
     循环则回到第一个可运行行并计一遍，否则结束。那一行已不在表里，它累计的用时、次数和任务名一并丢弃。
@@ -119,6 +121,7 @@ def sync_controls(settings: Orchestra, p: Progress, now: datetime) -> Progress:
         p.rest_until = None
         p.rest_remaining = None
         p.status_note = ''
+        clear_team_wait(p)
 
     if settings.command_seq > p.last_command_seq:
         if settings.command == 'skip_rest' and p.phase == 'resting':

@@ -307,3 +307,67 @@ def test_a_hand_edited_zero_wait_stops_on_the_first_poll():
     with pytest.raises(SystemExit):
         runtime.pick()
     assert len(notifier.pushes) == 1
+
+
+# ---------- 审查后的修正（第 1 轮） ----------
+
+def partner_playing():
+    """搭档已按会合开打第 1 行：在跑，心跳新鲜，会合记在 T0。这边按规则 b 只认不早于自己开始等的会合。"""
+    partner_file(phase='row_running', row_task='Orochi', team_row_ordinal=1, heartbeat_at=T0, team_met_at=T0,
+                 team_met_ordinal=1, team_met_task='Orochi', team_partner='t')
+
+
+@pytest.mark.parametrize('between', [None, 'Restart'])
+def test_a_meeting_is_kept_until_the_row_really_starts(between, caplog):
+    waiting_for_t()
+    runtime, script, config, clock = make([OrchestraRow(task='Orochi')], partner='u')
+    assert runtime.pick().next_run == T0                          # 会合
+    partner_playing()                                             # 搭档随即开打，这边的行却没起来
+    if between is not None:
+        runtime.before_run(between)                               # 桌面客户端没登录：上游把任务改写成了 Restart
+    clock.advance(minutes=3)
+    assert runtime.pick().next_run == clock.now                   # 不重新等，接着开打
+    clock.advance(seconds=30)
+    assert runtime.pick().next_run == clock.now
+    assert saved().team_wait_since is None                        # 没有新的等待记录
+    lines = [m for m in oas_messages(caplog, logging.INFO) if m.startswith('编排：')]
+    assert not [m for m in lines if '等搭档 u（' in m]               # 没有"开始等"那一行
+    assert lines.count('编排：已与搭档会合，第 1 行 Orochi 还没开打，接着开打') == 1   # 同一次会合只记一行
+
+
+def test_the_meeting_is_used_up_once_the_row_starts():
+    waiting_for_t()
+    runtime, script, config, clock = make([OrchestraRow(task='Orochi')], partner='u')
+    runtime.pick()                                                # 会合
+    runtime.before_run('Orochi')                                  # 行真的起来了
+    clock.advance(minutes=1)
+    runtime.after_run('Orochi', False)                            # 没打完，中断在这一行
+    partner_file(phase='interrupted', row_task='Orochi', team_row_ordinal=1, team_partner='t')   # 搭档也停在这一行
+    assert runtime.pick().next_run == clock.now + timedelta(seconds=31)   # 续跑照常先看搭档：等它
+
+
+def test_a_new_process_starts_without_the_meeting():
+    waiting_for_t()
+    runtime, script, config, clock = make([OrchestraRow(task='Orochi')], partner='u')
+    runtime.pick()                                                # 会合，行没起来，进程随后退出
+    partner_playing()
+    restarted, _, _, clock = make([OrchestraRow(task='Orochi')], partner='u')   # 同一份进度，新进程
+    clock.advance(minutes=3)
+    assert restarted.pick().next_run == clock.now + timedelta(seconds=31)   # 会合只记在内存里：照常等
+
+
+def test_a_pause_that_fails_in_any_way_still_notifies_and_exits(caplog):
+    runtime, script, config, clock = make([OrchestraRow(task='Orochi')], partner='u')
+    config.notifier = notifier = FakeNotifier()
+    runtime.pick()
+    clock.advance(minutes=30)
+
+    def broken():
+        raise RuntimeError('配置写坏了')
+    config.save = broken
+    with pytest.raises(SystemExit, match='等搭档 u 超时，已暂停'):
+        runtime.pick()
+    assert len(notifier.pushes) == 1 and saved().status_note == '等搭档 u 超时，已暂停'
+    errors = [r for r in caplog.records if r.name == 'oas' and r.levelno == logging.ERROR]
+    assert [r.getMessage() for r in errors] == ["编排：等搭档超时，暂停没能存进配置：RuntimeError('配置写坏了')"]
+    assert errors[0].exc_info is None

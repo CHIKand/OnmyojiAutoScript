@@ -788,3 +788,33 @@ def test_finish_interrupted_row_clears_the_wait_record():
     out = finish_interrupted_row(p, running(SIX), at(2), random.Random(0))
     assert (out.team_wait_since, out.team_wait_ordinal, out.team_wait_task, out.team_alive_at) == (None,) * 4
     assert (out.team_met_at, out.team_met_ordinal, out.team_met_task) == (T0, 1, 'Orochi')
+
+
+# 运行时审查后的裁定：编排结束时（跑完、停止）也清掉等待记录，会合记录不动
+
+MET = T0 - timedelta(hours=1)
+
+
+def waiting_at_second_row() -> Progress:
+    """在第 2 行等搭档（第 2 个组队行）；上一次会合在第 1 个组队行。"""
+    return Progress(phase='ready', row_index=1, sequence_started_at=T0, team_wait_since=T0, team_wait_ordinal=2,
+                    team_wait_task='Orochi', team_alive_at=at(1), team_met_at=MET, team_met_ordinal=1,
+                    team_met_task='Orochi')
+
+
+def test_finish_clears_the_wait_record_and_keeps_the_meeting():
+    p = waiting_at_second_row()
+    out = sync_controls(running([OrchestraRow(task='Orochi')]), p, at(2))   # 等着的第 2 行被改表删掉：序列跑完
+    assert out.phase == 'done'
+    assert (out.team_wait_since, out.team_wait_ordinal, out.team_wait_task, out.team_alive_at) == (None,) * 4
+    assert (out.team_met_at, out.team_met_ordinal, out.team_met_task) == (MET, 1, 'Orochi')
+    assert p.team_wait_since == T0   # 不改传入的对象
+
+
+def test_stop_clears_the_wait_record_and_keeps_the_meeting():
+    p = waiting_at_second_row()
+    out = sync_controls(Orchestra(rows=SIX, state='idle'), p, at(2))
+    assert out.phase == 'idle'
+    assert (out.team_wait_since, out.team_wait_ordinal, out.team_wait_task, out.team_alive_at) == (None,) * 4
+    assert (out.team_met_at, out.team_met_ordinal, out.team_met_task) == (MET, 1, 'Orochi')
+    assert p.team_wait_since == T0

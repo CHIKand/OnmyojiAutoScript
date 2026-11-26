@@ -1,7 +1,8 @@
 """编排引擎接入调度循环的运行时：在上游 Script 选任务、运行任务前、运行任务后三处各挂一个钩子。
 
 没有编排在进行时（state 是 idle，阶段是 idle 或 done），pick 原样返回上游 config.get_next() 的结果，
-其余两个钩子什么都不做，不改配置、不写进度文件，实例的行为与上游一致。
+其余两个钩子什么都不做，不改配置、不写进度文件，实例的行为与上游一致。唯一的例外：进程第一次选任务时，
+读到上一个进程留下的等待记录，就清掉并存盘（见下面的等搭档）。
 调用顺序与 engine 模块说明一致：选任务前 recover、sync_controls、decide，选中要等搭档的组队行时再过 team.gate；
 行运行前 row_limits、on_row_start；行运行后先还原行参数，再 on_row_end。
 
@@ -14,7 +15,9 @@
 否则上游空等时只截图不点击，连着等下去会被当成卡死而重启游戏。续跑的组队行搭档已离开：这一行按已打完记账，再 decide 一次。
 等满了：先存盘清空后的等待记录，再读一次搭档，它刚好先走了就照常开打，否则暂停编排、发通知、抛 SystemExit 让实例退出。
 插队放行前撤下等待刷新时间，搭档不再把这边算作在等，开始等的时间不变。本进程第一次读进度时清掉上一个进程留下的等待记录：
-实例重启后（点继续也会重启实例）重新计时。没设搭档时这些都不发生；进度里的搭档名只在编排进行中才跟着设置刷新。
+实例重启后（点继续也会重启实例）重新计时。会合之后这一行没能马上开始（比如桌面客户端没登录，上游先跑 Restart）：
+会合记在内存里，再选到同一行时直接开打，不重新等，这一行真正开始时清掉，新进程没有。
+没设搭档时这些都不发生；进度里的搭档名只在编排进行中才跟着设置刷新。
 
 钩子不让异常漏进调度循环：pick 出错退回上游的选法，before_run、after_run 出错只记日志。唯一的例外是等搭档超时时
 主动抛的 SystemExit：它不是 Exception，pick 的兜底拦不住，交给上游的进程外壳把实例记为警告状态后退出。
@@ -95,6 +98,8 @@ class OrchestraRuntime:
         self._row: _Row | None = None         # before_run 已启动、after_run 还没收尾的行
         self._warned_self_partner = False     # 搭档设成了自己的警告，每个进程只记一次
         self._team_logged_at: datetime | None = None   # 等搭档的日志上一次记在什么时候，按 team.LOG_EVERY 节流
+        self._met: tuple[int, str, int] | None = None  # 已与搭档会合、还没开打的行：(行号, 任务, 第几遍循环)，见 _team_gate
+        self._met_noted = False                         # 这次会合"还没开打，接着开打"的那行日志已经记过
 
     # ---------- 选任务 ----------
 
@@ -350,9 +355,19 @@ class OrchestraRuntime:
         skip：续跑的组队行搭档已离开，这一行按已打完记账，再 decide 一次。又是组队行就再过一次，这次不是续跑，不会再 skip。
         wait：复位卡死计时，交一个 team.POLL 后到点的 wait。日志按 team.LOG_EVERY 节流。
         timeout：先存盘清空后的进度，再读一次搭档：它在最后一刻按规则 a 先走了就照常开打，否则 _stop_for_partner，不返回。
+
+        每次 go（规则 a、b，续跑时搭档还在，超时后救回）都在内存里记下这一行（_met），直到它真正开始，由 _before_run 清掉。
+        其间再选到同一行（行号、任务、第几遍循环都相同），不读搭档、不过 gate，直接开打：这一行没能马上开始
+        （桌面客户端没登录时上游把任务改写成 Restart，或 before_run 中途退出），搭档多半已经开打，重新等的话
+        规则 b 认不出那次会合（它早于新的开始等的时间），只会白等到超时。新进程没有这个记录。
         """
         partner_name, me, minutes = settings.partner, config.config_name, settings.partner_wait_minutes
         index, command = decision.row_index, decision.command
+        if self._met == (index, command, p.loop_count):
+            if not self._met_noted:
+                self._met_noted = True
+                logger.info(f'编排：已与搭档会合，第 {index + 1} 行 {command} 还没开打，接着开打')
+            return p, decision, None
         resuming = p.phase == 'interrupted' and index == p.row_index and p.row_task == command   # 同 _before_run
         partner = self._read_partner(partner_name)
         result = team.gate(p, me, partner, ordinal, command, now, minutes, resuming)
@@ -396,6 +411,7 @@ class OrchestraRuntime:
             logger.info(f'编排：搭档还在第 {ordinal} 个组队行，第 {index + 1} 行直接续跑')
         else:
             logger.info(f'编排：与搭档 {partner_name} 会合，第 {index + 1} 行 {command} 开打')
+        self._met, self._met_noted = (index, command, q.loop_count), False
         return q, decision, None
 
     @staticmethod
@@ -423,7 +439,7 @@ class OrchestraRuntime:
         """等满了搭档也没来：按顺序暂停编排并存配置、面板提示改成超时、发通知、记警告，最后抛 SystemExit 让实例退出。
 
         SystemExit 不是 Exception，pick 的兜底拦不住，交给上游的进程外壳把实例记为警告状态后退出。
-        暂停存不进配置（OSError）、通知发不出，都只记错误，不带调用栈，照样往下做：停下比通知要紧。
+        暂停存不进配置、通知发不出，不管出的是什么异常，都只记错误、不带调用栈，照样往下做：挡不住后面的提示、通知和退出。
         p 是等待记录已清空、已存过盘的进度，其余原样保留，点继续时重新开始等、重新计时。
         situation 是最后一次读到的搭档情况（team.partner_situation），写进通知的第二行。
         """
@@ -431,7 +447,7 @@ class OrchestraRuntime:
         partner_name, minutes = settings.partner, settings.partner_wait_minutes
         try:
             self._pause(config)
-        except OSError as exc:
+        except Exception as exc:
             logger.error(f'编排：等搭档超时，暂停没能存进配置：{exc!r}')
         stopped = f'等搭档 {partner_name} 超时，已暂停'
         self._commit(replace(p, status_note=stopped))
@@ -497,6 +513,7 @@ class OrchestraRuntime:
         except Exception as exc:
             self._abort_start(config, p, written, index, command, exc)
             return
+        self._met = None   # 行真正开始了（进度与配置都已存盘）：会合用掉了；改跑了别的行时，那次会合也作废
         script.running_task_obj = None   # 心跳不能读到上一个任务的计数
         row_run = _Row(spec, base=started.done_count or 0)
         self._row = row_run
