@@ -6,8 +6,8 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from module.orchestra.engine import (Decision, TaskRef, decide, next_row_index, on_row_end, on_row_start, recover,
-                                     row_limits, sync_controls)
+from module.orchestra.engine import (Decision, TaskRef, decide, finish_interrupted_row, next_row_index, on_row_end,
+                                     on_row_start, recover, row_limits, sync_controls)
 from module.orchestra.model import Orchestra, OrchestraRow
 from module.orchestra.progress import HISTORY_LIMIT, Progress
 
@@ -725,3 +725,45 @@ def test_resume_without_a_recorded_rest_keeps_the_deadline():
     p = Progress(phase='resting', row_index=1, rest_until=at(30), paused=True, rest_remaining=None)
     out = sync_controls(running(SIX), p, at(20))
     assert (out.paused, out.rest_until, out.rest_remaining) == (False, at(30), None)
+
+
+# ---------- 等搭档：组队序号与续跑时按已打完记账 ----------
+
+def test_on_row_start_records_team_ordinal():
+    assert on_row_start(Progress(phase='ready'), 3, T0, {}, 'Orochi', team_ordinal=2).team_row_ordinal == 2
+
+
+def test_on_row_end_clears_team_ordinal_only_when_completed():
+    started = on_row_start(Progress(phase='ready'), 0, T0, {}, 'Orochi', team_ordinal=1)
+    settings = Orchestra(rows=[OrchestraRow(task='Orochi'), OrchestraRow(task='RealmRaid')])
+    assert on_row_end(started, settings, T0, False, None, random.Random(0)).team_row_ordinal == 1
+    assert on_row_end(started, settings, T0, True, None, random.Random(0)).team_row_ordinal is None
+
+
+def test_finish_interrupted_row_books_it_as_done():
+    settings = Orchestra(rows=[OrchestraRow(task='Orochi', rest_minutes=2), OrchestraRow(task='RealmRaid')])
+    p = Progress(phase='interrupted', row_index=0, row_task='Orochi', row_started_at=T0, row_elapsed_before=600.0,
+                 done_count=7, total_elapsed=100.0, team_row_ordinal=1)
+    end = T0 + timedelta(hours=1)
+    q = finish_interrupted_row(p, settings, end, random.Random(0))
+    assert q.total_elapsed == 700.0
+    assert q.history[-1] == {'row_index': 0, 'task': 'Orochi', 'started_at': T0.isoformat(),
+                             'ended_at': end.isoformat(), 'done_count': 7, 'loop_count': 0}
+    assert (q.phase, q.row_index, q.rest_until) == ('resting', 1, end + timedelta(minutes=2))
+    assert (q.row_elapsed_before, q.done_count, q.row_task, q.team_row_ordinal) == (0.0, None, None, None)
+
+
+def test_finish_interrupted_row_ends_like_a_completed_row():
+    rows = [OrchestraRow(task='Orochi'), OrchestraRow(task='RealmRaid')]
+    p = Progress(phase='interrupted', row_index=1, row_task='RealmRaid', row_started_at=T0, heartbeat_at=at(5),
+                 row_elapsed_before=300.0, saved_params={'k': 1}, history=[{'row_index': 0}])
+    before = copy.deepcopy(p)
+    done = finish_interrupted_row(p, running(rows), at(60), random.Random(0))   # 最后一行，跑完就停
+    assert (done.phase, done.saved_params, done.heartbeat_at) == ('done', {}, None)
+    assert done.history[-1]['task'] == 'RealmRaid'
+    looped = finish_interrupted_row(p, running(rows, after_finish='loop'), at(60), random.Random(0))
+    assert (looped.phase, looped.row_index, looped.loop_count) == ('resting', 0, 1)
+    capped = finish_interrupted_row(p, running(rows, after_finish='loop', total_minutes_cap=5), at(60),
+                                    random.Random(0))
+    assert capped.phase == 'done'   # 此前累计的 5 分钟计入总时长，到了上限
+    assert p == before and done.history is not p.history

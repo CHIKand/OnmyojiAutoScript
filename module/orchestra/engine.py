@@ -5,8 +5,9 @@
 就知道有没有变化、要不要存盘。decide 每次选任务都会被调用，被跳过的无效行由运行时去记日志，免得刷屏。
 
 运行时在调度循环里的调用顺序：
-    选任务前：本进程第一次先 recover，再 sync_controls，最后 decide；
-    行运行前：row_limits 求本次上限，on_row_start 记下开始和这一行的任务；
+    选任务前：本进程第一次先 recover，再 sync_controls，最后 decide；选中的是组队行、又设了搭档时先过 team.gate，
+        续跑时搭档已离开（skip）就用 finish_interrupted_row 把这一行按已打完记账，再 decide 一次；
+    行运行前：row_limits 求本次上限，on_row_start 记下开始、这一行的任务和组队序号；
     行运行后：先还原行参数，再 on_row_end。
 row_limits 按剩余量算的前提是接着跑同一个中断行：只有 decide 选中的行号等于进度里的 row_index、
 该行的任务也等于进度里的 row_task 时，运行时才用它，否则用该行自己的上限。on_row_start 判断续跑用的是同一个条件。
@@ -204,8 +205,10 @@ def row_limits(row: OrchestraRow, p: Progress, policy: str) -> tuple[int | None,
 
 
 def on_row_start(p: Progress, row_index: int, now: datetime, saved_params: dict,
-                 task: str | None = None) -> Progress:
-    """记下第 row_index 行开始运行。saved_params 是写入行参数前的用户原值，task 是这一行的任务。
+                 task: str | None = None, team_ordinal: int | None = None) -> Progress:
+    """记下第 row_index 行开始运行。saved_params 是写入行参数前的用户原值，task 是这一行的任务，
+    team_ordinal 是这一行的组队序号（见 team.team_ordinal，不是组队行为 None），记进 team_row_ordinal，
+    搭档续跑时凭它认出我是不是还在同一个组队行。
 
     接着同一个中断行续跑（阶段为 interrupted，行号相同，任务也相同）时，保留累计的用时和次数；
     其余情况都是新的一行，从零算：表在运行中被改过、同一个行号换成了别的任务，也是新的一行。
@@ -216,6 +219,7 @@ def on_row_start(p: Progress, row_index: int, now: datetime, saved_params: dict,
         p.done_count = None
     p.row_index = row_index
     p.row_task = task
+    p.team_row_ordinal = team_ordinal
     p.phase = 'row_running'
     p.row_started_at = now
     p.heartbeat_at = None
@@ -240,14 +244,13 @@ def on_row_end(p: Progress, settings: Orchestra, now: datetime, completed: bool,
     """记下当前行的结果，并定下一步。运行时要先还原行参数再调用，所以 saved_params 在这里清空。
 
     没完成：阶段为 interrupted，本次用时累加进 row_elapsed_before，done_count 不为 None 就记下，None 则保留此前的
-    累计；策略为 rerun 时两项清零，下次整行重打。row_task 保留，续跑时凭它认行。
+    累计；策略为 rerun 时两项清零，下次整行重打。row_task、team_row_ordinal 保留，续跑时凭它们认行。
     完成：用时（含此前各次中断累计的）计入总时长，写一条历史（任务取 row_task，即实际跑的那个；done_count 取传入值，
     None 表示未知），然后找下一个可运行的行：已无下一行时，循环则回到第一个可运行行并计一遍，否则结束；
     总时长到达上限也结束，不会打断行，只在行结束时判断。没结束就按该行的设置休息；休息为 0 则直接 ready。
     行运行期间被暂停时，休息的全长记进 rest_remaining，继续时从头休满。
     """
     p = copy.deepcopy(p)
-    index = p.row_index
     run = 0.0 if p.row_started_at is None else max(0.0, (now - p.row_started_at).total_seconds())
     p.saved_params = {}
     p.heartbeat_at = None
@@ -262,6 +265,29 @@ def on_row_end(p: Progress, settings: Orchestra, now: datetime, completed: bool,
             p.done_count = None
         return p
 
+    _complete_row(p, settings, now, run, done_count, rng)
+    return p
+
+
+def finish_interrupted_row(p: Progress, settings: Orchestra, now: datetime, rng: random.Random) -> Progress:
+    """把阶段为 interrupted 的当前行按已打完记账：续跑的组队行发现搭档已经离开时用（team.gate 返回 skip）。
+
+    不再加新的运行时间：总时长只加此前各次中断累计的 row_elapsed_before。历史的开始时间取原来的 row_started_at
+    （没有时为 None），次数取进度里的累计 done_count。之后找下一行、循环、总时长上限、休息，以及清空这一行的
+    运行状态（saved_params、heartbeat_at、累计用时与次数、row_task、team_row_ordinal），都与 on_row_end 的完成分支相同。
+    """
+    p = copy.deepcopy(p)
+    p.saved_params = {}
+    p.heartbeat_at = None
+    _complete_row(p, settings, now, 0.0, p.done_count, rng)
+    return p
+
+
+def _complete_row(p: Progress, settings: Orchestra, now: datetime, run: float, done_count: int | None,
+                  rng: random.Random) -> None:
+    """就地把当前行记为完成：本次用时 run 连同此前累计的计入总时长，写一条历史，清掉这一行的运行状态，
+    再定下一步。规则见 on_row_end 的完成分支，finish_interrupted_row 共用。"""
+    index = p.row_index
     p.total_elapsed += p.row_elapsed_before + run
     p.history = (p.history + [{
         'row_index': index,
@@ -274,6 +300,7 @@ def on_row_end(p: Progress, settings: Orchestra, now: datetime, completed: bool,
     p.row_elapsed_before = 0.0
     p.done_count = None
     p.row_task = None
+    p.team_row_ordinal = None
 
     cap = settings.total_minutes_cap
     following = None
@@ -285,7 +312,7 @@ def on_row_end(p: Progress, settings: Orchestra, now: datetime, completed: bool,
                 p.loop_count += 1
     if following is None:
         _finish(p)
-        return p
+        return
 
     p.row_index = following
     seconds = _rest_seconds(settings, index, rng)
@@ -297,7 +324,6 @@ def on_row_end(p: Progress, settings: Orchestra, now: datetime, completed: bool,
         p.rest_until = now + timedelta(seconds=seconds)
         if p.paused:
             p.rest_remaining = seconds
-    return p
 
 
 def recover(p: Progress, now: datetime) -> Progress:
