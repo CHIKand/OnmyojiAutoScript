@@ -2,14 +2,22 @@
 
 没有编排在进行时（state 是 idle，阶段是 idle 或 done），pick 原样返回上游 config.get_next() 的结果，
 其余两个钩子什么都不做，不改配置、不写进度文件，实例的行为与上游一致。
-调用顺序与 engine 模块说明一致：选任务前 recover、sync_controls、decide；行运行前 row_limits、on_row_start；
-行运行后先还原行参数，再 on_row_end。
+调用顺序与 engine 模块说明一致：选任务前 recover、sync_controls、decide，选中要等搭档的组队行时再过 team.gate；
+行运行前 row_limits、on_row_start；行运行后先还原行参数，再 on_row_end。
 
 进度（Progress）只由本进程写：首次 pick 时读一次放在内存，之后每次变化都存盘。文件写不进去只记警告，
 以内存里的为准，下一次存盘时补写。心跳线程与主线程共用 _lock，进度的替换、就地修改和存盘都在锁里。
 配置每次现取 script.config：上游会删掉缓存重建 config（ConfigModel 也会被 reload 换掉），不能跨调用持有。
 
-钩子不让异常漏进调度循环：pick 出错退回上游的选法，before_run、after_run 出错只记日志。
+等搭档（会合规则见 team 模块说明）：设了搭档（不是本实例自己）、decide 选中的是组队行时，交给上游之前先读搭档的进度文件
+（只读）过一次 team.gate。接着等：交一个 team.POLL 后到点的占位，面板提示写已等多久、搭档在哪，并复位上游设备的卡死计时，
+否则上游空等时只截图不点击，连着等下去会被当成卡死而重启游戏。续跑的组队行搭档已离开：这一行按已打完记账，再 decide 一次。
+等满了：先存盘清空后的等待记录，再读一次搭档，它刚好先走了就照常开打，否则暂停编排、发通知、抛 SystemExit 让实例退出。
+插队放行前撤下等待刷新时间，搭档不再把这边算作在等，开始等的时间不变。本进程第一次读进度时清掉上一个进程留下的等待记录：
+实例重启后（点继续也会重启实例）重新计时。没设搭档时这些都不发生；进度里的搭档名只在编排进行中才跟着设置刷新。
+
+钩子不让异常漏进调度循环：pick 出错退回上游的选法，before_run、after_run 出错只记日志。唯一的例外是等搭档超时时
+主动抛的 SystemExit：它不是 Exception，pick 的兜底拦不住，交给上游的进程外壳把实例记为警告状态后退出。
 行参数是用户配置的原值被临时覆盖，所以出错时宁可不跑编排，也不能让覆盖后的值留在配置里：
 before_run 先把原值记进进度并存盘，再把行参数存进配置文件，两次落盘之间被杀，恢复时凭进度把原值写回即可；
 启动一行失败就撤回行参数并暂停编排，免得 decide 一直选中它、让它的任务一次次按原生设置跑；
@@ -20,13 +28,14 @@ after_run 没走完，进度里仍是 row_running 且带着 saved_params，下�
 编排进行中（state 是 running 或 paused 且阶段不是 idle、done）上游没有任务可跑，不能让实例因此退出：
 改交一个 5 分钟后到点的占位 Function，上游睡到那时再选，配置一变（比如点了继续）就提前醒来。编排停了或跑完了，照上游重抛。
 编排进行中每次选任务记一行 INFO（选中哪一行、休息到几点、放行了谁），没有编排的实例一行都不记。
+等搭档时不逐次记：开始等记一行，之后每 team.LOG_EVERY 记一行；会合、续跑时怎么处理、超时，各记一行。
 """
 import random
 import threading
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NoReturn
 
 from module.config.anti_ban import AntiBanGuard
 from module.config.config import Function
@@ -34,12 +43,13 @@ from module.config.config_model import ConfigModel
 from module.config.utils import convert_to_underscore
 from module.exception import RequestHumanTakeover
 from module.logger import logger
-from module.orchestra.engine import (Decision, TaskRef, decide, next_row_index, on_row_end, on_row_start, recover,
-                                     row_limits, sync_controls)
-from module.orchestra.mapping import TASK_SPECS, TaskSpec, apply_row, restore_params, serialize_value
+from module.orchestra import team
+from module.orchestra.engine import (Decision, TaskRef, decide, finish_interrupted_row, next_row_index, on_row_end,
+                                     on_row_start, recover, row_limits, sync_controls)
+from module.orchestra.mapping import TASK_SPECS, TaskSpec, apply_row, restore_params, serialize_value, team_tasks
 from module.orchestra.model import Orchestra, validate_rows
-from module.orchestra.progress import (Progress, adopt_legacy_progress, legacy_progress_path, load_progress,
-                                       progress_path, save_progress)
+from module.orchestra.progress import (Progress, adopt_legacy_progress, clear_team_wait, legacy_progress_path,
+                                       load_progress, progress_path, save_progress)
 
 _HEARTBEAT_THREAD = 'OrchestraHeartbeat'
 _JOIN_TIMEOUT = 5.0   # 等心跳线程退出的秒数上限：它在 Event 上等，被唤醒后至多还剩一次存盘（重试最多约 0.5 秒）
@@ -68,7 +78,8 @@ class _Row:
 
 
 class OrchestraRuntime:
-    """一个实例（Script）的编排运行时。script 只需要 config、anti_ban_guard、running_task_obj 这三样属性。"""
+    """一个实例（Script）的编排运行时。script 只需要 config、anti_ban_guard、running_task_obj 这三样属性；
+    设备对象 device 已经建好就拿来复位卡死计时，没建不新建。等搭档超时发通知用 config.notifier。"""
 
     def __init__(self, script, clock: Callable[[], datetime] = datetime.now, rng: random.Random | None = None,
                  heartbeat_interval: float = 30.0) -> None:
@@ -82,6 +93,8 @@ class OrchestraRuntime:
         self._dirty = False                   # 上一次存盘失败了，下一次不管有没有变化都补存
         self._decision: Decision | None = None   # 最近一次 pick 的决定，before_run 凭它判断这一轮是不是编排的行
         self._row: _Row | None = None         # before_run 已启动、after_run 还没收尾的行
+        self._warned_self_partner = False     # 搭档设成了自己的警告，每个进程只记一次
+        self._team_logged_at: datetime | None = None   # 等搭档的日志上一次记在什么时候，按 team.LOG_EVERY 节流
 
     # ---------- 选任务 ----------
 
@@ -91,7 +104,8 @@ class OrchestraRuntime:
         passthrough 原样返回上游的结果；上游没有任务可跑（抛 RequestHumanTakeover）时，编排没在进行就照样重抛，
         在进行（暂停也算）就改交一个 5 分钟后到点的占位 Function，不让实例退出。native 返回待办里同名的 Function；
         row 与 wait 另造一个：row 的 next_run 是现在，wait 的 next_run 是休息截止（或更早到点的插队任务）再加 1 秒，
-        上游发现它没到点就睡到那一刻再重选，占位的任务不会被运行。
+        等搭档时是 team.POLL 之后再加 1 秒，上游发现它没到点就睡到那一刻再重选，占位的任务不会被运行。
+        等搭档超时抛出的 SystemExit 不拦，让实例退出（见 _stop_for_partner）。
         上一个任务的对象（script.running_task_obj）在这里放下：心跳只在行运行时读它，空闲等待期间不必再引用着。
         """
         try:
@@ -126,6 +140,10 @@ class OrchestraRuntime:
         pending = [] if error is not None else [TaskRef(f.command, f.next_run) for f in config.pending_task]
         waiting = [] if error is not None else [TaskRef(f.command, f.next_run) for f in config.waiting_task]
         decision = decide(settings, p, pending, waiting, now)
+        wait_note = None   # 接着等搭档时面板上的等待提示，见 _team_gate
+        ordinal = self._team_ordinal(config, settings, decision)
+        if ordinal is not None:   # 放在置 idle 之前：续跑时搭档已离开、记完账序列跑完了，state 照样要写回 idle
+            p, decision, wait_note = self._team_gate(config, settings, p, decision, ordinal, pending, waiting, now)
 
         if decision.kind == 'row':
             self._log_skipped(settings, p, decision.row_index)
@@ -133,10 +151,14 @@ class OrchestraRuntime:
             self._set_idle(config)
         active = settings.state in ('running', 'paused') or p.phase not in ('idle', 'done')
         if active:
-            p = replace(p, status_note=self._anti_ban_note(config, now))   # 提示只在编排进行中才更新，否则原样不动
+            # 提示和搭档名只在编排进行中才更新，否则原样不动；等搭档时等待提示接在防封禁提示后面
+            note = '；'.join(text for text in (self._anti_ban_note(config, now), wait_note) if text)
+            p = replace(p, status_note=note, team_partner=settings.partner)
+        if decision.kind == 'native' and p.team_wait_since is not None:
+            p = replace(p, team_alive_at=None)   # 插队放行：搭档不再把这边算作在等，开始等的时间不动
         self._commit(p)
         self._decision = decision
-        if active:
+        if active and wait_note is None:   # 等搭档时由 _team_gate 按 team.LOG_EVERY 节流记日志，不逐次记
             self._log_decision(decision, p)
 
         if decision.kind == 'passthrough':
@@ -186,7 +208,9 @@ class OrchestraRuntime:
     def _load(self, config) -> bool:
         """首次调用时读进度文件。新位置还没有、旧位置（log/.orchestra_<实例名>.json）有时，先把旧文件搬过来，
         进行中的序列与没还原的原值都接得上。文件缺失或损坏时 load_progress 给默认进度，不算失败；
-        搬或读本身出错（如被占用）返回 False，这一次按上游选，下一次再来。"""
+        搬或读本身出错（如被占用）返回 False，这一次按上游选，下一次再来。
+        读到的等待记录是上一个进程留下的：清掉并存盘，再到组队行时重新计时。否则接着旧的开始时间算，一到就超时；
+        暂停后点继续也会重启实例进程，同样从头计时。"""
         if self._p is not None:
             return True
         path = progress_path(config.config_name)
@@ -197,7 +221,11 @@ class OrchestraRuntime:
         except OSError as exc:
             logger.warning(f'编排进度文件读取失败（{path}）：{exc!r}，本次按上游原逻辑选任务，下次再试')
             return False
+        stale = clear_team_wait(p)
         self._path, self._p = path, p
+        if stale:
+            with self._lock:
+                self._save_locked()
         return True
 
     def _abandon_row(self) -> None:
@@ -297,6 +325,126 @@ class OrchestraRuntime:
                 return task
         raise LookupError(f'待办里没有 {command}')
 
+    # ---------- 等搭档 ----------
+
+    def _team_ordinal(self, config, settings: Orchestra, decision: Decision) -> int | None:
+        """decision 选中的行开打前要等搭档时，返回它的组队序号（见 team.team_ordinal）。不用等就返回 None：
+        不是行、没设搭档、搭档设成了自己（手改的配置，按没设处理，每个进程只记一次警告），或这一行不是组队行。
+        是不是组队行，凭这一刻配置里任务的队长、队员身份判断（mapping.team_tasks）。"""
+        if decision.kind != 'row' or not settings.partner:
+            return None
+        if settings.partner == config.config_name:
+            if not self._warned_self_partner:
+                self._warned_self_partner = True
+                logger.warning(f'编排：搭档设成了自己（{config.config_name}），不等搭档')
+            return None
+        return team.team_ordinal(settings.rows, decision.row_index, team_tasks(config.model))
+
+    def _team_gate(self, config, settings: Orchestra, p: Progress, decision: Decision, ordinal: int,
+                   pending: list[TaskRef], waiting: list[TaskRef],
+                   now: datetime) -> tuple[Progress, Decision, str | None]:
+        """decision 选中的组队行（组队序号 ordinal）开打前，读一次搭档的进度交给 team.gate，按结果处理。
+        返回 (进度, 决定, 等待提示)。等待提示只在接着等搭档时有值，_pick 把它接在防封禁提示后面写进 status_note。
+
+        go：开打，照常返回这一行。
+        skip：续跑的组队行搭档已离开，这一行按已打完记账，再 decide 一次。又是组队行就再过一次，这次不是续跑，不会再 skip。
+        wait：复位卡死计时，交一个 team.POLL 后到点的 wait。日志按 team.LOG_EVERY 节流。
+        timeout：先存盘清空后的进度，再读一次搭档：它在最后一刻按规则 a 先走了就照常开打，否则 _stop_for_partner，不返回。
+        """
+        partner_name, me, minutes = settings.partner, config.config_name, settings.partner_wait_minutes
+        index, command = decision.row_index, decision.command
+        resuming = p.phase == 'interrupted' and index == p.row_index and p.row_task == command   # 同 _before_run
+        partner = self._read_partner(partner_name)
+        result = team.gate(p, me, partner, ordinal, command, now, minutes, resuming)
+        q = result.progress
+
+        if result.kind == 'skip':
+            q = finish_interrupted_row(q, settings, now, self._rng)
+            logger.info(f'编排：搭档已离开第 {ordinal} 个组队行，第 {index + 1} 行按已打完记账')
+            again = decide(settings, q, pending, waiting, now)
+            again_ordinal = self._team_ordinal(config, settings, again)
+            if again_ordinal is None:
+                return q, again, None
+            return self._team_gate(config, settings, q, again, again_ordinal, pending, waiting, now)
+
+        if result.kind == 'wait':
+            waited = (now - q.team_wait_since) // timedelta(minutes=1)
+            situation = team.partner_situation(me, partner, ordinal, command, now)
+            self._reset_stuck_timer()
+            if q.team_wait_since != p.team_wait_since:   # 这一轮才开始等（或改等另一行）
+                logger.info(f'编排：第 {index + 1} 行 {command} 等搭档 {partner_name}'
+                            f'（第 {ordinal} 个组队行，最多 {minutes} 分钟）')
+                self._team_logged_at = now
+            elif self._team_logged_at is None or now - self._team_logged_at >= team.LOG_EVERY:
+                logger.info(f'编排：等搭档 {partner_name} 已 {waited} 分钟；{situation}')
+                self._team_logged_at = now
+            note = f'等搭档 {partner_name}：已等 {waited} 分钟，最多 {minutes} 分钟；{situation}'
+            return q, Decision('wait', None, at=now + team.POLL), note
+
+        met_at = result.met_at
+        if result.kind == 'timeout':
+            self._commit(q)   # 先把清空后的等待记录存下：从这一刻起，搭档不会再把这边算作在等
+            # 超时前开始等的时间。这一轮才开始等就超时（只有手改成 0 分钟的配置会这样）时，就是现在
+            since = p.team_wait_since if p.team_wait_since is not None else now
+            partner = self._read_partner(partner_name)
+            rescued = team.rescue_after_timeout(q, partner, ordinal, command, since)
+            if rescued is None:
+                self._stop_for_partner(config, q, team.partner_situation(me, partner, ordinal, command, now),
+                                       index, command)
+            q, met_at = rescued, rescued.team_met_at
+        if met_at is None:   # 续跑时搭档还在这一行
+            logger.info(f'编排：搭档还在第 {ordinal} 个组队行，第 {index + 1} 行直接续跑')
+        else:
+            logger.info(f'编排：与搭档 {partner_name} 会合，第 {index + 1} 行 {command} 开打')
+        return q, decision, None
+
+    @staticmethod
+    def _read_partner(name: str) -> Progress | None:
+        """读搭档的进度文件，只读，那是搭档实例自己写的。文件不存在、读时出 OSError（比如被占用、重试用尽），
+        或读出来是默认进度（load_progress 遇到损坏时给的就是它），都返回 None，当作读不到：接着等，不报错。"""
+        try:
+            partner = load_progress(progress_path(name))
+        except OSError:
+            return None
+        return None if partner == Progress() else partner
+
+    def _reset_stuck_timer(self) -> None:
+        """复位上游设备的卡死计时。等搭档时上游每次空等都按"任务队列为空时"的设置处理，回庭院的 GotoMain 只截图不点击，
+        连着等下去会被判为卡死，接着报错、重启游戏。设备对象已经建好（Script.device 是 cached_property，建好后在 __dict__
+        里）才复位，不为此新建：建设备要连模拟器或游戏窗口。出错只记警告，照常接着等。"""
+        try:
+            device = self._script.__dict__.get('device')
+            if device is not None:
+                device.stuck_record_clear()
+        except Exception as exc:
+            logger.warning(f'编排：复位卡死计时出错：{exc!r}')
+
+    def _stop_for_partner(self, config, p: Progress, situation: str, index: int, command: str) -> NoReturn:
+        """等满了搭档也没来：按顺序暂停编排并存配置、面板提示改成超时、发通知、记警告，最后抛 SystemExit 让实例退出。
+
+        SystemExit 不是 Exception，pick 的兜底拦不住，交给上游的进程外壳把实例记为警告状态后退出。
+        暂停存不进配置（OSError）、通知发不出，都只记错误，不带调用栈，照样往下做：停下比通知要紧。
+        p 是等待记录已清空、已存过盘的进度，其余原样保留，点继续时重新开始等、重新计时。
+        situation 是最后一次读到的搭档情况（team.partner_situation），写进通知的第二行。
+        """
+        settings = config.model.orchestra
+        partner_name, minutes = settings.partner, settings.partner_wait_minutes
+        try:
+            self._pause(config)
+        except OSError as exc:
+            logger.error(f'编排：等搭档超时，暂停没能存进配置：{exc!r}')
+        stopped = f'等搭档 {partner_name} 超时，已暂停'
+        self._commit(replace(p, status_note=stopped))
+        lines = (f'等搭档 {partner_name} 超过 {minutes} 分钟，已暂停在第 {index + 1} 行（{team.task_title(command)}）',
+                 situation,
+                 '处理好之后，在编排页点继续接着等；要两边都从头来，先把两个号都点停止，再都点开始')
+        try:
+            config.notifier.push(title='等搭档超时', content='\n'.join(lines))
+        except Exception as exc:
+            logger.error(f'编排：等搭档超时的通知没发出：{exc!r}')
+        logger.warning(f'编排：等搭档 {partner_name} 超过 {minutes} 分钟，暂停编排并退出实例')
+        raise SystemExit(stopped)
+
     # ---------- 行运行前 ----------
 
     def before_run(self, command: str) -> None:
@@ -333,8 +481,10 @@ class OrchestraRuntime:
             written = apply_row(config.model, row, count, minutes)
             saved = {**written, next_run_path: serialize_value(original_next_run)}   # 下面要把 next_run 改成现在
             now = self._clock()
-            # 先把原值记进进度并存盘，再把行参数存进配置文件：两次落盘之间被杀，恢复时凭进度把原值写回即可（幂等）
-            started = on_row_start(p, index, now, saved, command)
+            # 先把原值记进进度并存盘，再把行参数存进配置文件：两次落盘之间被杀，恢复时凭进度把原值写回即可（幂等）。
+            # 组队序号不管设没设搭档都记，搭档续跑时凭它认出这边是不是还在同一个组队行
+            ordinal = team.team_ordinal(settings.rows, index, team_tasks(config.model))
+            started = on_row_start(p, index, now, saved, command, team_ordinal=ordinal)
             self._commit(started)
             if self._dirty:   # 进度没存成：原值只在内存里，不能把行参数写进配置文件，当作启动失败
                 raise OSError('进度文件没能存盘，不写行参数')

@@ -41,8 +41,8 @@ def _last_seen(p: Progress) -> datetime | None:
     return p.heartbeat_at or p.row_started_at
 
 
-def _title(command: str | None) -> str:
-    """任务显示名：映射表里的 title，不在表里时用命令名本身。"""
+def task_title(command: str | None) -> str:
+    """任务显示名：映射表里的 title，不在表里时用命令名本身。面板上的搭档情况和运行时发的超时通知都用它。"""
     spec = TASK_SPECS.get(command)
     return spec.title if spec is not None else str(command)
 
@@ -125,11 +125,11 @@ def partner_situation(me: str, partner: Progress | None, ordinal: int, task: str
         if partner.team_wait_ordinal != ordinal:
             return f'搭档在等第 {partner.team_wait_ordinal} 个组队行，我在第 {ordinal} 个'
         if partner.team_wait_task != task:
-            return f'搭档这一行是 {_title(partner.team_wait_task)}，我是 {_title(task)}'
+            return f'搭档这一行是 {task_title(partner.team_wait_task)}，我是 {task_title(task)}'
         return '搭档也在等'
     if partner.phase == 'row_running':
         if _fresh(_last_seen(partner), now):
-            return f'搭档在跑第 {partner.row_index + 1} 行 {_title(partner.row_task)}'
+            return f'搭档在跑第 {partner.row_index + 1} 行 {task_title(partner.row_task)}'
         return _SILENT
     if partner.phase == 'resting':
         return '搭档在休息'
