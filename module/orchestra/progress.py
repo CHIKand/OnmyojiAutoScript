@@ -1,7 +1,7 @@
 """编排引擎的运行进度文件。
 
-每个实例一份，放在 log/orchestra/<实例名>.json。里面记着当前第几行、处于哪个阶段、心跳、休息截止时间，
-以及被行参数覆盖之前的用户原值：进程中断后凭它续跑或还原，接口也读它给运行面板。
+每个实例一份，放在 log/orchestra/<实例名>.json。里面记着当前第几行、处于哪个阶段、心跳、休息截止时间、
+被行参数覆盖之前的用户原值，以及等搭档的记录：进程中断后凭它续跑或还原，接口也读它给运行面板，搭档实例读它判断会合。
 不放在 log/ 根目录：上游每次启动会删掉 log/ 根目录下超过 14 天的文件（module/logger.py 的 cleanup_logs，
 子目录里只清 log/error），停了半个月的实例会连同没还原的原值一起丢掉进度。也不放在 config/：
 上游把那里的每个 json 都当作一个实例。早先版本放在 log/.orchestra_<实例名>.json，实例第一次读进度时
@@ -27,7 +27,8 @@ from module.logger import logger
 HISTORY_LIMIT = 20  # 文件里最多留多少条历史
 _RETRY_ATTEMPTS = 10  # 读写遇到 PermissionError 时，一次操作最多尝试的次数
 _RETRY_DELAY = 0.05   # 两次尝试之间等待的秒数
-_DATETIME_FIELDS = ('sequence_started_at', 'row_started_at', 'heartbeat_at', 'rest_until')
+_DATETIME_FIELDS = ('sequence_started_at', 'row_started_at', 'heartbeat_at', 'rest_until',
+                    'team_wait_since', 'team_alive_at', 'team_met_at')
 
 
 @dataclass
@@ -50,6 +51,17 @@ class Progress:
     paused: bool = False
     history: list[dict] = field(default_factory=list)  # 写文件时只留最后 HISTORY_LIMIT 条
     status_note: str = ''                  # 给运行面板看的提示，如 防封禁休眠中，08:00 继续
+    # 等搭档的等待记录：正在等时有值，会合或不再等后由 clear_team_wait 清空
+    team_wait_since: datetime | None = None    # 开始等的时刻
+    team_wait_ordinal: int | None = None       # 在等的是本表第几个组队行，从 1 起
+    team_wait_task: str | None = None          # 在等的那一行的任务
+    team_alive_at: datetime | None = None      # 最近一次刷新等待的时刻，搭档凭它判断这边还在不在等
+    # 最近一次与搭档会合：搭档凭它判断这边已经先走了
+    team_met_at: datetime | None = None
+    team_met_ordinal: int | None = None
+    team_met_task: str | None = None
+    team_partner: str = ''                     # 本实例当前设的搭档
+    team_row_ordinal: int | None = None        # 正在跑或被打断的那一行是第几个组队行；不是组队行为 None
 
 
 def _to_json_dict(p: Progress) -> dict:
@@ -170,3 +182,14 @@ def progress_to_dict(p: Progress, now: datetime) -> dict:
     elif p.phase == 'resting' and p.rest_until is not None:
         data['rest_remaining_seconds'] = max(0.0, (p.rest_until - now).total_seconds())
     return data
+
+
+def clear_team_wait(p: Progress) -> bool:
+    """就地清掉 p 的等待记录：team_wait_since、team_wait_ordinal、team_wait_task、team_alive_at；会合记录不动。
+
+    原来有一项有值就返回 True，调用方据此决定要不要存盘；本来就是空的返回 False。
+    """
+    had_any = any(value is not None
+                  for value in (p.team_wait_since, p.team_wait_ordinal, p.team_wait_task, p.team_alive_at))
+    p.team_wait_since = p.team_wait_ordinal = p.team_wait_task = p.team_alive_at = None
+    return had_any

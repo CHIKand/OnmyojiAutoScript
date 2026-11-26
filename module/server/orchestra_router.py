@@ -34,7 +34,7 @@ orchestra_app = APIRouter(prefix='/custom/orchestra')
 
 _NOT_FOUND = '实例不存在'
 _EDITABLE = ('rows', 'after_finish', 'total_minutes_cap', 'default_rest_minutes', 'rest_jitter', 'resume_policy',
-             'cut_in_tasks')   # PUT 能改的项；state、command、command_seq 只由命令接口和引擎写
+             'cut_in_tasks', 'partner', 'partner_wait_minutes')   # PUT 能改的项；state、command、command_seq 只由命令接口和引擎写
 _STATE_OF_ACTION = {'start': 'running', 'resume': 'running', 'pause': 'paused', 'stop': 'idle'}   # 启停实例的命令写的 state
 _ACTIONS = (*_STATE_OF_ACTION, 'skip_rest')   # 用元组，action 是什么类型的值都能安全地比较
 _CONFIG_LOCK = threading.Lock()   # 本进程里接口之间的配置读改写串行，见文件开头
@@ -58,18 +58,21 @@ def _validation_errors(exc: ValidationError) -> list[dict]:
 
 
 def _read_view(name: str) -> dict:
-    if name not in instance_names():
+    names = instance_names()
+    if name not in names:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     settings = ConfigModel(name).orchestra.model_dump(mode='json')
     try:
         progress = load_progress(progress_path(name))
     except OSError as exc:   # 进度文件被占用，重试用尽仍读不了：页面 2 秒后会再来读
         raise HTTPException(status_code=503, detail='进度文件暂时无法读取') from exc
-    return {'settings': settings, 'progress': progress_to_dict(progress, datetime.now()), 'catalog': catalog()}
+    return {'settings': settings, 'progress': progress_to_dict(progress, datetime.now()), 'catalog': catalog(),
+            'partners': sorted(names - {name})}   # 搭档下拉框的候选：其余实例
 
 
 def _write_settings(name: str, body: dict) -> dict:
-    if name not in instance_names():
+    names = instance_names()
+    if name not in names:
         return {'ok': False, 'errors': [{'index': -1, 'field': 'script_name', 'message': _NOT_FOUND}]}
     current = ConfigModel(name).orchestra
     accepted = {key: body[key] for key in _EDITABLE if key in body}
@@ -77,7 +80,7 @@ def _write_settings(name: str, body: dict) -> dict:
         candidate = Orchestra.model_validate({**current.model_dump(), **accepted})
     except ValidationError as exc:
         return {'ok': False, 'errors': _validation_errors(exc)}
-    errors = validate_settings(candidate)
+    errors = validate_settings(candidate, names, name)   # 搭档要是另一个已有的实例
     if errors:
         return {'ok': False, 'errors': [asdict(error) for error in errors]}
 
@@ -196,7 +199,8 @@ async def _control(name: str, action: str) -> bool:
 
 @orchestra_app.get('/{script_name}')
 async def get_orchestra(script_name: str) -> dict:
-    """编排设置、运行进度与任务目录。名字不是 config/ 下的实例返回 404，进度文件暂时读不了返回 503。"""
+    """编排设置、运行进度、任务目录，以及搭档的候选（其余实例名，排好序）。
+    名字不是 config/ 下的实例返回 404，进度文件暂时读不了返回 503。"""
     return await asyncio.to_thread(_read_view, script_name)
 
 

@@ -9,7 +9,8 @@
 
 本模块在 script.py 与服务端的导入链上，所以不按名字导入上游任务模块里的枚举：子项的枚举在建表时
 按字段路径从 ConfigModel 的类型标注里取。上游改了字段或枚举，只是对不上的任务不进 TASK_SPECS
-（记一条警告），表里它的行校验不过、运行时跳过，导入本身不会失败。
+（记一条警告），表里它的行校验不过、运行时跳过，导入本身不会失败。组队身份字段例外：它对不上时任务照样进表，
+只是它的行不再算组队行，见 _resolve。
 """
 from dataclasses import dataclass, replace
 from datetime import datetime, time
@@ -49,6 +50,7 @@ class TaskSpec:
     time_path: str | None       # 时长字段（Time 类型）；None 表示没有
     subs: tuple[SubField, ...]  # 子项，依次对应 sub1、sub2
     counter_attr: str | None    # 任务对象上记录"已打次数"的属性名；None 表示没有可靠的属性
+    team_status_path: str | None = None   # 组队身份字段，见 team_tasks；None 表示这个任务不分身份，或字段对不上
 
 
 def _enum_sub(path: str, enum_cls: type[Enum]) -> SubField:
@@ -69,41 +71,49 @@ def _on_off(raw: str) -> bool:
 #   MetaDemon：计数在类级的 battle_wait runtime 里，不会累加 current_count；
 #   FindJade、MemoryScrolls：不计战斗次数。
 # BondlingFairyland 在 handoff1 / handoff2 身份下，换手时会把 current_count 清零。
+# team_status_path 只有能组队的 7 个任务有，都是任务自己的 user_status（队长、队员、单刷……），其余任务为 None。
 _DEFINITIONS = (
     TaskSpec('Orochi', 'orochi', '御魂·八岐大蛇',
              count_path='orochi_config.limit_count', count_max=None, time_path='orochi_config.limit_time',
-             subs=(_EnumSub('orochi_config.layer'),), counter_attr='current_count'),
+             subs=(_EnumSub('orochi_config.layer'),), counter_attr='current_count',
+             team_status_path='orochi_config.user_status'),
     TaskSpec('Sougenbi', 'sougenbi', '御魂·业原火',
              count_path='sougenbi_config.limit_count', count_max=None, time_path='sougenbi_config.limit_time',
              subs=(_EnumSub('sougenbi_config.sougenbi_class'),), counter_attr='current_count'),
     TaskSpec('FallenSun', 'fallen_sun', '御魂·日轮之陨',
              count_path='fallen_sun_config.limit_count', count_max=None, time_path='fallen_sun_config.limit_time',
-             subs=(_EnumSub('fallen_sun_config.layer'),), counter_attr='current_count'),
+             subs=(_EnumSub('fallen_sun_config.layer'),), counter_attr='current_count',
+             team_status_path='fallen_sun_config.user_status'),
     TaskSpec('EternitySea', 'eternity_sea', '御魂·永生之海',
              count_path='eternity_sea_config.limit_count', count_max=None, time_path='eternity_sea_config.limit_time',
-             subs=(_EnumSub('eternity_sea_config.layer'),), counter_attr='current_count'),
+             subs=(_EnumSub('eternity_sea_config.layer'),), counter_attr='current_count',
+             team_status_path='eternity_sea_config.user_status'),
     TaskSpec('SixRealms', 'six_realms', '御魂·六道之门',
              count_path='six_realms_gate.limit_count', count_max=None, time_path='six_realms_gate.limit_time',
              subs=(), counter_attr=None),
     TaskSpec('OtherWorldTwilight', 'other_world_twilight', '御魂·彼世逢魔',
              count_path='other_world_twilight_config.limit_count', count_max=None,
              time_path='other_world_twilight_config.limit_time',
-             subs=(), counter_attr='current_count'),
+             subs=(), counter_attr='current_count',
+             team_status_path='other_world_twilight_config.user_status'),
     TaskSpec('BondlingFairyland', 'bondling_fairyland', '肝帝·契灵之境',
              count_path='bondling_config.limit_count', count_max=None, time_path='bondling_config.limit_time',
              subs=(_EnumSub('bondling_config.bondling_mode'), _EnumSub('bondling_config.bondling_stone_class')),
-             counter_attr='current_count'),
+             counter_attr='current_count',
+             team_status_path='bondling_config.user_status'),
     TaskSpec('EvoZone', 'evo_zone', '肝帝·觉醒副本',
              count_path='evo_zone_config.limit_count', count_max=None, time_path='evo_zone_config.limit_time',
              subs=(_EnumSub('evo_zone_config.kirin_type'), _EnumSub('evo_zone_config.layer')),
-             counter_attr='current_count'),
+             counter_attr='current_count',
+             team_status_path='evo_zone_config.user_status'),
     TaskSpec('GoryouRealm', 'goryou_realm', '肝帝·御灵之境',
              count_path='goryou_config.limit_count', count_max=None, time_path='goryou_config.limit_time',
              subs=(_EnumSub('goryou_config.goryou_class'),), counter_attr='current_count'),
     TaskSpec('Exploration', 'exploration', '肝帝·探索',
              count_path='exploration_config.minions_cnt', count_max=None, time_path='exploration_config.limit_time',
              subs=(_EnumSub('exploration_config.exploration_level'),),
-             counter_attr='minions_cnt'),
+             counter_attr='minions_cnt',
+             team_status_path='exploration_config.user_status'),
     TaskSpec('Hyakkiyakou', 'hyakkiyakou', '肝帝·百鬼夜行',
              count_path='hyakkiyakou_config.hya_limit_count', count_max=None,
              time_path='hyakkiyakou_config.hya_limit_time',
@@ -159,7 +169,11 @@ def _annotation(path: str) -> Any:
 
 def _resolve(spec: TaskSpec) -> TaskSpec:
     """把 spec 里的 _EnumSub 换成按字段的枚举类型建出的 SubField，并核对它用到的字段路径都在 ConfigModel 上：
-    子项、次数（爬塔按每种类型展开）、时长，以及运行时要写的 scheduler.next_run。对不上抛 LookupError。"""
+    子项、次数（爬塔按每种类型展开）、时长，以及运行时要写的 scheduler.next_run。对不上抛 LookupError。
+
+    组队身份字段例外：对不上只记一条警告，把 team_status_path 置为 None，任务照常返回，只是它的行不再算组队行。
+    这一项放在最后查：别的字段对不上时任务整个不进表，不为它多记一条警告。
+    """
     def annotation_of(path: str) -> Any:
         found = _annotation(f'{spec.model_key}.{path}')
         if found is _MISSING:
@@ -183,6 +197,10 @@ def _resolve(spec: TaskSpec) -> TaskSpec:
     for path in ('scheduler.next_run', spec.time_path, *count_paths):
         if path is not None:
             annotation_of(path)
+    if spec.team_status_path is not None and _annotation(f'{spec.model_key}.{spec.team_status_path}') is _MISSING:
+        logger.warning(f'编排映射：{spec.command} 的组队身份字段对不上（{spec.model_key}.{spec.team_status_path}），'
+                       f'这一项不按组队行处理')
+        resolved = replace(resolved, team_status_path=None)
     return resolved
 
 
@@ -311,6 +329,26 @@ def restore_params(model: ConfigModel, saved: dict[str, Any]) -> None:
         problems.append(f'原值无法写回字段，未还原：{", ".join(failed)}')
     if problems:
         raise ValueError('；'.join(problems))
+
+
+TEAM_STATUSES = ('leader', 'member')   # 算组队的身份：队长、队员。单刷、野队、换手等都不算
+
+
+def team_tasks(model: ConfigModel) -> frozenset[str]:
+    """身份字段取值在 TEAM_STATUSES 里的任务命令名，这些任务的行就是组队行。读的是 model 当时的值。
+
+    枚举取 .value 再比；没有身份字段的任务、字段读不出的都不算。
+    """
+    commands = set()
+    for spec in TASK_SPECS.values():
+        if spec.team_status_path is None:
+            continue
+        value = _get(model, f'{spec.model_key}.{spec.team_status_path}')
+        if isinstance(value, Enum):
+            value = value.value
+        if value in TEAM_STATUSES:
+            commands.add(spec.command)
+    return frozenset(commands)
 
 
 def catalog() -> list[dict]:

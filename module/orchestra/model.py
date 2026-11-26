@@ -1,3 +1,4 @@
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -34,6 +35,8 @@ class Orchestra(BaseModel):
     rest_jitter: bool = False
     resume_policy: str = 'remaining'          # remaining / rerun
     cut_in_tasks: list[str] = ['MetaDemon', 'ActivityShikigami']
+    partner: str = ''                         # 搭档的实例名，组队行开打前两边互相等；空表示不等搭档
+    partner_wait_minutes: int = 30            # 等搭档最多多少分钟，1–1439
     state: str = 'idle'                       # idle / running / paused
     command: str = ''
     command_seq: int = 0
@@ -102,11 +105,14 @@ def _scheduled_commands() -> set[str]:
             and 'scheduler' in field.annotation.model_fields}
 
 
-def validate_settings(o: Orchestra) -> list[RowError]:
+def validate_settings(o: Orchestra, instances: Collection[str] | None = None,
+                      own_name: str | None = None) -> list[RowError]:
     """校验用户可改的设置项，再接上 validate_rows 的结果。
 
     设置项的错误 index 为 -1，field 是属性名。state、command、command_seq 不查，原因见 Orchestra 的说明。
     插队名单可以是任何上游调度器能排的任务（比如真蛇），不限于映射表里的 17 个；Restart、SoulsTidy 写不写都永远放行。
+    搭档为空表示不等搭档，不查；不为空时，给了 own_name（本实例名）就查不是自己，给了 instances（现有的实例名）
+    就查在其中，两条只报先不过的那一条。保存接口两样都给。
     """
     invalid: list[str] = []
     if o.after_finish not in ('stop', 'loop'):
@@ -119,4 +125,12 @@ def validate_settings(o: Orchestra) -> list[RowError]:
         invalid.append('resume_policy')
     if o.cut_in_tasks and not set(o.cut_in_tasks) <= _scheduled_commands():
         invalid.append('cut_in_tasks')
-    return [RowError(-1, name, '取值不合法') for name in invalid] + validate_rows(o.rows)
+    if not 1 <= o.partner_wait_minutes <= 1439:
+        invalid.append('partner_wait_minutes')
+    errors = [RowError(-1, name, '取值不合法') for name in invalid]
+    if o.partner:
+        if o.partner == own_name:
+            errors.append(RowError(-1, 'partner', '搭档不能是自己'))
+        elif instances is not None and o.partner not in instances:
+            errors.append(RowError(-1, 'partner', '没有这个实例'))
+    return errors + validate_rows(o.rows)

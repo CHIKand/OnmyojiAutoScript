@@ -40,6 +40,15 @@ def full_progress() -> Progress:
         paused=True,
         history=[{'row_index': 0, 'task': 'Orochi', 'completed': True}],
         status_note='防封禁休眠中，08:00 继续',
+        team_wait_since=T0 + timedelta(hours=2),
+        team_wait_ordinal=2,
+        team_wait_task='Orochi',
+        team_alive_at=T0 + timedelta(hours=2, seconds=30),
+        team_met_at=T0 + timedelta(hours=1, minutes=30),
+        team_met_ordinal=1,
+        team_met_task='EternitySea',
+        team_partner='山川知异路',
+        team_row_ordinal=1,
     )
 
 

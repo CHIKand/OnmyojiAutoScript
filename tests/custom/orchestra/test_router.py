@@ -96,7 +96,7 @@ def resting(**kwargs) -> None:
 
 def test_get_returns_catalog_settings_progress(instance_dir):
     data = asyncio.run(get_orchestra('t'))
-    assert set(data) == {'settings', 'progress', 'catalog'}
+    assert set(data) == {'settings', 'progress', 'catalog', 'partners'}
     assert len(data['catalog']) == 17
     assert data['progress']['phase'] == 'idle'
     assert data['settings']['rows'] == []
@@ -190,14 +190,14 @@ def test_put_ignores_control_fields_in_the_body(instance_dir):
 def test_put_keeps_what_the_instance_changed_during_validation(instance_dir, monkeypatch):
     real_validate = orchestra_router.validate_settings
 
-    def validate_while_instance_moves_on(candidate):
+    def validate_while_instance_moves_on(candidate, *args):
         # 校验这一刻，实例进程改了运行控制字段（比如引擎把编排暂停了，用户又点了跳过休息）
         cfg = ConfigModel('t')
         cfg.orchestra.state = 'paused'
         cfg.orchestra.command = 'skip_rest'
         cfg.orchestra.command_seq = 5
         cfg.save()
-        return real_validate(candidate)
+        return real_validate(candidate, *args)
 
     monkeypatch.setattr(orchestra_router, 'validate_settings', validate_while_instance_moves_on)
     assert asyncio.run(put_orchestra('t', {'rows': [{'task': 'Orochi'}]})) == {'ok': True, 'errors': []}
