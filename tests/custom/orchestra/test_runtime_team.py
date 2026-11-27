@@ -3,18 +3,23 @@
 替身、假时钟和自动生效的夹具 isolated 都取自 test_runtime：每个用例先 chdir 到 tmp_path，进度文件都写在
 tmp_path/log/orchestra 下，用例结束时收回心跳线程。本实例名是 t，搭档默认是 u，搭档的进度文件由用例按需写好。
 表是一行八岐大蛇，FakeConfig 默认的八岐大蛇身份是队长，所以这一行是第 1 个组队行。
+文件末尾的用例用 runtime_for 建 t、u 两个真的运行时，共用一个假时钟，互读对方真写下的进度文件。
 """
 import logging
+import random
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from module.config.anti_ban import AntiBanGuard
 from module.orchestra import runtime as runtime_module
 from module.orchestra.model import OrchestraRow
-from module.orchestra.progress import Progress, progress_path, save_progress
+from module.orchestra.progress import Progress, load_progress, progress_path, save_progress
+from tasks.Script.config_optimization import WhenTaskQueueEmpty
 # isolated 是自动生效的夹具，导入进来才对本文件的用例生效
-from test_runtime import T0, fn, isolated, make, saved  # noqa: F401
+from test_runtime import T0, Clock, FakeConfig, fn, isolated, make, saved  # noqa: F401
 
 
 class FakeNotifier:
@@ -25,8 +30,9 @@ class FakeNotifier:
         self.pushes.append((title, content)); return True
 
 class FakeDevice:
-    clears = 0
+    clears = click_clears = 0
     def stuck_record_clear(self): self.clears += 1
+    def click_record_clear(self): self.click_clears += 1
 
 def partner_file(name='u', **fields): save_progress(progress_path(name), Progress(**fields))
 def waiting_for_t(name='u', at=T0, **kw):
@@ -371,3 +377,115 @@ def test_a_pause_that_fails_in_any_way_still_notifies_and_exits(caplog):
     errors = [r for r in caplog.records if r.name == 'oas' and r.levelno == logging.ERROR]
     assert [r.getMessage() for r in errors] == ["编排：等搭档超时，暂停没能存进配置：RuntimeError('配置写坏了')"]
     assert errors[0].exc_info is None
+
+
+# ---------- 终审后的修正 ----------
+
+def test_a_timeout_marks_the_progress_paused():
+    runtime, script, config, clock = make([OrchestraRow(task='Orochi')], partner='u')
+    config.notifier = FakeNotifier()
+    runtime.pick()
+    clock.advance(minutes=30)
+    with pytest.raises(SystemExit):
+        runtime.pick()
+    assert saved().paused is True                                 # 搭档读到的是已暂停，不是还没到
+    resumed, _, _, clock = make([OrchestraRow(task='Orochi')], partner='u')   # 点继续：state 写回 running，新进程
+    clock.advance(minutes=31)
+    assert resumed.pick().next_run == clock.now + timedelta(seconds=31)       # 继续照常处理暂停中的进度：重新等
+    assert (saved().paused, saved().team_wait_since) == (False, clock.now)
+
+
+IDLE_WARNING = '编排：任务队列为空时的设置会让每次等搭档的轮询都关掉游戏或模拟器，建议改成回庭院'
+IDLE_NOTE = '；任务队列为空时的设置会让每次轮询都关掉游戏或模拟器，建议改成回庭院'
+
+
+@pytest.mark.parametrize('method, close_game, close_emulator, closes', [
+    (WhenTaskQueueEmpty.CLOSE_GAME, dtime(0, 0), dtime(0, 0), True),        # 关游戏、等待时长 0：每次空等都关游戏
+    (WhenTaskQueueEmpty.GOTO_MAIN, dtime(0, 0), dtime(0, 0, 10), True),     # 关模拟器的等待时长短于一次占位
+    (WhenTaskQueueEmpty.GOTO_MAIN, dtime(0, 0), dtime(0, 0), False),        # 用户的设置：回庭院，不关模拟器
+    (WhenTaskQueueEmpty.CLOSE_GAME, dtime(0, 0, 30), dtime(0, 0), True),    # 占位 31 秒后到点：等 30 秒就关游戏
+    (WhenTaskQueueEmpty.CLOSE_GAME, dtime(0, 0, 31), dtime(0, 0), False),   # 不短于占位：上游不关
+    (WhenTaskQueueEmpty.CLOSE_GAME, dtime(0, 10), dtime(0, 0, 10), True),   # 关游戏等得够久，关模拟器的先到
+    (WhenTaskQueueEmpty.GOTO_MAIN, dtime(0, 0), dtime(0, 0, 31), False),
+])
+def test_idle_settings_that_close_the_game_warn_once_and_tell_the_panel(caplog, method, close_game,
+                                                                         close_emulator, closes):
+    runtime, script, config, clock = make([OrchestraRow(task='Orochi')], partner='u')
+    optimization = config.model.script.optimization
+    optimization.when_task_queue_empty = method
+    optimization.close_game_wait_duration, optimization.close_emulator_wait_duration = close_game, close_emulator
+    runtime.pick()
+    clock.advance(seconds=30)
+    runtime.pick()                                                # 两次轮询
+    assert oas_messages(caplog, logging.WARNING) == ([IDLE_WARNING] if closes else [])   # 每个进程只记一次
+    assert saved().status_note == '等搭档 u：已等 0 分钟，最多 30 分钟；读不到搭档的进度' + (IDLE_NOTE if closes else '')
+
+
+def test_each_poll_also_clears_the_click_record():
+    runtime, script, config, clock = make([OrchestraRow(task='Orochi')], partner='u')
+    script.device = device = FakeDevice()
+    for _ in range(3):
+        runtime.pick()
+        clock.advance(seconds=30)
+    assert (device.clears, device.click_clears) == (3, 3)        # 同上游每个任务开始前：卡死计时、点击记录都复位
+
+
+# 两个真的运行时：t、u 互设搭档，共用一个假时钟，各写各的进度文件，读的是对方真写下的
+
+def runtime_for(name: str, partner: str, clock: Clock, progress: Progress | None = None):
+    """实例 name 的运行时，搭档是 partner，时钟由用例传入。同 make，只是实例名可选（make 固定为 t）；
+    表是一行八岐大蛇，通知用 FakeNotifier。progress 预先写进 name 的进度文件。返回 (运行时, 配置替身)。"""
+    config = FakeConfig()
+    config.config_name = name
+    orchestra = config.model.orchestra   # 嵌套赋值不会触发 ConfigModel 的自动保存
+    orchestra.rows, orchestra.state, orchestra.partner = [OrchestraRow(task='Orochi')], 'running', partner
+    config.notifier = FakeNotifier()
+    script = SimpleNamespace(config=config, config_name=name, anti_ban_guard=AntiBanGuard(), running_task_obj=None)
+    if progress is not None:
+        save_progress(progress_path(name), progress)
+    return runtime_module.OrchestraRuntime(script, clock=clock, rng=random.Random(0)), config
+
+
+def test_two_runtimes_meet_and_record_the_same_meeting():
+    clock = Clock()
+    t, _ = runtime_for('t', 'u', clock)
+    u, _ = runtime_for('u', 't', clock)
+    for _ in range(6):                                            # t 从 T0 起每 30 秒看一次，u 还没到
+        assert t.pick().next_run == clock.now + timedelta(seconds=31)
+        clock.advance(seconds=30)
+    arrived = u.pick()                                            # T0 + 3 分钟 u 到了：t 正在等，按规则 a 直接开打
+    assert (arrived.command, arrived.next_run) == ('Orochi', clock.now)
+    clock.advance(seconds=30)
+    follows = t.pick()                                            # t 的下一次轮询：u 已先走，按规则 b 开打
+    assert (follows.command, follows.next_run) == ('Orochi', clock.now)
+    met = T0 + timedelta(minutes=3)
+    assert load_progress(progress_path('t')).team_met_at == load_progress(progress_path('u')).team_met_at == met
+
+
+def test_two_runtimes_resuming_the_same_row_go_together():
+    clock = Clock()
+    t, _ = runtime_for('t', 'u', clock, progress=INTERRUPTED)    # 两边都中断在第 1 个组队行
+    u, _ = runtime_for('u', 't', clock, progress=INTERRUPTED)
+    assert t.pick().next_run == clock.now + timedelta(seconds=31)   # u 也停在这一行：等它
+    assert load_progress(progress_path('t')).phase == 'interrupted'  # 续跑时的等待，阶段留在 interrupted
+    clock.advance(seconds=10)
+    assert u.pick().next_run == clock.now                         # t 正在等这一行：按规则 a 直接续跑
+    clock.advance(seconds=20)
+    assert t.pick().next_run == clock.now                         # t 的下一次轮询：u 已先走，按规则 b 续跑
+
+
+def test_after_a_timeout_the_partner_sees_it_paused():
+    clock = Clock()
+    t, _ = runtime_for('t', 'u', clock)
+    u, u_config = runtime_for('u', 't', clock)
+    t.pick()
+    clock.advance(minutes=30)
+    with pytest.raises(SystemExit):                               # t 一个人等满 30 分钟，暂停并退出
+        t.pick()
+    clock.advance(minutes=1)
+    assert u.pick().next_run == clock.now + timedelta(seconds=31)   # u 这才到：t 已经不等了
+    assert load_progress(progress_path('u')).status_note.endswith('；搭档已暂停')
+    clock.advance(minutes=30)
+    with pytest.raises(SystemExit):
+        u.pick()
+    assert u_config.notifier.pushes[0][1].split('\n')[1] == '搭档已暂停'   # u 自己的超时通知，第二行同样写已暂停

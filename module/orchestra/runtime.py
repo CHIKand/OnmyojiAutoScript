@@ -11,9 +11,12 @@
 配置每次现取 script.config：上游会删掉缓存重建 config（ConfigModel 也会被 reload 换掉），不能跨调用持有。
 
 等搭档（会合规则见 team 模块说明）：设了搭档（不是本实例自己）、decide 选中的是组队行时，交给上游之前先读搭档的进度文件
-（只读）过一次 team.gate。接着等：交一个 team.POLL 后到点的占位，面板提示写已等多久、搭档在哪，并复位上游设备的卡死计时，
-否则上游空等时只截图不点击，连着等下去会被当成卡死而重启游戏。续跑的组队行搭档已离开：这一行按已打完记账，再 decide 一次。
-等满了：先存盘清空后的等待记录，再读一次搭档，它刚好先走了就照常开打，否则暂停编排、发通知、抛 SystemExit 让实例退出。
+（只读）过一次 team.gate。接着等：交一个 team.POLL 后到点的占位，面板提示写已等多久、搭档在哪，并复位上游设备的卡死计时
+和点击记录（同上游每个任务开始前做的），否则上游空等时回庭院只截图不点击，连着等下去会被当成卡死，点击记录攒多了又会报
+点击过多，都会重启游戏。上游空等时按"任务队列为空时"的设置处理：设置会让每次轮询都关掉游戏或模拟器时只提醒、不拦着，
+警告每个进程记一次，面板提示后面接一句建议改成回庭院。续跑的组队行搭档已离开：这一行按已打完记账，再 decide 一次。
+等满了：先存盘清空后的等待记录，再读一次搭档，它刚好先走了就照常开打，否则暂停编排（进度也记为暂停，搭档读到的是
+搭档已暂停）、发通知、抛 SystemExit 让实例退出。
 插队放行前撤下等待刷新时间，搭档不再把这边算作在等，开始等的时间不变。本进程第一次读进度时清掉上一个进程留下的等待记录：
 实例重启后（点继续也会重启实例）重新计时。会合之后这一行没能马上开始（比如桌面客户端没登录，上游先跑 Restart）：
 会合记在内存里，再选到同一行时直接开打，不重新等，这一行真正开始时清掉，新进程没有。
@@ -71,6 +74,30 @@ def _next_run_path(spec: TaskSpec) -> str:
     return f'{spec.model_key}.scheduler.next_run'
 
 
+def _duration(value) -> timedelta:
+    """同上游 Script._time_to_timedelta：Time 字段（datetime.time）按时、分、秒折成 timedelta，None 为 0。"""
+    if value is None:
+        return timedelta(0)
+    return timedelta(hours=value.hour, minutes=value.minute, seconds=value.second)
+
+
+def _idle_closes_game(optimization, wait: timedelta) -> bool:
+    """上游空等 wait 这么久时，"任务队列为空时"的设置（optimization 是 script.optimization）会不会关掉游戏或模拟器。
+    条件照抄上游 Script._handle_wait_during_idle 分到的 _wait_close_game、_wait_goto_main，模拟器已经关着的那一支不算：
+    关模拟器的等待时长大于 0 且短于 wait 时，两种设置都关模拟器；设成关游戏时，关游戏的等待时长为 0 或短于 wait 就关游戏。
+    其余取值上游按原地等处理，什么都不关。"""
+    method = optimization.when_task_queue_empty
+    if method not in ('close_game', 'goto_main'):
+        return False
+    close_emulator = _duration(optimization.close_emulator_wait_duration)
+    if close_emulator > timedelta(0) and wait > close_emulator:
+        return True
+    if method != 'close_game':
+        return False
+    close_game = _duration(optimization.close_game_wait_duration)
+    return close_game <= timedelta(0) or wait > close_game
+
+
 @dataclass
 class _Row:
     """before_run 启动的一行，after_run 和心跳线程共用。"""
@@ -82,7 +109,7 @@ class _Row:
 
 class OrchestraRuntime:
     """一个实例（Script）的编排运行时。script 只需要 config、anti_ban_guard、running_task_obj 这三样属性；
-    设备对象 device 已经建好就拿来复位卡死计时，没建不新建。等搭档超时发通知用 config.notifier。"""
+    设备对象 device 已经建好就拿来复位卡死计时和点击记录，没建不新建。等搭档超时发通知用 config.notifier。"""
 
     def __init__(self, script, clock: Callable[[], datetime] = datetime.now, rng: random.Random | None = None,
                  heartbeat_interval: float = 30.0) -> None:
@@ -97,6 +124,7 @@ class OrchestraRuntime:
         self._decision: Decision | None = None   # 最近一次 pick 的决定，before_run 凭它判断这一轮是不是编排的行
         self._row: _Row | None = None         # before_run 已启动、after_run 还没收尾的行
         self._warned_self_partner = False     # 搭档设成了自己的警告，每个进程只记一次
+        self._warned_idle_closes = False      # 任务队列为空时的设置会关掉游戏或模拟器的警告，每个进程只记一次
         self._team_logged_at: datetime | None = None   # 等搭档的日志上一次记在什么时候，按 team.LOG_EVERY 节流
         self._met: tuple[int, str, int] | None = None  # 已与搭档会合、还没开打的行：(行号, 任务, 第几遍循环)，见 _team_gate
         self._met_noted = False                         # 这次会合"还没开打，接着开打"的那行日志已经记过
@@ -353,7 +381,8 @@ class OrchestraRuntime:
 
         go：开打，照常返回这一行。
         skip：续跑的组队行搭档已离开，这一行按已打完记账，再 decide 一次。又是组队行就再过一次，这次不是续跑，不会再 skip。
-        wait：复位卡死计时，交一个 team.POLL 后到点的 wait。日志按 team.LOG_EVERY 节流。
+        wait：复位卡死计时和点击记录，交一个 team.POLL 后到点的 wait。日志按 team.LOG_EVERY 节流。任务队列为空时的设置
+        会让这次空等关掉游戏或模拟器时，等待提示后面接一句建议（见 _idle_closes_note）。
         timeout：先存盘清空后的进度，再读一次搭档：它在最后一刻按规则 a 先走了就照常开打，否则 _stop_for_partner，不返回。
 
         每次 go（规则 a、b，续跑时搭档还在，超时后救回）都在内存里记下这一行（_met），直到它真正开始，由 _before_run 清掉。
@@ -393,7 +422,7 @@ class OrchestraRuntime:
             elif self._team_logged_at is None or now - self._team_logged_at >= team.LOG_EVERY:
                 logger.info(f'编排：等搭档 {partner_name} 已 {waited} 分钟；{situation}')
                 self._team_logged_at = now
-            note = f'等搭档 {partner_name}：已等 {waited} 分钟，最多 {minutes} 分钟；{situation}'
+            note = f'等搭档 {partner_name}：已等 {waited} 分钟，最多 {minutes} 分钟；{situation}' + self._idle_closes_note(config)
             return q, Decision('wait', None, at=now + team.POLL), note
 
         met_at = result.met_at
@@ -425,22 +454,39 @@ class OrchestraRuntime:
         return None if partner == Progress() else partner
 
     def _reset_stuck_timer(self) -> None:
-        """复位上游设备的卡死计时。等搭档时上游每次空等都按"任务队列为空时"的设置处理，回庭院的 GotoMain 只截图不点击，
-        连着等下去会被判为卡死，接着报错、重启游戏。设备对象已经建好（Script.device 是 cached_property，建好后在 __dict__
-        里）才复位，不为此新建：建设备要连模拟器或游戏窗口。出错只记警告，照常接着等。"""
+        """复位上游设备的卡死计时和点击记录，同上游 Script.loop 在每个任务开始前做的（stuck_record_clear、
+        click_record_clear）。等搭档时上游每次空等都按"任务队列为空时"的设置处理：回庭院的 GotoMain 只截图不点击，
+        连着等下去会被判为卡死；它点过的按钮又一直记在点击记录里，攒多了会报点击过多（GameTooManyClickError）。
+        两种都会报错、重启游戏。设备对象已经建好（Script.device 是 cached_property，建好后在 __dict__ 里）才复位，
+        不为此新建：建设备要连模拟器或游戏窗口。出错只记警告，照常接着等。"""
         try:
             device = self._script.__dict__.get('device')
             if device is not None:
                 device.stuck_record_clear()
+                device.click_record_clear()
         except Exception as exc:
             logger.warning(f'编排：复位卡死计时出错：{exc!r}')
 
+    def _idle_closes_note(self, config) -> str:
+        """等搭档时交给上游的占位 team.POLL 加 _WAIT_MARGIN 之后到点。上游空等这么久时，"任务队列为空时"的设置会关掉游戏
+        或模拟器（见 _idle_closes_game），就返回接在等待提示后面的一句建议，并记警告，每个进程只记一次；不会就返回空串。
+        只提醒，不拦着：照样接着等。"""
+        if not _idle_closes_game(config.model.script.optimization, team.POLL + _WAIT_MARGIN):
+            return ''
+        if not self._warned_idle_closes:
+            self._warned_idle_closes = True
+            logger.warning('编排：任务队列为空时的设置会让每次等搭档的轮询都关掉游戏或模拟器，建议改成回庭院')
+        return '；任务队列为空时的设置会让每次轮询都关掉游戏或模拟器，建议改成回庭院'
+
     def _stop_for_partner(self, config, p: Progress, situation: str, index: int, command: str) -> NoReturn:
-        """等满了搭档也没来：按顺序暂停编排并存配置、面板提示改成超时、发通知、记警告，最后抛 SystemExit 让实例退出。
+        """等满了搭档也没来：按顺序暂停编排并存配置、进度记为暂停并把面板提示改成超时、发通知、记警告，
+        最后抛 SystemExit 让实例退出。
 
         SystemExit 不是 Exception，pick 的兜底拦不住，交给上游的进程外壳把实例记为警告状态后退出。
         暂停存不进配置、通知发不出，不管出的是什么异常，都只记错误、不带调用栈，照样往下做：挡不住后面的提示、通知和退出。
-        p 是等待记录已清空、已存过盘的进度，其余原样保留，点继续时重新开始等、重新计时。
+        p 是等待记录已清空、已存过盘的进度，其余原样保留，点继续时重新开始等、重新计时。进度里的 paused 置为 True，
+        同 sync_controls 在 state 为 paused 时算出的：搭档读到的搭档情况是搭档已暂停，不是还没到；继续、开始、停止
+        本来就会处理暂停中的进度。
         situation 是最后一次读到的搭档情况（team.partner_situation），写进通知的第二行。
         """
         settings = config.model.orchestra
@@ -450,7 +496,7 @@ class OrchestraRuntime:
         except Exception as exc:
             logger.error(f'编排：等搭档超时，暂停没能存进配置：{exc!r}')
         stopped = f'等搭档 {partner_name} 超时，已暂停'
-        self._commit(replace(p, status_note=stopped))
+        self._commit(replace(p, status_note=stopped, paused=True))
         lines = (f'等搭档 {partner_name} 超过 {minutes} 分钟，已暂停在第 {index + 1} 行（{team.task_title(command)}）',
                  situation,
                  '处理好之后，在编排页点继续接着等；要两边都从头来，先把两个号都点停止，再都点开始')

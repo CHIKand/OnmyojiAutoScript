@@ -1,7 +1,7 @@
 import copy
 import json
 import random
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timedelta
 
 import pytest
@@ -818,3 +818,14 @@ def test_stop_clears_the_wait_record_and_keeps_the_meeting():
     assert (out.team_wait_since, out.team_wait_ordinal, out.team_wait_task, out.team_alive_at) == (None,) * 4
     assert (out.team_met_at, out.team_met_ordinal, out.team_met_task) == (MET, 1, 'Orochi')
     assert p.team_wait_since == T0
+
+
+# 终审补的用例：开始命令连会合记录在内清空全部组队字段（停止、跑完只清等待记录）
+
+def test_start_command_clears_every_team_field():
+    old = replace(waiting_at_second_row(), last_command_seq=3, team_partner='u', team_row_ordinal=2)
+    team = [f.name for f in fields(Progress) if f.name.startswith('team_')]
+    assert all(getattr(old, name) != getattr(Progress(), name) for name in team)   # 开始之前每一项都有值
+    p = sync_controls(running(SIX, command='start', command_seq=4), old, at(2))
+    assert (p.phase, p.sequence_started_at, p.last_command_seq) == ('ready', at(2), 4)
+    assert {name: getattr(p, name) for name in team} == {name: getattr(Progress(), name) for name in team}
