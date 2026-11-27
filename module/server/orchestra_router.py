@@ -12,7 +12,8 @@
 整份写回，实例在跑时写进去的运行控制字段就被冲掉了；实例停下之后再写，没有第二个写者。进度文件平时只由实例写，
 暂停、停止时实例已经停下，由本接口经 module.orchestra.progress 写。这四条命令都在实例停下之后、再次启动之前清掉进度里
 等搭档的等待记录（会合记录不动，组队编排等搭档设计 §7.7）：留着的话，搭档在新进程第一次选任务之前读到它，
-会当成这边还在等。同一实例的命令与重启共用 instance_lock，按先后排队。
+会当成这边还在等。继续、开始是尽力清：进度文件读写失败只记警告，照常启动实例，实例第一次选任务时自己会清。
+同一实例的命令与重启共用 instance_lock，按先后排队。
 跳过休息照旧只改配置、不启停实例：实例等待下一个任务时每 5 秒查一次配置文件的修改时间（上游 Script.wait_until），
 发现变化就重新选任务。
 """
@@ -29,8 +30,8 @@ from module.logger import logger
 from module.orchestra.engine import sync_controls
 from module.orchestra.mapping import catalog, restore_params
 from module.orchestra.model import Orchestra, validate_settings
-from module.orchestra.progress import (Progress, clear_team_wait, load_progress, progress_path, progress_to_dict,
-                                       save_progress)
+from module.orchestra.progress import (Progress, clear_team_wait, clear_team_wait_file, load_progress, progress_path,
+                                       progress_to_dict, save_progress)
 from module.server.instance_control import instance_lock, instance_names, start_instance, stop_instance
 
 orchestra_app = APIRouter(prefix='/custom/orchestra')
@@ -188,12 +189,8 @@ def _mark_running(name: str, start: bool) -> bool:
         except OSError as exc:
             logger.error(f'[{name}] 编排配置读写失败：{exc!r}，实例已停下，没有启动')
             return False
-    path = progress_path(name)
     try:
-        if path.exists():
-            p = load_progress(path)
-            if clear_team_wait(p):   # 没有等待记录就不写，进度文件原样留着
-                save_progress(path, p)
+        clear_team_wait_file(progress_path(name))   # 没有等待记录就不写，进度文件原样留着
     except OSError as exc:
         logger.warning(f'[{name}] 编排：清等待记录时进度文件读写失败：{exc!r}，实例启动后自己会清')
     return True
@@ -201,7 +198,8 @@ def _mark_running(name: str, start: bool) -> bool:
 
 async def _control(name: str, action: str) -> bool:
     """开始、暂停、继续、停止：先停实例，停下之后在工作线程里写配置和进度，state 为 running 的写完再启动实例。
-    调用方持 instance_lock。写入失败时实例保持停下。"""
+    调用方持 instance_lock。返回 False（配置读写失败，暂停、停止时还有进度读不了，见 _halt、_mark_running）时
+    实例保持停下；继续、开始时进度里的等待记录清不掉，只记警告，实例照常启动。"""
     await stop_instance(name)   # 已停着就什么都不做：暂停、停止总要停下，开始、继续在跑才停
     state = _STATE_OF_ACTION[action]
     if state != 'running':
@@ -230,7 +228,8 @@ async def post_command(script_name: str, body: dict) -> dict:
     """控制命令，不接受或没做成返回 ok 为 False。实例名或动作不认识时什么都不碰。
     start、pause、resume、stop 先停实例，都清掉进度里等搭档的等待记录（会合记录不动）：pause 写 state=paused、
     stop 写 state=idle，都还原本行参数、同步进度，不再启动实例；resume 写 state=running，start 另记一条 start 命令
-    （command_seq 加 1），进度的其余部分不动，写完启动实例。
+    （command_seq 加 1），进度的其余部分不动，写完启动实例。resume、start 清等待记录是尽力的：进度文件读写失败只记警告，
+    照常启动实例，ok 仍为 True，实例第一次选任务时自己会清。
     skip_rest 不启停实例，只在实例的进度处于休息中、且没有还没处理的开始命令时接受，记一条 skip_rest 命令。"""
     action = body.get('action')
     if action not in _ACTIONS or script_name not in await asyncio.to_thread(instance_names):

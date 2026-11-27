@@ -23,8 +23,9 @@ from starlette.routing import Mount
 
 from module.config import config_model
 from module.config.config_model import ConfigModel
+from module.orchestra import progress as progress_module
 from module.orchestra.engine import sync_controls
-from module.orchestra.progress import Progress, progress_path, save_progress
+from module.orchestra.progress import Progress, load_progress, progress_path, save_progress
 from module.server import instance_control, orchestra_router
 from module.server.custom_routes import register_custom
 from module.server.instance_control import (instance_lock, instance_names, post_restart, restart_instance,
@@ -375,7 +376,7 @@ def test_restart_of_unknown_process_is_false(monkeypatch):
     assert asyncio.run(restart_instance('ghost')) is False
 
 
-def test_restart_running_instances_skips_inactive(monkeypatch):
+def test_restart_running_instances_skips_inactive(instance_dir, monkeypatch):
     processes = {'a': FakeProcess(ScriptState.RUNNING), 'b': FakeProcess(ScriptState.INACTIVE),
                  'c': FakeProcess(ScriptState.WARNING), 'd': FakeProcess(ScriptState.UPDATING)}
     use_fake_manager(monkeypatch, **processes)
@@ -480,7 +481,7 @@ def test_restart_instance_still_restarts_a_stopped_instance_by_default(monkeypat
 def test_restart_running_instances_leaves_a_timed_out_instance_stopped(instance_dir, monkeypatch, caplog):
     # 等搭档超时：实例把编排写成暂停后自己退出，上游标 WARNING；a 没有配置文件，按没暂停处理
     cfg = ConfigModel('t')
-    cfg.orchestra.state = 'paused'
+    cfg.orchestra.state, cfg.orchestra.partner = 'paused', 'u'
     cfg.save()
     processes = {'t': FakeProcess(ScriptState.WARNING), 'a': FakeProcess(ScriptState.WARNING)}
     use_fake_manager(monkeypatch, **processes)
@@ -507,6 +508,67 @@ def test_restart_running_instances_restarts_when_the_config_cannot_be_read(insta
     assert process.calls == ['stop', 'start']
     assert any(r.levelno == logging.WARNING and r.getMessage().startswith('[t] ') and 'JSONDecodeError' in r.getMessage()
                for r in caplog.records)
+
+
+def test_a_paused_instance_without_a_partner_is_restarted_as_before(instance_dir, monkeypatch):
+    cfg = ConfigModel('t')
+    cfg.orchestra.state = 'paused'   # 没设搭档：不会是等搭档超时停下的，照以前一样随更新重启
+    cfg.save()
+    process = FakeProcess(ScriptState.WARNING)
+    use_fake_manager(monkeypatch, t=process)
+    assert asyncio.run(restart_running_instances()) == ['t']
+    assert process.calls == ['stop', 'start']
+
+
+def test_a_single_restart_still_restarts_a_timed_out_instance(instance_dir, monkeypatch):
+    cfg = ConfigModel('t')
+    cfg.orchestra.state, cfg.orchestra.partner = 'paused', 'u'
+    cfg.save()
+    process = FakeProcess(ScriptState.WARNING)
+    use_fake_manager(monkeypatch, t=process)
+    assert asyncio.run(restart_instance('t')) is True   # 不传 running_only：单个实例的重启接口不受这条限制
+    assert process.calls == ['stop', 'start']
+
+
+WAIT_AT = datetime(2026, 11, 26, 10, 0)
+MET_AT = WAIT_AT - timedelta(hours=1)
+WAITING = dict(phase='ready', team_wait_since=WAIT_AT, team_wait_ordinal=1, team_wait_task='Orochi',
+               team_alive_at=WAIT_AT, team_met_at=MET_AT, team_met_ordinal=1, team_met_task='Orochi')
+
+
+def test_an_update_restart_clears_the_wait_record_before_starting(instance_dir, monkeypatch):
+    save_progress(progress_path('t'), Progress(**WAITING))
+    seen: list = []
+
+    class Recording(FakeProcess):
+        """停、启时各读一次进度文件里的开始等的时间。"""
+
+        async def stop(self) -> None:
+            seen.append(('stop', load_progress(progress_path('t')).team_wait_since))
+
+        async def start(self) -> None:
+            seen.append(('start', load_progress(progress_path('t')).team_wait_since))
+
+    use_fake_manager(monkeypatch, t=Recording())
+    assert asyncio.run(restart_running_instances()) == ['t']
+    assert seen == [('stop', WAIT_AT), ('start', None)]   # 停下之后、启动之前清掉
+    p = load_progress(progress_path('t'))
+    assert (p.team_wait_since, p.team_wait_ordinal, p.team_wait_task, p.team_alive_at) == (None,) * 4
+    assert (p.team_met_at, p.team_met_ordinal, p.team_met_task) == (MET_AT, 1, 'Orochi')   # 会合记录不动
+
+
+def test_a_restart_with_a_locked_progress_file_still_starts_and_warns(instance_dir, monkeypatch, caplog):
+    save_progress(progress_path('t'), Progress(**WAITING))
+
+    def locked(path):
+        raise PermissionError('占用中')
+    monkeypatch.setattr(progress_module, 'load_progress', locked)
+    process = FakeProcess(ScriptState.RUNNING)
+    use_fake_manager(monkeypatch, t=process)
+    assert asyncio.run(restart_running_instances()) == ['t']
+    assert process.calls == ['stop', 'start']   # 清不掉也照常启动，实例第一次选任务时自己会清
+    assert [r.getMessage() for r in caplog.records if r.name == 'oas' and r.levelno == logging.WARNING] == [
+        "[t] 编排：清等待记录时进度文件读写失败：PermissionError('占用中')，实例启动后自己会清"]
 
 
 @pytest.mark.parametrize('state', [ScriptState.RUNNING, ScriptState.WARNING, ScriptState.UPDATING])

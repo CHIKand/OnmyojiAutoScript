@@ -193,3 +193,19 @@ def clear_team_wait(p: Progress) -> bool:
                   for value in (p.team_wait_since, p.team_wait_ordinal, p.team_wait_task, p.team_alive_at))
     p.team_wait_since = p.team_wait_ordinal = p.team_wait_task = p.team_alive_at = None
     return had_any
+
+
+def clear_team_wait_file(path: Path) -> bool:
+    """清掉进度文件 path 里的等待记录（同 clear_team_wait，会合记录不动）并存盘，进度的其余部分原样写回。
+    服务端在实例停下之后、再次启动之前用它：编排命令的继续、开始，以及重启实例。
+
+    文件不存在、本来就没有等待记录，或内容损坏（load_progress 读成默认进度，里面没有等待记录）时什么都不写，
+    返回 False；清了返回 True。读写出错（OSError，含重试用尽的 PermissionError）照常抛给调用方。
+    """
+    if not path.exists():
+        return False
+    p = load_progress(path)
+    if not clear_team_wait(p):
+        return False
+    save_progress(path, p)
+    return True

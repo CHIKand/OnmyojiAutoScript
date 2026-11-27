@@ -206,6 +206,7 @@ def _resolve(spec: TaskSpec) -> TaskSpec:
 
 def build_task_specs() -> dict[str, TaskSpec]:
     """按 _DEFINITIONS 建映射表，顺序不变。字段对不上的任务不放进去，每个记一条警告。
+    组队身份字段例外：对不上只记一条警告，任务照常放进去，它的行不再算组队行（见 _resolve）。
 
     在导入时运行，所以任何异常都不往外抛：本模块在 script.py 与服务端的导入链上，抛了实例和服务都起不来。
     """

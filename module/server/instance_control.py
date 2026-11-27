@@ -8,8 +8,10 @@ M3a 合并上游代码后用 restart_running_instances 让在跑的实例换上�
 编排的开始、暂停、继续、停止经 stop_instance、start_instance 停启实例。
 
 等搭档超时时，实例把编排写成暂停后自己退出，上游把进程标成 WARNING。restart_running_instances 不重启这样的实例
-（状态 WARNING、编排已暂停），用户在编排页点继续或开始之前，更新和每日定时合并都不把它拉起来跑任务
-（组队编排等搭档设计 §7.5）。单个实例的重启接口不受影响。
+（状态 WARNING、设了搭档、编排已暂停），用户在编排页点继续或开始之前，更新和每日定时合并都不把它拉起来跑任务
+（组队编排等搭档设计 §7.5）。没设搭档的实例不会因等搭档停下，照旧重启。单个实例的重启接口不受这条限制。
+重启在实例停下之后、再次启动之前尽力清掉它进度里等搭档的等待记录（会合记录不动），同编排命令的继续、开始：留着的话，
+新进程起来之前搭档读到它，会当成这边还在等，一个人开打。进度文件读写失败只记警告，照常启动，实例第一次选任务时自己会清。
 
 排队只覆盖重启和编排命令。总览页的启停走上游的 websocket（script_router.py 的 websocket_endpoint 收到 start、stop
 直接 await 进程的 start()、stop()），不拿 instance_lock，可能与一条编排命令交错：
@@ -31,6 +33,7 @@ from fastapi import APIRouter
 
 from module.config.config_model import ConfigModel
 from module.logger import logger
+from module.orchestra.progress import clear_team_wait_file, progress_path
 from module.server.script_process import ScriptProcess, ScriptState
 
 instance_app = APIRouter(prefix='/custom/instance')
@@ -87,21 +90,36 @@ async def start_instance(name: str) -> None:
 
 
 def _paused_by_orchestra(name: str) -> bool:
-    """name 是 config/ 下的实例，且它的编排已暂停（orchestra.state 为 paused）。只读配置，读的时候出任何异常都记警告，
-    按没暂停处理。不是实例的名字不去读：ConfigModel 读不到文件时给默认值，上游 read_file 还会顺手建 config/ 目录。"""
+    """name 是 config/ 下的实例，设了搭档（orchestra.partner 不为空），且它的编排已暂停（orchestra.state 为 paused）：
+    等搭档超时的实例停下后就是这样。没设搭档的不会因等搭档停下，返回 False，照旧随更新重启。
+    只读配置，读的时候出任何异常都记警告，按没暂停处理。不是实例的名字不去读：ConfigModel 读不到文件时给默认值，
+    上游 read_file 还会顺手建 config/ 目录。"""
     try:
-        return name in instance_names() and ConfigModel(name).orchestra.state == 'paused'
+        if name not in instance_names():
+            return False
+        orchestra = ConfigModel(name).orchestra
+        return orchestra.state == 'paused' and bool(orchestra.partner)
     except Exception as exc:
         logger.warning(f'[{name}] 编排配置读取失败：{exc!r}，按编排没暂停处理，实例照常随更新重启')
         return False
 
 
+def _clear_team_wait(name: str) -> None:
+    """重启时实例停下之后、再次启动之前调用：尽力清掉 name 进度里等搭档的等待记录（会合记录不动），见文件开头。
+    进度文件读写失败只记警告，警告同编排命令的继续、开始（orchestra_router._mark_running），调用方照常启动实例。"""
+    try:
+        clear_team_wait_file(progress_path(name))
+    except OSError as exc:
+        logger.warning(f'[{name}] 编排：清等待记录时进度文件读写失败：{exc!r}，实例启动后自己会清')
+
+
 async def restart_instance(name: str, running_only: bool = False) -> bool:
     """重启一个实例：先 stop() 再 start()，都 await；同一个实例的重启与编排命令按先后排队。进程表里没有这个实例返回 False。
+    停下之后、启动之前在工作线程里尽力清掉进度里等搭档的等待记录（_clear_team_wait），清不掉也照常启动。
     running_only 为 True 时只重启没停的实例：拿到锁之后再看状态，已停着（INACTIVE）的返回 False，不停也不启。
-    排队期间前面的暂停、停止可能刚把它停下，拿锁之前看到的状态已经过时。状态是 WARNING、编排已暂停的
+    排队期间前面的暂停、停止可能刚把它停下，拿锁之前看到的状态已经过时。状态是 WARNING、设了搭档、编排已暂停的
     （等搭档超时后自己退出的）同样返回 False，不停也不启，等用户点继续或开始；编排已暂停、状态却不是 WARNING 的
-    （比如在总览页启动过、还在跑）照旧重启。
+    （比如在总览页启动过、还在跑），以及没设搭档的，照旧重启。
     只有 restart_running_instances 传 running_only；POST /custom/instance/{name}/restart 不传，停着的实例照旧重启。"""
     async with instance_lock(name):
         process = _manager().script_process.get(name)
@@ -112,6 +130,7 @@ async def restart_instance(name: str, running_only: bool = False) -> bool:
             logger.info(f'[{name}] 编排已暂停、实例已退出，不随更新重启')
             return False
         await process.stop()
+        await asyncio.to_thread(_clear_team_wait, name)
         await process.start()
     logger.info(f'[{name}] 实例已重启')
     return True
@@ -119,8 +138,8 @@ async def restart_instance(name: str, running_only: bool = False) -> bool:
 
 async def restart_running_instances() -> list[str]:
     """重启所有没停的实例（状态不是 INACTIVE），返回重启成了的名字。停着的不动，不替用户启动：是否停着在拿到实例锁之后
-    判断，排在暂停、停止后面、等锁期间被停下的实例也不动。快照里已停着的不去排队。编排已暂停、实例已退出（WARNING）的
-    也不动，见 restart_instance。
+    判断，排在暂停、停止后面、等锁期间被停下的实例也不动。快照里已停着的不去排队。设了搭档、编排已暂停、实例已退出
+    （WARNING）的也不动，见 restart_instance。
     一个实例出错只记日志（带调用栈），不挡着其余的，也不列进返回值。"""
     restarted: list[str] = []
     for name, process in list(_manager().script_process.items()):   # 重启中途进程表可能被别的请求改动，先取快照

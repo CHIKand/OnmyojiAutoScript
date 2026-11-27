@@ -13,7 +13,8 @@ from module.config.config_model import ConfigModel
 from module.orchestra import mapping
 from module.orchestra.mapping import TASK_SPECS, team_tasks
 from module.orchestra.model import Orchestra, RowError, validate_settings
-from module.orchestra.progress import Progress, clear_team_wait, load_progress, progress_path, save_progress
+from module.orchestra.progress import (Progress, clear_team_wait, clear_team_wait_file, load_progress, progress_path,
+                                       save_progress)
 from module.server.orchestra_router import get_orchestra, put_orchestra
 from tasks.BondlingFairyland.config import UserStatus as BondlingStatus
 from tasks.Exploration.config import UserStatus as ExplorationStatus
@@ -87,6 +88,23 @@ def test_clear_team_wait():
     assert (p.team_wait_since, p.team_wait_ordinal, p.team_wait_task, p.team_alive_at, p.team_met_at) == \
         (None, None, None, None, T0)
     assert clear_team_wait(p) is False
+
+
+def test_clear_team_wait_file(tmp_path):
+    path = progress_path('t', tmp_path)
+    assert clear_team_wait_file(path) is False and not path.exists()             # 没有文件：不新建
+    save_progress(path, Progress(phase='ready'))
+    before = path.read_bytes()
+    assert clear_team_wait_file(path) is False and path.read_bytes() == before   # 没有等待记录：不写
+    save_progress(path, Progress(phase='ready', row_index=2, team_wait_since=T0, team_wait_ordinal=1,
+                                 team_wait_task='Orochi', team_alive_at=T0, team_met_at=T0))
+    assert clear_team_wait_file(path) is True
+    p = load_progress(path)
+    assert (p.team_wait_since, p.team_wait_ordinal, p.team_wait_task, p.team_alive_at) == (None,) * 4
+    assert (p.team_met_at, p.phase, p.row_index) == (T0, 'ready', 2)              # 会合记录和其余部分不动
+    path.write_text('{坏了', encoding='utf-8')
+    assert clear_team_wait_file(path) is False
+    assert path.read_text(encoding='utf-8') == '{坏了'                            # 损坏的文件不拿默认进度覆盖
 
 
 def test_put_saves_partner_settings(instance_dir, default_config):

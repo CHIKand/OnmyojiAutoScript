@@ -16,6 +16,7 @@ import pytest
 
 from module.config import config_model
 from module.config.config_model import ConfigModel
+from module.orchestra import progress as progress_module
 from module.orchestra.engine import recover, row_limits, sync_controls
 from module.orchestra.mapping import apply_row, serialize_value
 from module.orchestra.model import OrchestraRow
@@ -524,7 +525,7 @@ def test_commands_clear_the_wait_record(journal, monkeypatch, action):
 def test_resume_survives_a_locked_progress_file_when_clearing(journal, monkeypatch, caplog):
     save_progress(progress_path('t'), Progress(phase='ready', **WAIT))
     table(monkeypatch, journal, t=Instance(journal))
-    monkeypatch.setattr(orchestra_router, 'load_progress', _locked)
+    monkeypatch.setattr(progress_module, 'load_progress', _locked)   # 继续经 progress.clear_team_wait_file 读进度
     assert send(journal, 'resume')['ok'] is True
     assert journal[-1] == 'start'   # 清不掉也照常启动实例，它第一次选任务时自己会清
     assert any(r.levelno == logging.WARNING and '清等待记录时进度文件读写失败' in r.getMessage() for r in caplog.records)
